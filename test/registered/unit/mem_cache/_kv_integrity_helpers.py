@@ -55,3 +55,43 @@ def assert_owners(tracker, page: int, expected: set[int]) -> None:
 
 def assert_no_owner(tracker, page: int) -> None:
     assert_owners(tracker, page, set())
+
+
+def fake_batch_with_pool(
+    reqs,
+    req_to_token,
+    seq_lens,
+    *,
+    page_size: int,
+    max_context: int = 128,
+    req_pool_size: int = 64,
+):
+    """Build a batch fixture exposing the same surface validate_batch needs:
+    `batch.reqs`, `batch.req_to_token_pool.req_to_token`, `batch.seq_lens_cpu`.
+
+    Args:
+        reqs: list of (rid, req_pool_idx) pairs.
+        req_to_token: list of (req_pool_idx, slot_array) populating
+            req_to_token[idx, :len(slots)]. Other rows stay zero.
+        seq_lens: list of int, one per req in `reqs`. Determines the
+            slice req_to_token[idx, :seq_len] that validate_batch reads.
+
+    Other rows of req_to_token are left as zero — slot 0 maps to page 0,
+    so callers that want validation to silently pass on row idx must also
+    record page 0 as owned by that idx.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    rt = torch.zeros((req_pool_size, max_context), dtype=torch.int64)
+    for idx, slots in req_to_token:
+        slots_t = torch.as_tensor(slots, dtype=torch.int64)
+        rt[idx, : slots_t.numel()] = slots_t
+    pool = SimpleNamespace(req_to_token=rt)
+    reqs_ns = [SimpleNamespace(rid=rid, req_pool_idx=idx) for rid, idx in reqs]
+    return SimpleNamespace(
+        reqs=reqs_ns,
+        req_to_token_pool=pool,
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+    )

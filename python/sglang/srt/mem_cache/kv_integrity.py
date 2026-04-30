@@ -124,43 +124,75 @@ class KvIntegrityTracker:
             self._record("REQ_FREE", p, req_pool_idx)
 
     def validate_batch(self, batch: Any) -> list[IntegrityViolation]:
+        """Check each request's *current* read range against page_owners.
+
+        Reads ``batch.req_to_token_pool.req_to_token[idx, :seq_len]`` — the
+        actual slot list the forward will read — and verifies every page
+        derived from those slots is authorized for ``idx``. Pages no longer
+        referenced by req_to_token_pool (spec-decode rejection, tree-cache
+        eviction of inactive prefix nodes, decode-offload move-to-CPU) are
+        ignored, so legitimate frees do not produce false positives.
+
+        See spec section "Update 2026-04-30: Option A revision" for the
+        production data that motivated this semantic.
+        """
         violations: list[IntegrityViolation] = []
         if batch is None:
             return violations
-        for req in getattr(batch, "reqs", ()):
+        pool = getattr(batch, "req_to_token_pool", None)
+        if pool is None:
+            return violations
+        req_to_token = getattr(pool, "req_to_token", None)
+        if req_to_token is None:
+            return violations
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return violations
+        seq_lens = (
+            seq_lens_cpu.tolist()
+            if hasattr(seq_lens_cpu, "tolist")
+            else list(seq_lens_cpu)
+        )
+        reqs = list(getattr(batch, "reqs", ()))
+        if len(seq_lens) != len(reqs):
+            return violations
+        for req, seq_len in zip(reqs, seq_lens):
             idx = getattr(req, "req_pool_idx", None)
-            if idx is None:
+            if idx is None or seq_len <= 0:
                 continue
-            pages = self.req_pages.get(idx)
-            if not pages:
+            slots = req_to_token[idx, :seq_len]
+            if hasattr(slots, "detach"):
+                slots = slots.detach().cpu().numpy()
+            slots = np.asarray(slots, dtype=np.int64).ravel()
+            if slots.size == 0:
                 continue
-            page_arr = np.fromiter(pages, dtype=np.int64, count=len(pages))
+            pages = np.unique(slots // self.page_size)
+            in_range = (pages >= 0) & (pages < self.num_pages)
+            pages = pages[in_range]
+            if pages.size == 0:
+                continue
             word_idx, bit = self._bit_for(idx)
-            in_range = (page_arr >= 0) & (page_arr < self.num_pages)
-            authorized = np.zeros(page_arr.shape, dtype=bool)
-            if in_range.any():
-                in_range_pages = page_arr[in_range]
-                authorized[in_range] = (
-                    self.page_owners[in_range_pages, word_idx] & bit
-                ) != 0
+            authorized = (self.page_owners[pages, word_idx] & bit) != 0
             if authorized.all():
                 continue
-            bad_pages = page_arr[~authorized].tolist()
+            bad_pages = pages[~authorized].tolist()
             self._log_violation(req, idx, bad_pages)
             violations.append(IntegrityViolation(req=req, bad_pages=bad_pages))
         return violations
 
     def _log_violation(self, req: Any, req_pool_idx: int, bad_pages: list[int]) -> None:
         rid = getattr(req, "rid", "?")
-        relevant = [
-            entry for entry in self.transition_log if entry[1] in set(bad_pages)
-        ]
+        n = len(bad_pages)
+        head = bad_pages[:32]
+        suffix = "" if n <= 32 else f" ... +{n - 32} more"
+        relevant = [entry for entry in self.transition_log if entry[1] in set(head)]
         logger.warning(
-            "KV integrity violation: rid=%s req_pool_idx=%d bad_pages=%s "
+            "KV integrity violation: rid=%s req_pool_idx=%d bad_pages=%s%s "
             "recent_transitions=%s",
             rid,
             req_pool_idx,
-            bad_pages,
+            head,
+            suffix,
             relevant[-32:],
         )
 

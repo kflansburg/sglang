@@ -54,6 +54,7 @@ from _kv_integrity_helpers import (
     assert_no_owner,
     assert_owners,
     build_tracker,
+    fake_batch_with_pool,
     slot_tensor,
     slots_for_pages,
 )
@@ -160,24 +161,38 @@ class TestValidateBatch(unittest.TestCase):
         self.assertEqual(bad, [])
 
     def test_violation_detected_when_req_pages_includes_unowned_page(self):
+        # H13 shape: alloc page 3 → free it → req_to_token_pool still
+        # references it. Validate must fire.
         t = build_tracker(num_pages=64, page_size=4)
         t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3], page_size=4))
-        t.req_pages[1].add(99)
-        bad = t.validate_batch(fake_batch([("a", 1)]))
+        t.on_free(slots_for_pages([3], page_size=4))
+        batch = fake_batch_with_pool(
+            reqs=[("a", 1)],
+            req_to_token=[(1, slots_for_pages([3], page_size=4))],
+            seq_lens=[4],
+            page_size=4,
+        )
+        bad = t.validate_batch(batch)
         self.assertEqual(len(bad), 1)
         self.assertEqual(bad[0].req.rid, "a")
-        self.assertEqual(bad[0].bad_pages, [99])
+        self.assertEqual(bad[0].bad_pages, [3])
 
     def test_violation_logs_structured_warning(self):
         t = build_tracker(num_pages=64, page_size=4)
         t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3], page_size=4))
-        t.req_pages[1].add(99)
+        t.on_free(slots_for_pages([3], page_size=4))
+        batch = fake_batch_with_pool(
+            reqs=[("a", 1)],
+            req_to_token=[(1, slots_for_pages([3], page_size=4))],
+            seq_lens=[4],
+            page_size=4,
+        )
         with self.assertLogs("sglang", level="WARNING") as cm:
-            t.validate_batch(fake_batch([("a", 1)]))
+            t.validate_batch(batch)
         joined = "\n".join(cm.output)
         self.assertIn("rid=a", joined)
         self.assertIn("req_pool_idx=1", joined)
-        self.assertIn("99", joined)
+        self.assertIn("3", joined)
 
     def test_validate_skips_reqs_without_pool_idx(self):
         t = build_tracker(num_pages=64, page_size=4)
@@ -188,6 +203,144 @@ class TestValidateBatch(unittest.TestCase):
         t = build_tracker(num_pages=64, page_size=4)
         bad = t.validate_batch(fake_batch([("a", 5)]))
         self.assertEqual(bad, [])
+
+
+class TestValidateAgainstReqToTokenPool(unittest.TestCase):
+    """Validation must read each request's *current* page set from
+    `batch.req_to_token_pool.req_to_token[idx, :seq_len]`, not from any
+    historical record of past allocations. This is the only semantic that
+    correctly rejects the spec-decode-rejection / decode-offload-move
+    false-positive paths while still catching the H13 race surface
+    (page freed but req_to_token_pool still references it).
+    """
+
+    def test_freed_pages_dropped_from_req_to_token_pool_do_not_fire(self):
+        # Spec-decode rejection scenario: tracker recorded all 4 draft pages,
+        # 2 were rejected and freed, req_to_token_pool now references only the
+        # 2 accepted pages. Validate must not fire.
+        t = build_tracker(num_pages=64, page_size=4, req_pool_size=64)
+        t.on_alloc(
+            req_pool_idx=5,
+            slot_indices=slots_for_pages([10, 11, 12, 13], page_size=4),
+        )
+        # Verify rejected drafts: free pages 12, 13.
+        t.on_free(slots_for_pages([12, 13], page_size=4))
+        # req_to_token_pool[5, :8] = slots covering only pages 10, 11.
+        batch = fake_batch_with_pool(
+            reqs=[("a", 5)],
+            req_to_token=[(5, slots_for_pages([10, 11], page_size=4))],
+            seq_lens=[8],
+            page_size=4,
+            req_pool_size=64,
+        )
+        bad = t.validate_batch(batch)
+        self.assertEqual(bad, [])
+
+    def test_h13_freed_page_still_in_req_to_token_pool_fires(self):
+        # H13 scenario: page was freed but req_to_token_pool was NOT updated.
+        # Validate must fire.
+        t = build_tracker(num_pages=64, page_size=4, req_pool_size=64)
+        t.on_alloc(
+            req_pool_idx=5,
+            slot_indices=slots_for_pages([10, 11], page_size=4),
+        )
+        # Premature free of page 11 (the H13 race): page_owners cleared.
+        t.on_free(slots_for_pages([11], page_size=4))
+        # req_to_token_pool[5, :8] still references both pages.
+        batch = fake_batch_with_pool(
+            reqs=[("a", 5)],
+            req_to_token=[(5, slots_for_pages([10, 11], page_size=4))],
+            seq_lens=[8],
+            page_size=4,
+            req_pool_size=64,
+        )
+        bad = t.validate_batch(batch)
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0].req.rid, "a")
+        self.assertEqual(bad[0].bad_pages, [11])
+
+    def test_clean_batch_with_pool_returns_no_violations(self):
+        t = build_tracker(num_pages=64, page_size=4, req_pool_size=64)
+        t.on_alloc(
+            req_pool_idx=1,
+            slot_indices=slots_for_pages([3, 5], page_size=4),
+        )
+        t.on_alloc(
+            req_pool_idx=2,
+            slot_indices=slots_for_pages([7], page_size=4),
+        )
+        batch = fake_batch_with_pool(
+            reqs=[("a", 1), ("b", 2)],
+            req_to_token=[
+                (1, slots_for_pages([3, 5], page_size=4)),
+                (2, slots_for_pages([7], page_size=4)),
+            ],
+            seq_lens=[8, 4],
+            page_size=4,
+            req_pool_size=64,
+        )
+        bad = t.validate_batch(batch)
+        self.assertEqual(bad, [])
+
+    def test_mass_eviction_does_not_fire(self):
+        # Reproduces the Test F production trigger: a request alloc'd a long
+        # range of pages over its lifetime, then HiCache / tree-cache evicted
+        # a contiguous mid-range batch. req_to_token_pool retains only the
+        # head + tail. Validate must not fire on the evicted middle range.
+        t = build_tracker(num_pages=128, page_size=4, req_pool_size=64)
+        t.on_alloc(
+            req_pool_idx=7,
+            slot_indices=slots_for_pages(list(range(50)), page_size=4),
+        )
+        # Batch eviction of 32 contiguous pages.
+        t.on_free(slots_for_pages(list(range(10, 42)), page_size=4))
+        # The request now references only the surviving 18 pages.
+        retained = list(range(10)) + list(range(42, 50))
+        batch = fake_batch_with_pool(
+            reqs=[("a", 7)],
+            req_to_token=[(7, slots_for_pages(retained, page_size=4))],
+            seq_lens=[len(retained) * 4],
+            page_size=4,
+            req_pool_size=64,
+            max_context=256,
+        )
+        bad = t.validate_batch(batch)
+        self.assertEqual(bad, [])
+
+
+class TestLogTruncation(unittest.TestCase):
+    """A real violation can flag a long range of pages; the log line must stay
+    bounded in size, regardless. Mirrors what Test F produced before
+    truncation: ~5000-page bad_pages lists per violation, 10KB+ per line."""
+
+    def test_log_truncation_caps_bad_pages_at_32(self):
+        t = build_tracker(num_pages=4096, page_size=4, req_pool_size=64)
+        idx = 5
+        # Allocate 1000 pages then free them all, so every page in
+        # req_to_token_pool will be unauthorized.
+        for p in range(1000):
+            t.on_alloc(
+                req_pool_idx=idx,
+                slot_indices=slots_for_pages([p], page_size=4),
+            )
+        t.on_free(slots_for_pages(list(range(1000)), page_size=4))
+        batch = fake_batch_with_pool(
+            reqs=[("a", idx)],
+            req_to_token=[(idx, slots_for_pages(list(range(1000)), page_size=4))],
+            seq_lens=[1000 * 4],
+            page_size=4,
+            req_pool_size=64,
+            max_context=8192,
+        )
+        with self.assertLogs("sglang", level="WARNING") as cm:
+            t.validate_batch(batch)
+        joined = "\n".join(cm.output)
+        self.assertIn("+968 more", joined)
+        self.assertLess(
+            len(joined),
+            8192,
+            f"log line should be truncated to a few KB, got {len(joined)} bytes",
+        )
 
 
 class TestAllocatorIntegration(unittest.TestCase):
@@ -354,20 +507,35 @@ class TestEndToEndAbortPlumbing(unittest.TestCase):
             prefix_indices=torch.tensor([], dtype=torch.int64),
             to_finish=None,
         )
+        # Each req allocs a non-overlapping range. req a gets slots 16-23
+        # (pages 4, 5), req b gets slots 24-31 (pages 6, 7).
         out_cache_loc = torch.arange(16, 32, dtype=torch.int64)
+        # Build a fake req_to_token_pool whose row[req_pool_idx, :seq_len] for
+        # each req mirrors the recorded allocation. Then inject the H13
+        # corruption shape on req_a only by freeing page 5 while leaving the
+        # pool entry stale — req_a still references page 5 in the pool but
+        # page_owners[5, 1] is cleared.
+        pool_rt = torch.zeros((64, 128), dtype=torch.int64)
+        pool_rt[1, :8] = torch.arange(16, 24, dtype=torch.int64)  # req_a slots
+        pool_rt[2, :8] = torch.arange(24, 32, dtype=torch.int64)  # req_b slots
+        req_to_token_pool = SimpleNamespace(req_to_token=pool_rt)
         batch = SimpleNamespace(
             reqs=[req_a, req_b],
             prefix_lens_cpu=torch.tensor([0, 0], dtype=torch.int64),
             seq_lens_cpu=torch.tensor([8, 8], dtype=torch.int64),
             out_cache_loc=out_cache_loc,
+            req_to_token_pool=req_to_token_pool,
         )
         _record_extend_for_tracker(tracker, batch, out_cache_loc)
-        # Inject a corruption: pretend req_a's req_to_token now references page 99,
-        # which is owned by nobody (and out of range — should still be flagged).
-        tracker.req_pages[1].add(99)
+
+        # Inject corruption on req_a only: free page 5 while the pool still
+        # references it via slots 20-23. Validate must fire on req_a's page 5
+        # but NOT on req_b's pages (still authorized).
+        tracker.on_free(slots_for_pages([5], page_size=4))
         violations = tracker.validate_batch(batch)
         self.assertEqual(len(violations), 1)
         self.assertEqual(violations[0].req.rid, "a")
+        self.assertEqual(violations[0].bad_pages, [5])
 
         # Mimic the abort wiring from prepare_for_extend.
         from http import HTTPStatus
