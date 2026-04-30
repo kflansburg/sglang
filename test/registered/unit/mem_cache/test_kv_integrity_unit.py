@@ -260,5 +260,58 @@ class TestReqToTokenPoolIntegration(unittest.TestCase):
         assert_no_owner(tracker, 2)
 
 
+class TestRecordExtend(unittest.TestCase):
+    def _make_batch(self, reqs_info, prefix_lens_cpu, seq_lens_cpu):
+        import torch
+
+        reqs = [
+            SimpleNamespace(
+                rid=info["rid"],
+                req_pool_idx=info["req_pool_idx"],
+                prefix_indices=info["prefix_indices"],
+            )
+            for info in reqs_info
+        ]
+        return SimpleNamespace(
+            reqs=reqs,
+            prefix_lens_cpu=torch.tensor(prefix_lens_cpu, dtype=torch.int64),
+            seq_lens_cpu=torch.tensor(seq_lens_cpu, dtype=torch.int64),
+        )
+
+    def test_records_extend_alloc_and_prefix_hits_per_req(self):
+        import torch
+
+        from sglang.srt.managers.schedule_batch import _record_extend_for_tracker
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        batch = self._make_batch(
+            reqs_info=[
+                {
+                    "rid": "a",
+                    "req_pool_idx": 1,
+                    "prefix_indices": torch.tensor([], dtype=torch.int64),
+                },
+                {
+                    "rid": "b",
+                    "req_pool_idx": 2,
+                    "prefix_indices": torch.arange(0, 8, dtype=torch.int64),
+                },
+            ],
+            prefix_lens_cpu=[0, 8],
+            seq_lens_cpu=[8, 12],
+        )
+        # Slots layout: req a gets slots [16..23] (8 new), req b gets slots [24..27] (4 new).
+        out_cache_loc = torch.arange(16, 28, dtype=torch.int64)
+        _record_extend_for_tracker(tracker, batch, out_cache_loc)
+        # req a's pages: 4, 5 (slots 16-19, 20-23 with page_size=4)
+        assert_owners(tracker, 4, {1})
+        assert_owners(tracker, 5, {1})
+        # req b's prefix-hit pages: 0, 1 (slots 0-3, 4-7)
+        assert_owners(tracker, 0, {2})
+        assert_owners(tracker, 1, {2})
+        # req b's new pages: 6 (slots 24-27)
+        assert_owners(tracker, 6, {2})
+
+
 if __name__ == "__main__":
     unittest.main()

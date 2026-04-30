@@ -571,6 +571,28 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+def _record_extend_for_tracker(tracker, batch, out_cache_loc) -> None:
+    if not getattr(tracker, "enabled", False):
+        return
+    slots_host = (
+        out_cache_loc.detach().cpu().numpy()
+        if hasattr(out_cache_loc, "detach")
+        else out_cache_loc
+    )
+    prefix_lens = batch.prefix_lens_cpu.tolist()
+    seq_lens = batch.seq_lens_cpu.tolist()
+    offset = 0
+    for i, req in enumerate(batch.reqs):
+        prefix = req.prefix_indices
+        if prefix is not None and len(prefix) > 0:
+            tracker.on_prefix_hit(req.req_pool_idx, prefix)
+        new_tokens = seq_lens[i] - prefix_lens[i]
+        if new_tokens > 0:
+            req_slots = slots_host[offset : offset + new_tokens]
+            tracker.on_alloc(req.req_pool_idx, req_slots)
+            offset += new_tokens
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1952,6 +1974,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+        # KV integrity tracking: record extend allocations + prefix hits, then
+        # validate the batch and abort offending requests.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            self.prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+            _record_extend_for_tracker(tracker, self, self.out_cache_loc)
+            violations = tracker.validate_batch(self)
+            for v in violations:
+                logger.warning(
+                    "Aborting rid=%s due to KV integrity violation on pages %s",
+                    v.req.rid,
+                    v.bad_pages,
+                )
+                v.req.to_finish = FINISH_ABORT(
+                    f"KV integrity violation on pages {v.bad_pages}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "KVIntegrityError",
+                )
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
