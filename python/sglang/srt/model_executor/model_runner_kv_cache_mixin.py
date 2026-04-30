@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -666,18 +668,23 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
-        from sglang.srt.mem_cache.kv_integrity import make_tracker
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker, make_tracker
 
-        tracker = make_tracker(
-            num_pages=(
-                self.token_to_kv_pool_allocator.num_pages
-                if hasattr(self.token_to_kv_pool_allocator, "num_pages")
-                else self.token_to_kv_pool_allocator.size
-                // self.token_to_kv_pool_allocator.page_size
-            ),
-            page_size=self.token_to_kv_pool_allocator.page_size,
-            req_pool_size=self.req_to_token_pool.size,
-        )
+        if isinstance(self.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator):
+            tracker = make_tracker(
+                num_pages=self.token_to_kv_pool_allocator.num_pages,
+                page_size=self.token_to_kv_pool_allocator.page_size,
+                req_pool_size=self.req_to_token_pool.size,
+            )
+        else:
+            tracker = _NullTracker()
+            if os.environ.get("SGLANG_KV_INTEGRITY", "off").lower() == "host":
+                logger.warning(
+                    "SGLANG_KV_INTEGRITY=host is only supported for paged "
+                    "allocators (PagedTokenToKVPoolAllocator). Got %s — falling "
+                    "back to no-op tracker.",
+                    type(self.token_to_kv_pool_allocator).__name__,
+                )
         self.token_to_kv_pool_allocator.tracker = tracker
         self.req_to_token_pool.tracker = tracker
 
