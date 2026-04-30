@@ -154,6 +154,35 @@ class KvIntegrityTracker:
         )
 
 
+def record_alloc_per_req(
+    tracker,
+    req_pool_indices,
+    lens_per_req,
+    out_cache_loc,
+) -> None:
+    if not getattr(tracker, "enabled", False):
+        return
+    if hasattr(out_cache_loc, "detach"):
+        slots_host = out_cache_loc.detach().cpu().numpy()
+    else:
+        slots_host = np.asarray(out_cache_loc)
+    if hasattr(req_pool_indices, "tolist"):
+        indices = req_pool_indices.tolist()
+    else:
+        indices = list(req_pool_indices)
+    if hasattr(lens_per_req, "tolist"):
+        lens = lens_per_req.tolist()
+    else:
+        lens = list(lens_per_req)
+    offset = 0
+    for idx, n in zip(indices, lens):
+        n = int(n)
+        if n <= 0:
+            continue
+        tracker.on_alloc(idx, slots_host[offset : offset + n])
+        offset += n
+
+
 def make_tracker(num_pages: int, page_size: int, req_pool_size: int):
     mode = os.environ.get("SGLANG_KV_INTEGRITY", "off").lower()
     if mode == "off":

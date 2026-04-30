@@ -385,5 +385,56 @@ class TestEndToEndAbortPlumbing(unittest.TestCase):
         self.assertIsNone(req_b.to_finish)
 
 
+class TestRecordAllocPerReq(unittest.TestCase):
+    def test_distributes_slots_by_per_req_length(self):
+        import torch
+
+        from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        # 3 reqs: req 0 gets 4 slots (one page), req 1 gets 0 (skipped),
+        # req 2 gets 8 slots (two pages).
+        out_cache_loc = torch.tensor([20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43])
+        record_alloc_per_req(
+            tracker,
+            req_pool_indices=torch.tensor([5, 6, 7]),
+            lens_per_req=[4, 0, 8],
+            out_cache_loc=out_cache_loc,
+        )
+        assert_owners(tracker, 5, {5})
+        assert_owners(tracker, 9, {7})
+        assert_owners(tracker, 10, {7})
+        self.assertNotIn(6, tracker.req_pages)
+
+    def test_disabled_tracker_is_no_op(self):
+        import torch
+
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker, record_alloc_per_req
+
+        tracker = _NullTracker()
+        record_alloc_per_req(
+            tracker,
+            req_pool_indices=torch.tensor([0, 1]),
+            lens_per_req=[2, 2],
+            out_cache_loc=torch.tensor([10, 11, 12, 13]),
+        )
+        # No exception; nothing tracked.
+
+    def test_accepts_python_list_for_indices_and_lens(self):
+        import torch
+
+        from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        record_alloc_per_req(
+            tracker,
+            req_pool_indices=[5, 7],
+            lens_per_req=[4, 4],
+            out_cache_loc=torch.tensor([20, 21, 22, 23, 36, 37, 38, 39]),
+        )
+        assert_owners(tracker, 5, {5})
+        assert_owners(tracker, 9, {7})
+
+
 if __name__ == "__main__":
     unittest.main()
