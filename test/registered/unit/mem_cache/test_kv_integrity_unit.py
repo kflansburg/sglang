@@ -447,5 +447,37 @@ class TestSingleReqAlloc(unittest.TestCase):
         self.assertEqual(tracker.req_pages[42], {5})
 
 
+class TestSlotBoundsGuard(unittest.TestCase):
+    def test_out_of_range_pages_are_filtered_with_warning(self):
+        import numpy as np
+
+        t = build_tracker(num_pages=64, page_size=4)
+        # Slot 999 → page 249, well out of range.
+        with self.assertLogs("sglang", level="WARNING") as cm:
+            t.on_alloc(req_pool_idx=1, slot_indices=np.array([999], dtype=np.int64))
+        joined = "\n".join(cm.output)
+        self.assertIn("out-of-range", joined)
+        self.assertIn("249", joined)
+        self.assertNotIn(1, t.req_pages)  # nothing was recorded since page filtered
+
+    def test_negative_slots_are_filtered(self):
+        import numpy as np
+
+        t = build_tracker(num_pages=64, page_size=4)
+        with self.assertLogs("sglang", level="WARNING"):
+            t.on_alloc(req_pool_idx=1, slot_indices=np.array([-4, -8], dtype=np.int64))
+        self.assertNotIn(1, t.req_pages)
+
+    def test_mixed_valid_and_invalid_records_only_valid(self):
+        import numpy as np
+
+        t = build_tracker(num_pages=64, page_size=4)
+        # Slots 4..7 → page 1 (valid). Slot 999 → page 249 (invalid).
+        with self.assertLogs("sglang", level="WARNING"):
+            t.on_alloc(req_pool_idx=2, slot_indices=np.array([4, 5, 6, 7, 999]))
+        assert_owners(t, 1, {2})
+        self.assertEqual(t.req_pages[2], {1})
+
+
 if __name__ == "__main__":
     unittest.main()

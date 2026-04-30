@@ -60,7 +60,18 @@ class KvIntegrityTracker:
         slots = np.asarray(slot_indices, dtype=np.int64).ravel()
         if slots.size == 0:
             return np.empty(0, dtype=np.int64)
-        return np.unique(slots // self.page_size)
+        pages = np.unique(slots // self.page_size)
+        in_range = (pages >= 0) & (pages < self.num_pages)
+        if not in_range.all():
+            bad = pages[~in_range].tolist()
+            logger.warning(
+                "KV integrity: dropped out-of-range pages %s (num_pages=%d) "
+                "from slot tracker input — caller passed invalid slot indices",
+                bad,
+                self.num_pages,
+            )
+            pages = pages[in_range]
+        return pages
 
     def _bit_for(self, req_pool_idx: int) -> tuple[int, np.uint64]:
         word_idx = req_pool_idx // 64
