@@ -190,5 +190,55 @@ class TestValidateBatch(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestAllocatorIntegration(unittest.TestCase):
+    def test_paged_allocator_free_invokes_tracker_on_free(self):
+        import torch
+
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.kv_integrity import KvIntegrityTracker
+
+        page_size = 4
+        num_pages = 16
+        size = num_pages * page_size
+        kvcache = SimpleNamespace(device="cpu", dtype=torch.bfloat16)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kvcache,
+            need_sort=False,
+        )
+        tracker = KvIntegrityTracker(
+            num_pages=num_pages, page_size=page_size, req_pool_size=64
+        )
+        allocator.tracker = tracker
+        slots = torch.arange(8, 16, dtype=torch.int64, device="cpu")
+        tracker.on_alloc(req_pool_idx=3, slot_indices=slots)
+        assert_owners(tracker, 2, {3})
+        assert_owners(tracker, 3, {3})
+        allocator.free(slots)
+        assert_no_owner(tracker, 2)
+        assert_no_owner(tracker, 3)
+
+    def test_default_allocator_has_null_tracker(self):
+        import torch
+
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        kvcache = SimpleNamespace(device="cpu", dtype=torch.bfloat16)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=64,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kvcache,
+            need_sort=False,
+        )
+        self.assertIsInstance(allocator.tracker, _NullTracker)
+        allocator.free(torch.tensor([0, 1, 2, 3], dtype=torch.int64))
+
+
 if __name__ == "__main__":
     unittest.main()
