@@ -666,6 +666,21 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
+        from sglang.srt.mem_cache.kv_integrity import make_tracker
+
+        tracker = make_tracker(
+            num_pages=(
+                self.token_to_kv_pool_allocator.num_pages
+                if hasattr(self.token_to_kv_pool_allocator, "num_pages")
+                else self.token_to_kv_pool_allocator.size
+                // self.token_to_kv_pool_allocator.page_size
+            ),
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            req_pool_size=self.req_to_token_pool.size,
+        )
+        self.token_to_kv_pool_allocator.tracker = tracker
+        self.req_to_token_pool.tracker = tracker
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
