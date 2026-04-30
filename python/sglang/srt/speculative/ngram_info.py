@@ -108,6 +108,19 @@ class NgramVerifyInput(SpecInput):
             )
             self.last_loc = last_loc
 
+        tracker = batch.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            num_reqs = len(batch.req_pool_indices)
+            lens_per_req = [self.draft_token_num] * num_reqs
+            record_alloc_per_req(
+                tracker,
+                batch.req_pool_indices,
+                lens_per_req,
+                batch.out_cache_loc,
+            )
+
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,

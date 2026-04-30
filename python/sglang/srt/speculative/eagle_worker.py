@@ -658,6 +658,26 @@ class EAGLEWorker(TpModelWorker):
                 )
             )
 
+        tracker = batch.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            num_reqs = len(batch.req_pool_indices)
+            if self.page_size == 1:
+                per_req = self.speculative_num_steps * self.topk
+                lens_per_req = [per_req] * num_reqs
+            elif self.topk == 1:
+                lens_per_req = (seq_lens_cpu - prefix_lens_cpu).tolist()
+            else:
+                lens_per_req = None
+            if lens_per_req is not None:
+                record_alloc_per_req(
+                    tracker,
+                    batch.req_pool_indices,
+                    lens_per_req,
+                    out_cache_loc,
+                )
+
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
             duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)

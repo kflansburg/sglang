@@ -154,6 +154,22 @@ class EagleDraftInputV2Mixin:
                 num_needed_tokens,
             )
 
+        tracker = batch.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            if page_size == 1:
+                num_reqs = len(batch.req_pool_indices)
+                lens_per_req = [self.draft_token_num] * num_reqs
+            else:
+                lens_per_req = (nxt_kv_lens_cpu - cur_kv_lens_cpu).tolist()
+            record_alloc_per_req(
+                tracker,
+                batch.req_pool_indices,
+                lens_per_req,
+                out_cache_loc,
+            )
+
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,

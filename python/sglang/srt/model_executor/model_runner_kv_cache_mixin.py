@@ -681,6 +681,20 @@ class ModelRunnerKVCacheMixin:
         self.token_to_kv_pool_allocator.tracker = tracker
         self.req_to_token_pool.tracker = tracker
 
+        if (
+            tracker.enabled
+            and getattr(self.server_args, "speculative_eagle_topk", 1) > 1
+            and self.token_to_kv_pool_allocator.page_size > 1
+        ):
+            logger.warning(
+                "SGLANG_KV_INTEGRITY=host: speculative_eagle_topk > 1 with "
+                "page_size > 1 is not fully covered (eagle_worker.py:468 "
+                "post-alloc duplication shape is omitted). Spec-decode "
+                "allocation bugs in this exact configuration may not be "
+                "caught. Set speculative_eagle_topk=1 (Spec v2 default) for "
+                "full coverage."
+            )
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
