@@ -593,6 +593,18 @@ def _record_extend_for_tracker(tracker, batch, out_cache_loc) -> None:
             offset += new_tokens
 
 
+def _record_decode_for_tracker(tracker, batch, out_cache_loc) -> None:
+    if not getattr(tracker, "enabled", False):
+        return
+    slots_host = (
+        out_cache_loc.detach().cpu().numpy()
+        if hasattr(out_cache_loc, "detach")
+        else out_cache_loc
+    )
+    for i, req in enumerate(batch.reqs):
+        tracker.on_alloc(req.req_pool_idx, slots_host[i : i + 1])
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -2395,6 +2407,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+
+        # KV integrity tracking: record decode allocations, then validate the
+        # batch and abort offending requests.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            _record_decode_for_tracker(tracker, self, self.out_cache_loc)
+            violations = tracker.validate_batch(self)
+            for v in violations:
+                logger.warning(
+                    "Aborting rid=%s due to KV integrity violation on pages %s",
+                    v.req.rid,
+                    v.bad_pages,
+                )
+                v.req.to_finish = FINISH_ABORT(
+                    f"KV integrity violation on pages {v.bad_pages}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "KVIntegrityError",
+                )
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:

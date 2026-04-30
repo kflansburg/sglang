@@ -313,5 +313,24 @@ class TestRecordExtend(unittest.TestCase):
         assert_owners(tracker, 6, {2})
 
 
+class TestRecordDecode(unittest.TestCase):
+    def test_records_one_new_slot_per_req(self):
+        import torch
+
+        from sglang.srt.managers.schedule_batch import _record_decode_for_tracker
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        out_cache_loc = torch.tensor([12, 28], dtype=torch.int64)
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(rid="a", req_pool_idx=1),
+                SimpleNamespace(rid="b", req_pool_idx=2),
+            ]
+        )
+        _record_decode_for_tracker(tracker, batch, out_cache_loc)
+        assert_owners(tracker, 3, {1})  # slot 12 // 4 = page 3
+        assert_owners(tracker, 7, {2})  # slot 28 // 4 = page 7
+
+
 if __name__ == "__main__":
     unittest.main()
