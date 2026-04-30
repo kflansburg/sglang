@@ -956,6 +956,10 @@ class DecodePreallocQueue:
             kv_loc is not None
         ), "KV cache is full! There is a bug in memory estimation."
 
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            tracker.on_alloc(req.req_pool_idx, kv_loc)
+
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
         # populate metadata

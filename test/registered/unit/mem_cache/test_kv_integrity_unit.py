@@ -436,5 +436,16 @@ class TestRecordAllocPerReq(unittest.TestCase):
         assert_owners(tracker, 9, {7})
 
 
+class TestSingleReqAlloc(unittest.TestCase):
+    def test_on_alloc_single_req_full_page(self):
+        import torch
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        kv_loc = torch.arange(20, 24, dtype=torch.int64)
+        tracker.on_alloc(req_pool_idx=42, slot_indices=kv_loc)
+        assert_owners(tracker, 5, {42})
+        self.assertEqual(tracker.req_pages[42], {5})
+
+
 if __name__ == "__main__":
     unittest.main()
