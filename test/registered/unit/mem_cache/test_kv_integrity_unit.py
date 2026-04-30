@@ -479,5 +479,66 @@ class TestSlotBoundsGuard(unittest.TestCase):
         self.assertEqual(t.req_pages[2], {1})
 
 
+class TestShouldWarnUnsupportedSpecDecodeShape(unittest.TestCase):
+    """Regression: prefill must not crash when spec-decode is disabled and
+    `server_args.speculative_eagle_topk` is None (not just absent)."""
+
+    def test_topk_none_does_not_raise_and_returns_false(self):
+        from sglang.srt.mem_cache.kv_integrity import (
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        result = should_warn_unsupported_spec_decode_shape(
+            tracker_enabled=True,
+            speculative_eagle_topk=None,
+            page_size=64,
+        )
+        self.assertFalse(result)
+
+    def test_topk_one_returns_false(self):
+        from sglang.srt.mem_cache.kv_integrity import (
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        self.assertFalse(
+            should_warn_unsupported_spec_decode_shape(
+                tracker_enabled=True, speculative_eagle_topk=1, page_size=64
+            )
+        )
+
+    def test_topk_gt_one_with_page_size_one_returns_false(self):
+        from sglang.srt.mem_cache.kv_integrity import (
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        self.assertFalse(
+            should_warn_unsupported_spec_decode_shape(
+                tracker_enabled=True, speculative_eagle_topk=4, page_size=1
+            )
+        )
+
+    def test_topk_gt_one_with_page_size_gt_one_returns_true(self):
+        from sglang.srt.mem_cache.kv_integrity import (
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        self.assertTrue(
+            should_warn_unsupported_spec_decode_shape(
+                tracker_enabled=True, speculative_eagle_topk=4, page_size=64
+            )
+        )
+
+    def test_disabled_tracker_returns_false_regardless(self):
+        from sglang.srt.mem_cache.kv_integrity import (
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        self.assertFalse(
+            should_warn_unsupported_spec_decode_shape(
+                tracker_enabled=False, speculative_eagle_topk=4, page_size=64
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -668,7 +668,11 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
-        from sglang.srt.mem_cache.kv_integrity import _NullTracker, make_tracker
+        from sglang.srt.mem_cache.kv_integrity import (
+            _NullTracker,
+            make_tracker,
+            should_warn_unsupported_spec_decode_shape,
+        )
 
         if isinstance(self.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator):
             tracker = make_tracker(
@@ -688,10 +692,10 @@ class ModelRunnerKVCacheMixin:
         self.token_to_kv_pool_allocator.tracker = tracker
         self.req_to_token_pool.tracker = tracker
 
-        if (
-            tracker.enabled
-            and getattr(self.server_args, "speculative_eagle_topk", 1) > 1
-            and self.token_to_kv_pool_allocator.page_size > 1
+        if should_warn_unsupported_spec_decode_shape(
+            tracker.enabled,
+            getattr(self.server_args, "speculative_eagle_topk", None),
+            self.token_to_kv_pool_allocator.page_size,
         ):
             logger.warning(
                 "SGLANG_KV_INTEGRITY=host: speculative_eagle_topk > 1 with "

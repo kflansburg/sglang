@@ -209,6 +209,22 @@ def record_alloc_per_req(
         offset += n
 
 
+def should_warn_unsupported_spec_decode_shape(
+    tracker_enabled: bool,
+    speculative_eagle_topk,
+    page_size: int,
+) -> bool:
+    """Whether to warn that the eagle_worker.py topk>1 + page_size>1 verify-phase
+    shape (post-alloc cache_loc duplication) is not modeled by this tracker.
+
+    Tolerates ``speculative_eagle_topk`` being ``None`` or missing — when
+    spec-decode is disabled, the server_args attribute may be set to ``None``
+    rather than absent, so ``getattr(args, name, 1)`` is not enough on its own.
+    """
+    topk = speculative_eagle_topk or 1
+    return bool(tracker_enabled) and topk > 1 and page_size > 1
+
+
 def make_tracker(num_pages: int, page_size: int, req_pool_size: int):
     mode = os.environ.get("SGLANG_KV_INTEGRITY", "off").lower()
     if mode == "off":
