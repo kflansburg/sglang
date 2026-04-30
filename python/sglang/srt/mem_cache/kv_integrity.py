@@ -82,6 +82,29 @@ class KvIntegrityTracker:
         for p in pages.tolist():
             self._record("FREE", p, None)
 
+    def on_prefix_hit(self, req_pool_idx: int, slot_indices: Any) -> None:
+        pages = self._pages_from_slots(slot_indices)
+        if pages.size == 0:
+            return
+        word_idx, bit = self._bit_for(req_pool_idx)
+        self.page_owners[pages, word_idx] |= bit
+        bucket = self.req_pages.setdefault(req_pool_idx, set())
+        for p in pages.tolist():
+            bucket.add(p)
+            self._record("PREFIX_HIT", p, req_pool_idx)
+
+    def on_req_free(self, req_pool_idx: Optional[int]) -> None:
+        if req_pool_idx is None:
+            return
+        pages = self.req_pages.pop(req_pool_idx, None)
+        if not pages:
+            return
+        page_arr = np.fromiter(pages, dtype=np.int64, count=len(pages))
+        word_idx, bit = self._bit_for(req_pool_idx)
+        self.page_owners[page_arr, word_idx] &= ~bit
+        for p in pages:
+            self._record("REQ_FREE", p, req_pool_idx)
+
 
 def make_tracker(num_pages: int, page_size: int, req_pool_size: int):
     mode = os.environ.get("SGLANG_KV_INTEGRITY", "off").lower()

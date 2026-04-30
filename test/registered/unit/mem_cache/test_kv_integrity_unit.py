@@ -95,5 +95,52 @@ class TestOnAllocOnFree(unittest.TestCase):
         t.on_free(slot_tensor([]))
 
 
+class TestOnPrefixHitOnReqFree(unittest.TestCase):
+    def test_prefix_hit_or_s_in_existing_owner(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3, 5], page_size=4))
+        t.on_prefix_hit(
+            req_pool_idx=2,
+            slot_indices=slots_for_pages([3, 5], page_size=4),
+        )
+        assert_owners(t, 3, {1, 2})
+        assert_owners(t, 5, {1, 2})
+        self.assertEqual(t.req_pages[2], {3, 5})
+
+    def test_prefix_hit_does_not_disturb_unrelated_pages(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3, 5, 7], page_size=4))
+        t.on_prefix_hit(
+            req_pool_idx=2,
+            slot_indices=slots_for_pages([3], page_size=4),
+        )
+        assert_owners(t, 3, {1, 2})
+        assert_owners(t, 5, {1})
+        assert_owners(t, 7, {1})
+
+    def test_req_free_removes_only_that_req_bit(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3, 5], page_size=4))
+        t.on_prefix_hit(
+            req_pool_idx=2,
+            slot_indices=slots_for_pages([3, 5], page_size=4),
+        )
+        t.on_req_free(1)
+        assert_owners(t, 3, {2})
+        assert_owners(t, 5, {2})
+        self.assertNotIn(1, t.req_pages)
+
+    def test_final_req_free_leaves_zero_row(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3], page_size=4))
+        t.on_req_free(1)
+        assert_no_owner(t, 3)
+        self.assertNotIn(1, t.req_pages)
+
+    def test_req_free_unknown_idx_is_safe(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_req_free(999)
+
+
 if __name__ == "__main__":
     unittest.main()
