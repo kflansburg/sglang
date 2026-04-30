@@ -240,5 +240,25 @@ class TestAllocatorIntegration(unittest.TestCase):
         allocator.free(torch.tensor([0, 1, 2, 3], dtype=torch.int64))
 
 
+class TestReqToTokenPoolIntegration(unittest.TestCase):
+    def test_req_to_token_pool_free_invokes_tracker_on_req_free(self):
+        from sglang.srt.mem_cache.kv_integrity import KvIntegrityTracker
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        pool = ReqToTokenPool(
+            size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+        )
+        tracker = KvIntegrityTracker(num_pages=64, page_size=4, req_pool_size=8)
+        pool.tracker = tracker
+        tracker.on_alloc(
+            req_pool_idx=3, slot_indices=slots_for_pages([1, 2], page_size=4)
+        )
+        req = SimpleNamespace(rid="a", req_pool_idx=3)
+        pool.free(req)
+        self.assertNotIn(3, tracker.req_pages)
+        assert_no_owner(tracker, 1)
+        assert_no_owner(tracker, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,10 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(size))
 
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        self.tracker = _NullTracker()
+
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
@@ -181,6 +185,7 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.tracker.on_req_free(req.req_pool_idx)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
