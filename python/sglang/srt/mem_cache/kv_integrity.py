@@ -2,6 +2,7 @@ import collections
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -9,6 +10,12 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _VALID_MODES = {"off", "host", "device"}
+
+
+@dataclass
+class IntegrityViolation:
+    req: Any
+    bad_pages: list[int]
 
 
 class _NullTracker:
@@ -104,6 +111,47 @@ class KvIntegrityTracker:
         self.page_owners[page_arr, word_idx] &= ~bit
         for p in pages:
             self._record("REQ_FREE", p, req_pool_idx)
+
+    def validate_batch(self, batch: Any) -> list[IntegrityViolation]:
+        violations: list[IntegrityViolation] = []
+        if batch is None:
+            return violations
+        for req in getattr(batch, "reqs", ()):
+            idx = getattr(req, "req_pool_idx", None)
+            if idx is None:
+                continue
+            pages = self.req_pages.get(idx)
+            if not pages:
+                continue
+            page_arr = np.fromiter(pages, dtype=np.int64, count=len(pages))
+            word_idx, bit = self._bit_for(idx)
+            in_range = (page_arr >= 0) & (page_arr < self.num_pages)
+            authorized = np.zeros(page_arr.shape, dtype=bool)
+            if in_range.any():
+                in_range_pages = page_arr[in_range]
+                authorized[in_range] = (
+                    self.page_owners[in_range_pages, word_idx] & bit
+                ) != 0
+            if authorized.all():
+                continue
+            bad_pages = page_arr[~authorized].tolist()
+            self._log_violation(req, idx, bad_pages)
+            violations.append(IntegrityViolation(req=req, bad_pages=bad_pages))
+        return violations
+
+    def _log_violation(self, req: Any, req_pool_idx: int, bad_pages: list[int]) -> None:
+        rid = getattr(req, "rid", "?")
+        relevant = [
+            entry for entry in self.transition_log if entry[1] in set(bad_pages)
+        ]
+        logger.warning(
+            "KV integrity violation: rid=%s req_pool_idx=%d bad_pages=%s "
+            "recent_transitions=%s",
+            rid,
+            req_pool_idx,
+            bad_pages,
+            relevant[-32:],
+        )
 
 
 def make_tracker(num_pages: int, page_size: int, req_pool_size: int):

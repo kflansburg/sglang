@@ -142,5 +142,53 @@ class TestOnPrefixHitOnReqFree(unittest.TestCase):
         t.on_req_free(999)
 
 
+from types import SimpleNamespace
+
+
+def fake_batch(pairs):
+    """pairs is a list of (rid, req_pool_idx)."""
+    reqs = [SimpleNamespace(rid=rid, req_pool_idx=idx) for rid, idx in pairs]
+    return SimpleNamespace(reqs=reqs)
+
+
+class TestValidateBatch(unittest.TestCase):
+    def test_clean_batch_returns_no_bad_reqs(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3, 5], page_size=4))
+        t.on_alloc(req_pool_idx=2, slot_indices=slots_for_pages([7], page_size=4))
+        bad = t.validate_batch(fake_batch([("a", 1), ("b", 2)]))
+        self.assertEqual(bad, [])
+
+    def test_violation_detected_when_req_pages_includes_unowned_page(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3], page_size=4))
+        t.req_pages[1].add(99)
+        bad = t.validate_batch(fake_batch([("a", 1)]))
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0].req.rid, "a")
+        self.assertEqual(bad[0].bad_pages, [99])
+
+    def test_violation_logs_structured_warning(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        t.on_alloc(req_pool_idx=1, slot_indices=slots_for_pages([3], page_size=4))
+        t.req_pages[1].add(99)
+        with self.assertLogs("sglang", level="WARNING") as cm:
+            t.validate_batch(fake_batch([("a", 1)]))
+        joined = "\n".join(cm.output)
+        self.assertIn("rid=a", joined)
+        self.assertIn("req_pool_idx=1", joined)
+        self.assertIn("99", joined)
+
+    def test_validate_skips_reqs_without_pool_idx(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        bad = t.validate_batch(fake_batch([("a", None)]))
+        self.assertEqual(bad, [])
+
+    def test_validate_skips_reqs_with_no_known_pages(self):
+        t = build_tracker(num_pages=64, page_size=4)
+        bad = t.validate_batch(fake_batch([("a", 5)]))
+        self.assertEqual(bad, [])
+
+
 if __name__ == "__main__":
     unittest.main()
