@@ -332,5 +332,58 @@ class TestRecordDecode(unittest.TestCase):
         assert_owners(tracker, 7, {2})  # slot 28 // 4 = page 7
 
 
+class TestEndToEndAbortPlumbing(unittest.TestCase):
+    def test_corruption_sets_to_finish_only_on_offender(self):
+        import torch
+
+        from sglang.srt.managers.schedule_batch import (
+            FINISH_ABORT,
+            _record_extend_for_tracker,
+        )
+
+        tracker = build_tracker(num_pages=64, page_size=4)
+        req_a = SimpleNamespace(
+            rid="a",
+            req_pool_idx=1,
+            prefix_indices=torch.tensor([], dtype=torch.int64),
+            to_finish=None,
+        )
+        req_b = SimpleNamespace(
+            rid="b",
+            req_pool_idx=2,
+            prefix_indices=torch.tensor([], dtype=torch.int64),
+            to_finish=None,
+        )
+        out_cache_loc = torch.arange(16, 32, dtype=torch.int64)
+        batch = SimpleNamespace(
+            reqs=[req_a, req_b],
+            prefix_lens_cpu=torch.tensor([0, 0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([8, 8], dtype=torch.int64),
+            out_cache_loc=out_cache_loc,
+        )
+        _record_extend_for_tracker(tracker, batch, out_cache_loc)
+        # Inject a corruption: pretend req_a's req_to_token now references page 99,
+        # which is owned by nobody (and out of range — should still be flagged).
+        tracker.req_pages[1].add(99)
+        violations = tracker.validate_batch(batch)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].req.rid, "a")
+
+        # Mimic the abort wiring from prepare_for_extend.
+        from http import HTTPStatus
+
+        for v in violations:
+            v.req.to_finish = FINISH_ABORT(
+                f"KV integrity violation on pages {v.bad_pages}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "KVIntegrityError",
+            )
+
+        self.assertIsNotNone(req_a.to_finish)
+        self.assertIsInstance(req_a.to_finish, FINISH_ABORT)
+        self.assertIn("integrity", str(req_a.to_finish.message).lower())
+        self.assertIsNone(req_b.to_finish)
+
+
 if __name__ == "__main__":
     unittest.main()
