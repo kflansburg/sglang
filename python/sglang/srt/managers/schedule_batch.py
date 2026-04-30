@@ -2303,6 +2303,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        # KV integrity validation must run BEFORE the spec-decode early-return
+        # below — otherwise spec-decode workloads (where every decode step
+        # short-circuits via that return) never validate. The bitmap reflects
+        # all on_alloc/on_free events from the prior step (recorded in the
+        # spec-decode allocation hooks for spec paths, or in the trailing
+        # _record_decode_for_tracker call for the non-spec path), and we are
+        # *before* the next forward kernel that would re-read any stale slots.
+        # Aborting via req.to_finish is safe here: no kernel runs between
+        # this point and the next dispatch.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            violations = tracker.validate_batch(self)
+            for v in violations:
+                logger.warning(
+                    "Aborting rid=%s due to KV integrity violation on pages %s",
+                    v.req.rid,
+                    v.bad_pages,
+                )
+                v.req.to_finish = FINISH_ABORT(
+                    f"KV integrity violation on pages {v.bad_pages}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "KVIntegrityError",
+                )
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -2403,23 +2427,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-        # KV integrity tracking: record decode allocations, then validate the
-        # batch and abort offending requests.
+        # KV integrity tracking: record this step's decode allocations.
+        # Validation runs at the TOP of the next prepare_for_decode (before
+        # any spec-decode early-return) so spec and non-spec paths both get
+        # checked exactly once per step.
         tracker = self.token_to_kv_pool_allocator.tracker
         if tracker.enabled:
             _record_decode_for_tracker(tracker, self, self.out_cache_loc)
-            violations = tracker.validate_batch(self)
-            for v in violations:
-                logger.warning(
-                    "Aborting rid=%s due to KV integrity violation on pages %s",
-                    v.req.rid,
-                    v.bad_pages,
-                )
-                v.req.to_finish = FINISH_ABORT(
-                    f"KV integrity violation on pages {v.bad_pages}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "KVIntegrityError",
-                )
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:

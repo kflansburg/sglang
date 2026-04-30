@@ -540,5 +540,57 @@ class TestShouldWarnUnsupportedSpecDecodeShape(unittest.TestCase):
         )
 
 
+class TestPrepareForDecodeOrdering(unittest.TestCase):
+    """Regression: validate_batch must run BEFORE the spec_algorithm
+    early-return in ScheduleBatch.prepare_for_decode. Otherwise spec-decode
+    workloads (where every decode step short-circuits via that return) never
+    validate, silently masking exactly the H13-class bugs the integrity layer
+    is meant to detect. See investigation 2026-04-30-kv-integrity-spec-decode-coverage-gap.md.
+    """
+
+    def test_validate_batch_appears_before_spec_decode_early_return(self):
+        import inspect
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        source = inspect.getsource(ScheduleBatch.prepare_for_decode)
+        validate_pos = source.find("tracker.validate_batch")
+        spec_return_pos = source.find("if not self.spec_algorithm.is_none()")
+        self.assertGreater(
+            validate_pos, 0, "validate_batch must be called in prepare_for_decode"
+        )
+        self.assertGreater(
+            spec_return_pos,
+            0,
+            "spec_algorithm.is_none() guard must exist for the test to be meaningful",
+        )
+        self.assertLess(
+            validate_pos,
+            spec_return_pos,
+            "validate_batch must appear textually before the spec-decode early-return; "
+            "moving it after would silently disable validation on spec-decode workloads",
+        )
+
+    def test_record_decode_appears_after_spec_decode_early_return(self):
+        import inspect
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        source = inspect.getsource(ScheduleBatch.prepare_for_decode)
+        # Match the actual function call, not any comment that mentions the name.
+        record_pos = source.find("_record_decode_for_tracker(tracker")
+        spec_return_pos = source.find("if not self.spec_algorithm.is_none()")
+        self.assertGreater(
+            record_pos, 0, "_record_decode_for_tracker(...) call must exist"
+        )
+        self.assertGreater(
+            record_pos,
+            spec_return_pos,
+            "_record_decode_for_tracker call must appear AFTER the spec-decode "
+            "early-return; spec-decode allocs are recorded inside the eagle worker, "
+            "not here",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
