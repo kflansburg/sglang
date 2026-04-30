@@ -574,35 +574,30 @@ class MultimodalInputs:
 def _record_extend_for_tracker(tracker, batch, out_cache_loc) -> None:
     if not getattr(tracker, "enabled", False):
         return
-    slots_host = (
-        out_cache_loc.detach().cpu().numpy()
-        if hasattr(out_cache_loc, "detach")
-        else out_cache_loc
-    )
-    prefix_lens = batch.prefix_lens_cpu.tolist()
-    seq_lens = batch.seq_lens_cpu.tolist()
-    offset = 0
-    for i, req in enumerate(batch.reqs):
+    from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+    for req in batch.reqs:
         prefix = req.prefix_indices
         if prefix is not None and len(prefix) > 0:
             tracker.on_prefix_hit(req.req_pool_idx, prefix)
-        new_tokens = seq_lens[i] - prefix_lens[i]
-        if new_tokens > 0:
-            req_slots = slots_host[offset : offset + new_tokens]
-            tracker.on_alloc(req.req_pool_idx, req_slots)
-            offset += new_tokens
+    prefix_lens = batch.prefix_lens_cpu.tolist()
+    seq_lens = batch.seq_lens_cpu.tolist()
+    lens_per_req = [seq_lens[i] - prefix_lens[i] for i in range(len(batch.reqs))]
+    req_pool_indices = [req.req_pool_idx for req in batch.reqs]
+    record_alloc_per_req(tracker, req_pool_indices, lens_per_req, out_cache_loc)
 
 
 def _record_decode_for_tracker(tracker, batch, out_cache_loc) -> None:
     if not getattr(tracker, "enabled", False):
         return
-    slots_host = (
-        out_cache_loc.detach().cpu().numpy()
-        if hasattr(out_cache_loc, "detach")
-        else out_cache_loc
+    from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+    record_alloc_per_req(
+        tracker,
+        req_pool_indices=[req.req_pool_idx for req in batch.reqs],
+        lens_per_req=[1] * len(batch.reqs),
+        out_cache_loc=out_cache_loc,
     )
-    for i, req in enumerate(batch.reqs):
-        tracker.on_alloc(req.req_pool_idx, slots_host[i : i + 1])
 
 
 class Req(ReqDllmMixin):
