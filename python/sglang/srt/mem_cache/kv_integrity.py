@@ -160,6 +160,21 @@ def record_alloc_per_req(
     lens_per_req,
     out_cache_loc,
 ) -> None:
+    """Distribute a flat ``out_cache_loc`` across requests by per-req length.
+
+    Calls ``tracker.on_alloc(req_pool_idx, slots)`` for each non-empty req.
+
+    Note: this records allocations only. Validation (catching reads of pages
+    not authorized for the requesting req) runs at the start of the next
+    ``ScheduleBatch.prepare_for_extend`` or ``prepare_for_decode``. For
+    spec-decode call sites, this means a violation is detected one
+    scheduler step after it occurs, not in the same step. This lag is
+    acceptable because:
+
+    * The bitmap is already correct at the time of the next forward.
+    * Aborting mid-spec-decode-verify would corrupt the speculation pipeline
+      worse than letting the bad output complete.
+    """
     if not getattr(tracker, "enabled", False):
         return
     if hasattr(out_cache_loc, "detach"):
