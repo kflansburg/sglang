@@ -89,14 +89,14 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
 
             position_values = getattr(item, "image_position_ids", None)
             if position_values is None:
-                raise RuntimeError(
+                raise ValueError(
                     f"Gemma4 image item {item_idx} is missing image_position_ids"
                 )
 
             features = flatten_nested_list([item.feature])
             position_tensors = flatten_nested_list([position_values])
             if len(features) != len(position_tensors):
-                raise RuntimeError(
+                raise ValueError(
                     f"Gemma4 image item {item_idx} has {len(features)} feature tensor(s) "
                     f"for {len(position_tensors)} image position tensor(s)"
                 )
@@ -115,7 +115,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                     or position_ids.shape[-1] != 2
                     or feature.shape[:2] != position_ids.shape[:2]
                 ):
-                    raise RuntimeError(
+                    raise ValueError(
                         f"Gemma4 image item {item_idx} has incompatible feature shape "
                         f"{tuple(feature.shape)} and image_position_ids shape "
                         f"{tuple(position_ids.shape)}"
@@ -133,7 +133,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                         position_ids, input_seq_len, output_length
                     )
                     if pooling_indices.max().item() >= output_length:
-                        raise RuntimeError(
+                        raise ValueError(
                             f"Gemma4 image item {item_idx} has pooled position outside "
                             f"the valid range [0, {output_length})"
                         )
@@ -143,7 +143,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                     )
 
             if item.offsets is None or len(item.offsets) != len(embedding_counts):
-                raise RuntimeError(
+                raise ValueError(
                     f"Gemma4 image item {item_idx} has {len(item.offsets or [])} token "
                     f"span(s) for {len(embedding_counts)} image(s)"
                 )
@@ -153,7 +153,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             ):
                 num_placeholders = end - start + 1
                 if num_placeholders != num_embeddings:
-                    raise RuntimeError(
+                    raise ValueError(
                         "Gemma4 image token count mismatch before scheduling: "
                         f"item={item_idx}, image={image_idx}, "
                         f"placeholders={num_placeholders}, embeddings={num_embeddings}, "
