@@ -104,7 +104,25 @@ class TestGemma4ImageTokenCounts(CustomTestCase):
         )
 
         with self.assertRaisesRegex(
-            RuntimeError, r"placeholders=4, embeddings=3, patches=12"
+            ValueError, r"placeholders=4, embeddings=3, patches=12"
+        ):
+            make_processor()._validate_image_token_counts([item])
+
+    def test_rejects_production_placeholder_and_embedding_count_mismatch(self):
+        positions = [
+            position
+            for cell in range(428)
+            for position in (
+                [2 * cell, 0],
+                [2 * cell + 1, 0],
+                [2 * cell, 1],
+                [2 * cell + 1, 1],
+            )
+        ]
+        item = make_image_item(offsets=[(0, 511)], position_ids=[positions])
+
+        with self.assertRaisesRegex(
+            ValueError, r"placeholders=512, embeddings=428, patches=1712"
         ):
             make_processor()._validate_image_token_counts([item])
 
@@ -136,7 +154,7 @@ class TestGemma4ImageTokenCounts(CustomTestCase):
         )
 
         with self.assertRaisesRegex(
-            RuntimeError, r"item=0, image=0, placeholders=2, embeddings=1"
+            ValueError, r"item=0, image=0, placeholders=2, embeddings=1"
         ):
             make_processor()._validate_image_token_counts([item])
 
@@ -147,7 +165,7 @@ class TestGemma4ImageTokenCounts(CustomTestCase):
             feature=torch.zeros((1, 1)),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "missing image_position_ids"):
+        with self.assertRaisesRegex(ValueError, "missing image_position_ids"):
             make_processor()._validate_image_token_counts([item])
 
     def test_accepts_list_wrapped_split_item(self):
