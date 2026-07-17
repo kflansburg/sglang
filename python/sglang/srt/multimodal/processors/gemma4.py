@@ -24,7 +24,9 @@ from sglang.srt.managers.multimodal_processor import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.models.gemma4_vision import get_gemma4_vision_pooling_indices
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 
@@ -77,6 +79,87 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         hop = getattr(fe, "hop_length", 160)
         first_stride = _SSCP_CONV_STRIDE_SIZES[0][0]
         return hop * first_stride
+
+    def _validate_image_token_counts(self, mm_items) -> None:
+        pooling_kernel_size = self._processor.image_processor.pooling_kernel_size
+
+        for item_idx, item in enumerate(mm_items):
+            if not item.is_image() or item.is_precomputed_embedding():
+                continue
+
+            position_values = getattr(item, "image_position_ids", None)
+            if position_values is None:
+                raise RuntimeError(
+                    f"Gemma4 image item {item_idx} is missing image_position_ids"
+                )
+
+            features = flatten_nested_list([item.feature])
+            position_tensors = flatten_nested_list([position_values])
+            if len(features) != len(position_tensors):
+                raise RuntimeError(
+                    f"Gemma4 image item {item_idx} has {len(features)} feature tensor(s) "
+                    f"for {len(position_tensors)} image position tensor(s)"
+                )
+
+            embedding_counts = []
+            for feature, position_ids in zip(features, position_tensors, strict=True):
+                feature = torch.as_tensor(feature)
+                position_ids = torch.as_tensor(position_ids)
+                if feature.ndim == 2:
+                    feature = feature.unsqueeze(0)
+                if position_ids.ndim == 2:
+                    position_ids = position_ids.unsqueeze(0)
+                if (
+                    feature.ndim != 3
+                    or position_ids.ndim != 3
+                    or position_ids.shape[-1] != 2
+                    or feature.shape[:2] != position_ids.shape[:2]
+                ):
+                    raise RuntimeError(
+                        f"Gemma4 image item {item_idx} has incompatible feature shape "
+                        f"{tuple(feature.shape)} and image_position_ids shape "
+                        f"{tuple(position_ids.shape)}"
+                    )
+
+                input_seq_len = feature.shape[1]
+                output_length = input_seq_len // pooling_kernel_size**2
+                if input_seq_len == output_length:
+                    masks = (position_ids == -1).all(dim=-1)
+                    embedding_counts.extend(
+                        (mask.sum().item(), input_seq_len) for mask in masks
+                    )
+                else:
+                    pooling_indices, _ = get_gemma4_vision_pooling_indices(
+                        position_ids, input_seq_len, output_length
+                    )
+                    if pooling_indices.max().item() >= output_length:
+                        raise RuntimeError(
+                            f"Gemma4 image item {item_idx} has pooled position outside "
+                            f"the valid range [0, {output_length})"
+                        )
+                    embedding_counts.extend(
+                        (torch.unique(indices).numel(), input_seq_len)
+                        for indices in pooling_indices
+                    )
+
+            if item.offsets is None or len(item.offsets) != len(embedding_counts):
+                raise RuntimeError(
+                    f"Gemma4 image item {item_idx} has {len(item.offsets or [])} token "
+                    f"span(s) for {len(embedding_counts)} image(s)"
+                )
+
+            for image_idx, ((num_embeddings, num_patches), (start, end)) in enumerate(
+                zip(embedding_counts, item.offsets, strict=True)
+            ):
+                num_placeholders = end - start + 1
+                if num_placeholders != num_embeddings:
+                    raise RuntimeError(
+                        "Gemma4 image token count mismatch before scheduling: "
+                        f"item={item_idx}, image={image_idx}, "
+                        f"placeholders={num_placeholders}, embeddings={num_embeddings}, "
+                        f"patches={num_patches}, "
+                        f"pooling_kernel_size={pooling_kernel_size}"
+                    )
 
     def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
         """Convert a VideoDecoderWrapper to a (sampled_frames, C, H, W) uint8 tensor.
@@ -148,6 +231,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        self._validate_image_token_counts(mm_items)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
