@@ -1843,12 +1843,15 @@ class ServingChatTestCase(unittest.TestCase):
         chunks = get_or_create_event_loop().run_until_complete(_collect())
         return [c["usage"] for c in self._parse_chunks(chunks) if c.get("usage")]
 
-    def test_continuous_usage_reports_cached_tokens(self):
-        """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
+    def test_continuous_usage_omits_cached_tokens(self):
+        """continuous_usage_stats chunks omit cached tokens for WCE compatibility."""
         self.tm.server_args.enable_cache_report = True
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+        self.assertEqual(usages[0]["prompt_tokens"], 10)
+        self.assertEqual(usages[0]["completion_tokens"], 2)
+        self.assertEqual(usages[0]["total_tokens"], 12)
+        self.assertIsNone(usages[0].get("prompt_tokens_details"))
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
