@@ -1355,6 +1355,30 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("<｜User｜>describe", out)
         self.assertNotIn("image_url", out)
 
+    def test_dsv4_reasoning_effort_prefixes(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [{"role": "user", "content": "Solve this."}]
+        low = encoding_dsv4.encode_messages(
+            messages, thinking_mode="thinking", reasoning_effort="low"
+        )
+        high = encoding_dsv4.encode_messages(
+            messages, thinking_mode="thinking", reasoning_effort="high"
+        )
+        max_effort = encoding_dsv4.encode_messages(
+            messages, thinking_mode="thinking", reasoning_effort="max"
+        )
+
+        self.assertTrue(low.startswith("<｜begin▁of▁sentence｜><｜User｜>"))
+        self.assertTrue(
+            high.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
+        )
+        self.assertTrue(
+            max_effort.startswith(
+                "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"
+            )
+        )
+
     def test_dsv4_task_and_reminder_encode_end_to_end(self):
         """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
         from sglang.srt.entrypoints.openai import encoding_dsv4
