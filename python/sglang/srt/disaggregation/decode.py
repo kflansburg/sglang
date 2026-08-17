@@ -789,7 +789,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            if poll == KVPoll.Bootstrapping:
+            if poll in (KVPoll.Bootstrapping, KVPoll.Transferring):
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
