@@ -178,6 +178,29 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
 
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_handshake_waits_while_aborted_transfer_quiesces(self, mock_poll):
+        req = SimpleNamespace(
+            rid="quiescing-handshake",
+            bootstrap_room=7,
+            time_stats=MagicMock(),
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=SimpleNamespace(conclude_state=KVPoll.Failed),
+            waiting_for_input=False,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.gloo_group = MagicMock()
+        queue.tp_rank = 0
+        mock_poll.return_value = [KVPoll.Transferring]
+
+        queue._update_handshake_waiters()
+
+        self.assertFalse(decode_req.waiting_for_input)
+        req.time_stats.set_bootstrap_done_time.assert_not_called()
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
