@@ -574,6 +574,12 @@ class BaseMultimodalProcessor(ABC):
             embedding_slice = embeddings[modality][
                 embedding_start : embedding_start + num_tokens
             ]
+            if embedding_slice.shape[0] != num_tokens:
+                raise RuntimeError(
+                    "Precomputed multimodal embedding length mismatch for "
+                    f"{modality.name}: expected {num_tokens} tokens at offset "
+                    f"{embedding_start}, got {embedding_slice.shape[0]}"
+                )
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(
