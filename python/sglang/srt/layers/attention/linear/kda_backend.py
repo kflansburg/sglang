@@ -649,12 +649,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             if fused_static is None:
                 raise RuntimeError("K3 deferred f_b is missing fallback weights")
-            a = kimi_k3_tiny_gemm(
-                a,
-                fused_static[0].view(
-                    layer.num_v_heads * layer.head_v_dim, layer.head_v_dim
-                ),
-            )
+            if a.shape[-1] == layer.head_v_dim:
+                a = kimi_k3_tiny_gemm(
+                    a,
+                    fused_static[0].view(
+                        layer.num_v_heads * layer.head_v_dim, layer.head_v_dim
+                    ),
+                )
 
         # Fully fused decode step: conv1d update + delta-rule recurrence +
         # gated RMSNorm in one kernel. Engages only when the model handed off
