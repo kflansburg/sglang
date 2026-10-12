@@ -249,6 +249,19 @@ class Serving(msgspec.Struct):
         bool,
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
     ] = False
+    systemone_clef_question_mode: A[
+        str,
+        Arg(
+            help="How a Clef joint-schema checkpoint serves /v1/systemone. 'joint' "
+            "(default) answers all questions from one prompt in one prefill with "
+            "cross-question context. 'independent' expands each request into one "
+            "single-question prompt per question, runs each branch as a full "
+            "uncached prefill without cross-question context, and reassembles the "
+            "same response shape. Independent mode is opt-in and may differ in "
+            "accuracy from joint mode, which the checkpoint was trained for.",
+            choices=["joint", "independent"],
+        ),
+    ] = "joint"
 
     # -------------------------------------------------------------------------
     # Streaming

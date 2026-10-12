@@ -18,7 +18,10 @@ from transformers import AutoTokenizer
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
-from sglang.srt.entrypoints.systemone.joint_schema import encode_joint_schema
+from sglang.srt.entrypoints.systemone.joint_schema import (
+    encode_independent_schema,
+    encode_joint_schema,
+)
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing, _read_image
 from sglang.srt.layers.joint_schema_head import (
@@ -468,6 +471,144 @@ class TestJointSchemaAdmission(CustomTestCase):
                     self.assertLess(max(decoded), len(payload))
                 else:
                     self.assertEqual(decoded[-1], len(payload))
+
+
+
+
+class TestIndependentSchemaPrompt(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    def _branches(self, request=REQUEST, max_length=4096):
+        return encode_independent_schema(
+            self.tokenizer,
+            SystemOneRequest(**request),
+            max_length=max_length,
+            image_token_counts=[],
+        )
+
+    def test_one_prompt_per_question_rendered_as_field_one(self):
+        branches = self._branches()
+        self.assertEqual(
+            [question_id for question_id, _, _ in branches],
+            list(REQUEST["questions"]),
+        )
+        for question_id, input_ids, layout in branches:
+            prompt = self.tokenizer.decode(input_ids)
+            self.assertIn("Decide the field.", prompt)
+            self.assertNotIn("Decide every field jointly.", prompt)
+            # Exactly one field, numbered 1, holding this question's ID.
+            self.assertEqual(prompt.count("FIELD "), 1)
+            self.assertIn(f"FIELD 1\nID: {question_id}\n", prompt)
+            self.assertTrue(prompt.endswith("JOINT SCHEMA DECISIONS:"))
+            (question,) = parse_decision_layout(layout, len(input_ids))
+            self.assertEqual(
+                question.question_type,
+                {"team": 1, "urgent": 0, "severity": 2}[question_id],
+            )
+
+    def test_branches_share_an_identical_retained_state(self):
+        request = {**REQUEST, "state": "word " * 5000}
+        branches = self._branches(request=request, max_length=4096)
+        states = []
+        for _, input_ids, _ in branches:
+            prompt = self.tokenizer.decode(input_ids)
+            state = prompt.split("STATE:\n", 1)[1].split("\n\nSCHEMA FIELDS:", 1)[0]
+            states.append(state)
+        self.assertTrue(all(state == states[0] for state in states))
+        # The state is truncated against the widest branch, so the widest
+        # branch fills the budget exactly and narrower branches are shorter.
+        lengths = [len(input_ids) for _, input_ids, _ in branches]
+        self.assertEqual(max(lengths), 4096)
+        self.assertLess(min(lengths), 4096)
+
+    def test_adding_a_question_changes_no_other_branch(self):
+        """Isolation: one question's prompt must not depend on the others."""
+        base = {
+            qid: ids
+            for qid, ids, _ in self._branches(
+                request={**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
+            )
+        }
+        full = {qid: ids for qid, ids, _ in self._branches()}
+        self.assertEqual(base["team"], full["team"])
+
+
+class TestIndependentSchemaAnswers(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+        override = get_context().override_server_args(
+            systemone_clef_question_mode="independent"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    async def test_independent_mode_runs_one_prefill_per_question(self):
+        manager = HeadManager(self.tokenizer)
+        response = await _handler(manager).handle_request(
+            SystemOneRequest(**REQUEST), None
+        )
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        # Three questions, so three independent prefills, one prompt each.
+        self.assertEqual(len(manager.requests), 3)
+        expected = {
+            qid: (ids, layout)
+            for qid, ids, layout in encode_independent_schema(
+                self.tokenizer,
+                SystemOneRequest(**REQUEST),
+                max_length=4089,
+                image_token_counts=[],
+            )
+        }
+        sent = {}
+        for request in manager.requests:
+            (question,) = parse_decision_layout(
+                request.decision_layout, len(request.input_ids)
+            )
+            prompt = self.tokenizer.decode(request.input_ids)
+            qid = prompt.split("FIELD 1\nID: ", 1)[1].split("\n", 1)[0]
+            sent[qid] = (request.input_ids, request.decision_layout)
+        self.assertEqual(set(sent), set(REQUEST["questions"]))
+        for qid in REQUEST["questions"]:
+            self.assertEqual(sent[qid], expected[qid])
+        # usage counts every branch's prompt, as /v1/decisions does per question.
+        total = sum(len(ids) for ids, _ in expected.values())
+        self.assertEqual(body["usage"]["input_tokens"], total)
+        # Answers map back to request ids with the same response shape as joint.
+        self.assertEqual(set(body["answers"]), set(REQUEST["questions"]))
+        three, two = _softmax([0.0, 1.0, 2.0]), _softmax([0.0, 1.0])
+        team, urgent, severity = (body["answers"][q] for q in REQUEST["questions"])
+        self.assertEqual(team["choice"], "support")
+        self.assertAlmostEqual(team["probabilities"]["support"], three[2])
+        self.assertAlmostEqual(urgent["noul"], two[0])
+        self.assertAlmostEqual(severity["score"], three[1] + 2 * three[2])
+        for answer in (team, urgent, severity):
+            self.assertNotIn("x_label_mass", answer)
+
+    async def test_joint_mode_stays_the_default(self):
+        manager = HeadManager(self.tokenizer)
+        with get_context().override_server_args(
+            systemone_clef_question_mode="joint"
+        ) as override:
+            override.install()
+            response = await _handler(manager).handle_request(
+                SystemOneRequest(**REQUEST), None
+            )
+        self.assertEqual(response.status_code, 200)
+        (sent,) = manager.requests
+        input_ids, layout = encode_joint_schema(
+            self.tokenizer,
+            SystemOneRequest(**REQUEST),
+            max_length=4089,
+            image_token_counts=[],
+        )
+        self.assertEqual((sent.input_ids, sent.decision_layout), (input_ids, layout))
 
 
 if __name__ == "__main__":
