@@ -1087,6 +1087,10 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
         self.decision_layout = decision_layout
+        # Projected prefix memory retrieved from the radix-cache sidecar for
+        # a reused CLEF prefix (None until the scheduler's match fills it).
+        # Consumed by ForwardBatch.decision_prefix_memory -> JointSchemaPooler.
+        self.decision_prefix_memory = None
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -1667,6 +1671,17 @@ class Req(ReqDllmMixin):
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
+
+            # CLEF: after the prefix match, carry a cached head sidecar (the
+            # projected prefix memory) onto the request so the pooler reuses it
+            # instead of reprojecting the shared state. Best-effort: on a KV-only
+            # hit or identity mismatch the request stays uncached.
+            if self.decision_layout is not None and self.prefix_len > 0:
+                from sglang.srt.mem_cache.clef_sidecar import (
+                    try_attach_decision_sidecar,
+                )
+
+                try_attach_decision_sidecar(self, tree_cache)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
