@@ -2376,6 +2376,23 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         return f"{base}|{_path}@{_revision}"
 
                     register_identity_provider(_identity)
+
+                    # Let the sidecar producer reach the radix cache from the
+                    # pooler (which owns hidden states but not the cache).
+                    from sglang.srt.mem_cache.clef_sidecar import (
+                        register_cache_resolver,
+                    )
+
+                    def _resolve_cache():
+                        try:
+                            from sglang.srt.runtime_context import get_schedule
+
+                            sched = get_schedule()
+                            return getattr(sched, "tree_cache", None)
+                        except Exception:
+                            return None
+
+                    register_cache_resolver(_resolve_cache)
                 except Exception:
                     # Sidecars are opt-in; failing to register just leaves every
                     # request on the uncached path.

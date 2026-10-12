@@ -135,6 +135,51 @@ def current_identity() -> Optional[str]:
         return None
 
 
+# The pooler owns the hidden states but not the radix cache, and the scheduler
+# owns the cache but not the head. The model that constructs the head registers
+# a resolver locating the tree cache, so the pooler's MISS path can attach by
+# calling produce_sidecar without importing the scheduler.
+_cache_resolver = None
+
+
+def register_cache_resolver(resolver) -> None:
+    """Register a zero-arg callable returning the RadixCache used for sidecars."""
+    global _cache_resolver
+    _cache_resolver = resolver
+
+
+def produce_sidecar(
+    head: JointSchemaHead,
+    node: Any,
+    prefix_hidden_states: torch.Tensor,
+) -> bool:
+    """MISS path: attach the projected prefix memory for ``node`` if possible.
+
+    Called by the pooler after it has the prefix's final hidden states for a
+    request whose matched prefix had no usable sidecar. Returns True when the
+    sidecar was attached. Never raises: any failure degrades to the uncached
+    path (no sidecar attached), matching the module's non-load-bearing rule.
+    """
+    try:
+        if node is None or prefix_hidden_states is None:
+            return False
+        if _cache_resolver is None:
+            return False
+        tree_cache = _cache_resolver()
+        if tree_cache is None or not hasattr(tree_cache, "attach_sidecar"):
+            return False
+        # A node may already carry a sidecar (attached by a concurrent branch);
+        # do not overwrite it.
+        if tree_cache.get_sidecar(node, current_identity() or "") is not None:
+            return False
+        attach_prefix_sidecar(
+            tree_cache, node, head, prefix_hidden_states, current_identity()
+        )
+        return True
+    except Exception:
+        return False
+
+
 def try_attach_decision_sidecar(req: Any, tree_cache: Any) -> None:
     """HIT path: if ``req`` matched a cached prefix that has a sidecar, carry
     that projected prefix memory onto ``req.decision_prefix_memory``.

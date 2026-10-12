@@ -592,6 +592,33 @@ class JointSchemaPooler(nn.Module):
         offsets = [0]
         for length in lengths:
             offsets.append(offsets[-1] + length)
+
+        # MISS path: a request matched a cached prefix (has a node) but had no
+        # usable sidecar. Project that prefix's final hidden states and attach a
+        # sidecar so later requests hit it instead of reprojecting the state.
+        prefix_nodes = getattr(forward_batch, "decision_prefix_nodes", None)
+        if prefix_nodes is not None:
+            try:
+                from sglang.srt.mem_cache.clef_sidecar import produce_sidecar
+
+                for i, node in enumerate(prefix_nodes):
+                    if (
+                        node is None
+                        or used_prefix_memory[i] is not None
+                        or prefix_lengths[i] <= 0
+                    ):
+                        continue
+                    plen = int(prefix_lengths[i])
+                    produce_sidecar(
+                        self.head,
+                        node,
+                        hidden_states[offsets[i] : offsets[i] + plen],
+                    )
+            except Exception:
+                # Sidecars are never load-bearing: attach failure leaves the
+                # request on the already-computed uncached path.
+                pass
+
         runs: List[List[int]] = []
         for i in layouts:
             if runs and runs[-1][-1] == i - 1:

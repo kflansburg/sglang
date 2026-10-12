@@ -622,6 +622,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # per request. Read by JointSchemaPooler to feed the head. None = no sidecar.
     decision_prefix_memory: Optional[List[Optional["torch.Tensor"]]] = None
 
+    # Radix node of each request's matched CLEF prefix (None = no reused prefix).
+    # Used by JointSchemaPooler's MISS path to attach the projected sidecar.
+    decision_prefix_nodes: Optional[List[Optional[Any]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1284,6 +1288,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ):
                 self.decision_prefix_memory = [
                     getattr(r, "decision_prefix_memory", None) for r in batch.reqs
+                ]
+
+            if any(
+                getattr(r, "decision_prefix_node", None) is not None
+                for r in batch.reqs
+            ):
+                self.decision_prefix_nodes = [
+                    getattr(r, "decision_prefix_node", None) for r in batch.reqs
                 ]
 
         token_type_ids = [

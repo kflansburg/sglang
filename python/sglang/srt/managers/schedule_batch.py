@@ -1091,6 +1091,9 @@ class Req(ReqDllmMixin):
         # a reused CLEF prefix (None until the scheduler's match fills it).
         # Consumed by ForwardBatch.decision_prefix_memory -> JointSchemaPooler.
         self.decision_prefix_memory = None
+        # The radix node of the matched prefix (when the prefix is reused).
+        # On a miss the pooler attaches the projected memory to this node.
+        self.decision_prefix_node = None
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -1677,6 +1680,12 @@ class Req(ReqDllmMixin):
             # instead of reprojecting the shared state. Best-effort: on a KV-only
             # hit or identity mismatch the request stays uncached.
             if self.decision_layout is not None and self.prefix_len > 0:
+                # Remember the matched prefix node so the pooler can attach a
+                # sidecar after computing the prefix's hidden states on a miss.
+                self.decision_prefix_node = (
+                    getattr(self, "last_device_node", None)
+                    or getattr(self, "last_node", None)
+                )
                 from sglang.srt.mem_cache.clef_sidecar import (
                     try_attach_decision_sidecar,
                 )
