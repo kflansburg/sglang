@@ -2349,54 +2349,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 self.pooler = JointSchemaPooler(
                     JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
                 )
-                # Let the radix-cache sidecar layer resolve this head's identity
-                # for prefix-memory reuse (the scheduler does not hold the head).
-                try:
-                    from sglang.srt.mem_cache.clef_sidecar import (
-                        identity_with_head,
-                        register_identity_provider,
-                        sidecar_identity,
-                    )
-
-                    _head = self.pooler.head
-                    _revision = getattr(model, "revision", None)
-                    _path = getattr(model, "model_path", None)
-
-                    def _identity():
-                        base = sidecar_identity()
-                        try:
-                            sig = 0
-                            for _n, _p in _head.named_parameters():
-                                sig = (sig * 1315423911) ^ (
-                                    hash((tuple(_p.shape), str(_p.dtype))) & 0x7FFFFFFF
-                                )
-                            base = f"{base}|head@{sig:x}"
-                        except Exception:
-                            pass
-                        return f"{base}|{_path}@{_revision}"
-
-                    register_identity_provider(_identity)
-
-                    # Let the sidecar producer reach the radix cache from the
-                    # pooler (which owns hidden states but not the cache).
-                    from sglang.srt.mem_cache.clef_sidecar import (
-                        register_cache_resolver,
-                    )
-
-                    def _resolve_cache():
-                        try:
-                            from sglang.srt.runtime_context import get_schedule
-
-                            sched = get_schedule()
-                            return getattr(sched, "tree_cache", None)
-                        except Exception:
-                            return None
-
-                    register_cache_resolver(_resolve_cache)
-                except Exception:
-                    # Sidecars are opt-in; failing to register just leaves every
-                    # request on the uncached path.
-                    pass
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)

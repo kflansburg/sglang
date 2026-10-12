@@ -616,15 +616,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
-
-    # Projected prefix memory for CLEF joint-schema requests that reuse a cached
-    # state prefix (the radix-cache sidecar for that prefix), one tensor or None
-    # per request. Read by JointSchemaPooler to feed the head. None = no sidecar.
-    decision_prefix_memory: Optional[List[Optional["torch.Tensor"]]] = None
-
-    # Radix node of each request's matched CLEF prefix (None = no reused prefix).
-    # Used by JointSchemaPooler's MISS path to attach the projected sidecar.
-    decision_prefix_nodes: Optional[List[Optional[Any]]] = None
+    # Joint schema head memory of each request's cached prefix, None per request
+    # without one
+    decision_prefix_memory: Optional[List[Optional[torch.Tensor]]] = None
+    # Which requests return their prefix memory rows, to reuse in later requests
+    return_decision_memory: Optional[List[bool]] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -1281,21 +1277,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             if any(r.decision_layout is not None for r in batch.reqs):
                 self.decision_layouts = [r.decision_layout for r in batch.reqs]
-
-            if any(
-                getattr(r, "decision_prefix_memory", None) is not None
-                for r in batch.reqs
-            ):
                 self.decision_prefix_memory = [
-                    getattr(r, "decision_prefix_memory", None) for r in batch.reqs
+                    r.decision_prefix_memory for r in batch.reqs
                 ]
-
-            if any(
-                getattr(r, "decision_prefix_node", None) is not None
-                for r in batch.reqs
-            ):
-                self.decision_prefix_nodes = [
-                    getattr(r, "decision_prefix_node", None) for r in batch.reqs
+                self.return_decision_memory = [
+                    r.return_decision_memory for r in batch.reqs
                 ]
 
         token_type_ids = [

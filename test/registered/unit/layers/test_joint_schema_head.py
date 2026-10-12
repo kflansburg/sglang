@@ -76,7 +76,9 @@ class _RecordingHead:
     def __init__(self):
         self.calls = []
 
-    def forward_batch(self, hidden, input_ids, lengths, layouts, embedding_weight):
+    def forward_batch(
+        self, hidden, input_ids, lengths, layouts, embedding_weight, prefix_memory
+    ):
         self.calls.append(lengths)
         return [
             torch.full((sum(len(q.option_spans) for q in layout),), float(length))
@@ -96,6 +98,8 @@ class TestJointSchemaPooler(CustomTestCase):
             decision_layouts=[layout, layout, layout],
             extend_seq_lens_cpu=lengths,
             extend_prefix_lens_cpu=[0, 0, 0],
+            decision_prefix_memory=None,
+            return_decision_memory=None,
             batch_size=3,
             input_ids=torch.zeros(sum(lengths), dtype=torch.long),
         )

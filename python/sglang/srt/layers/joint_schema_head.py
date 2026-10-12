@@ -554,65 +554,32 @@ class JointSchemaPooler(nn.Module):
         lengths = list(forward_batch.extend_seq_lens_cpu)
         prefix_lengths = forward_batch.extend_prefix_lens_cpu or [0] * len(lengths)
         raw_layouts = forward_batch.decision_layouts
-        # Projected prefix memory retrieved from the radix cache sidecars, one
-        # tensor (or None) per request. Absent attribute means no sidecar support.
-        sidecars = getattr(forward_batch, "decision_prefix_memory", None)
+        prefix_memory = forward_batch.decision_prefix_memory or [None] * len(lengths)
+        return_memory = forward_batch.return_decision_memory or [False] * len(lengths)
         embeddings: List[torch.Tensor] = [
             hidden_states.new_empty(0, dtype=torch.float32) for _ in lengths
         ]
-        # The tokenizer manager checks every layout against its prompt, and the
-        # server runs each prompt in one uncached prefill. A layout that no longer
-        # fits its prompt, as after a truncation, gets no scores, which the
-        # decision route reports as a server error. A request with a shared
-        # (cached) prefix is scored only when its projected prefix memory is
-        # available as a sidecar; without one — a KV-only hit — it is skipped here
-        # so serving can fall back to a complete uncached prefill.
+        # The tokenizer manager checks every layout against its prompt. A layout
+        # that no longer fits its prompt, as after a truncation, or a cached
+        # prefix without its head memory gets no scores, which the decision route
+        # reports as a server error.
         layouts = {}
-        used_prefix_memory: List[Optional[torch.Tensor]] = [None] * len(lengths)
-        for i, (layout, prefix, length) in enumerate(
-            zip(raw_layouts, prefix_lengths, lengths)
+        for i, (layout, prefix, length, memory) in enumerate(
+            zip(raw_layouts, prefix_lengths, lengths, prefix_memory)
         ):
             if layout is None:
                 continue
-            sidecar = sidecars[i] if sidecars is not None else None
-            if prefix != 0 and sidecar is None:
+            if prefix != (0 if memory is None else memory.shape[0]):
                 continue
             try:
-                layouts[i] = parse_decision_layout(layout, length)
+                layouts[i] = parse_decision_layout(layout, prefix + length)
+                if prefix:
+                    _shift_layout(layouts[i], -prefix)
             except ValueError:
-                continue
-            if sidecar is not None:
-                used_prefix_memory[i] = sidecar
+                layouts.pop(i, None)
         offsets = [0]
         for length in lengths:
             offsets.append(offsets[-1] + length)
-
-        # MISS path: a request matched a cached prefix (has a node) but had no
-        # usable sidecar. Project that prefix's final hidden states and attach a
-        # sidecar so later requests hit it instead of reprojecting the state.
-        prefix_nodes = getattr(forward_batch, "decision_prefix_nodes", None)
-        if prefix_nodes is not None:
-            try:
-                from sglang.srt.mem_cache.clef_sidecar import produce_sidecar
-
-                for i, node in enumerate(prefix_nodes):
-                    if (
-                        node is None
-                        or used_prefix_memory[i] is not None
-                        or prefix_lengths[i] <= 0
-                    ):
-                        continue
-                    plen = int(prefix_lengths[i])
-                    produce_sidecar(
-                        self.head,
-                        node,
-                        hidden_states[offsets[i] : offsets[i] + plen],
-                    )
-            except Exception:
-                # Sidecars are never load-bearing: attach failure leaves the
-                # request on the already-computed uncached path.
-                pass
-
         runs: List[List[int]] = []
         for i in layouts:
             if runs and runs[-1][-1] == i - 1:
@@ -627,9 +594,23 @@ class JointSchemaPooler(nn.Module):
                 [lengths[i] for i in run],
                 [layouts[i] for i in run],
                 self._output_embedding(),
-                prefix_memory=[used_prefix_memory[i] for i in run],
-                prefix_lengths=[prefix_lengths[i] for i in run],
+                prefix_memory=[prefix_memory[i] for i in run],
             )
             for i, values in zip(run, logits):
                 embeddings[i] = values
-        return EmbeddingPoolerOutput(embeddings=embeddings)
+        # Rows up to the first span: a prompt sharing more than that with this
+        # one has its own first span there, and no match goes past it.
+        decision_memory = None
+        if any(return_memory):
+            decision_memory = [None] * len(lengths)
+            for i, layout in layouts.items():
+                if return_memory[i] and prefix_lengths[i] == 0:
+                    first = min(
+                        min(q.question_span[0], q.option_spans[0][0]) for q in layout
+                    )
+                    decision_memory[i] = self.head.project_memory(
+                        hidden_states[offsets[i] : offsets[i] + first]
+                    )
+        return EmbeddingPoolerOutput(
+            embeddings=embeddings, decision_memory=decision_memory
+        )

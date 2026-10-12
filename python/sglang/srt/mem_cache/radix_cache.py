@@ -269,17 +269,6 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
-        # CLEF joint-schema-head sidecar: the projected prefix memory for the
-        # tokens of this node (rows aligned 1:1 with self.value), or None. It is
-        # an immutable tensor kept alive by the owning RadixCache's
-        # _sidecar_store; split nodes keep aligned row slices. Identity of what
-        # produced it (model+head weights, dtype/format) lives on the sidecar
-        # entry, not here.
-        self.sidecar: Optional[torch.Tensor] = None
-        # Which model+head-weights+dtype identity produced `sidecar`
-        # (see attach_sidecar). A mismatch means the stored memory is stale
-        # even when the backbone KV is still valid.
-        self.sidecar_identity: Optional[str] = None
 
     @property
     def evicted(self):
@@ -361,14 +350,6 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        # Active sidecar entries by node id -> (tensor, identity, nbytes).
-        # This is the single owner of every sidecar tensor, so an evicted node's
-        # sidecar is dropped exactly when its last reference here goes away; a
-        # sidecar referenced by an active branch keeps the tensor alive through
-        # that reference. Bytes are accounted into the cache budget via
-        # sidecar_bytes_ (in addition to KV token accounting), not free.
-        self._sidecar_store: dict = {}
-        self.sidecar_bytes_ = 0
         self._empty_device_indices = torch.empty(
             (0,), dtype=torch.int64, device=self.device
         )
@@ -568,59 +549,6 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    ##### CLEF sidecar API #####
-    # A sidecar is the joint schema head's projected prefix memory for a cached
-    # token range, stored alongside the backbone KV for reuse across CLEF branches.
-
-    def sidecar_bytes(self) -> int:
-        """Bytes of stored sidecar tensors, counted in the cache budget."""
-        return self.sidecar_bytes_
-
-    def attach_sidecar(
-        self, node: TreeNode, sidecar: torch.Tensor, identity: str
-    ) -> None:
-        """Own the projected prefix memory for ``node``.
-
-        ``sidecar`` must have one row per token of ``node`` (i.e. per row of
-        ``node.value``); it is treated as immutable. ``identity`` names what
-        produced it (model revision, adapter and head weights, dtype/projection
-        format, mm config), so a head change makes a stored sidecar stale even
-        when the backbone KV is still valid. The node references the rows; this
-        store owns the tensor and accounts its bytes into the budget.
-        """
-        assert node.sidecar is None, "node already has a sidecar"
-        nbytes = sidecar.numel() * sidecar.element_size()
-        entry = (sidecar, identity, nbytes)
-        self._sidecar_store[node.id] = entry
-        self.sidecar_bytes_ += nbytes
-        node.sidecar = sidecar
-        node.sidecar_identity = identity
-
-    def get_sidecar(self, node: TreeNode, identity: str) -> Optional[torch.Tensor]:
-        """The sidecar for ``node`` if it exists and matches ``identity``.
-
-        A KV-only hit (no sidecar) or an identity mismatch yields None, which the
-        caller treats as a miss: recompute the prefix memory or fall back to a
-        complete uncached prefill rather than reuse stale or absent memory.
-        """
-        entry = self._sidecar_store.get(node.id)
-        if entry is None or node.sidecar is None:
-            return None
-        _tensor, stored_identity, _nbytes = entry
-        if stored_identity != identity:
-            return None
-        return node.sidecar
-
-    def drop_sidecar(self, node: TreeNode) -> None:
-        """Release this cache's reference to ``node``'s sidecar and un-account its
-        bytes; the tensor survives while an active branch still references it."""
-        entry = self._sidecar_store.pop(node.id, None)
-        if entry is not None:
-            self.sidecar_bytes_ -= entry[2]
-            node.sidecar = None
-            node.sidecar_identity = None
-
-
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -769,15 +697,6 @@ class RadixCache(BasePrefixCache):
             child.event_hash_value, split_len, self.page_size
         )
 
-        # Sidecar: split the projected prefix memory rows 1:1 with the token split,
-        # preserving aligned row slices. The two node attributes reference row-slices
-        # of the one tensor; the owning entry in the store keeps the underlying
-        # tensor alive, so neither node owns a separate copy.
-        if child.sidecar is not None:
-            new_node.sidecar = child.sidecar[:split_len]
-            child.sidecar = child.sidecar[split_len:]
-            new_node.sidecar_identity = child.sidecar_identity
-
         return new_node
 
     def _inc_hit_count(self, node: TreeNode):
@@ -864,11 +783,6 @@ class RadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.evictable_size_ -= len(node.key)
-        # A leaf only reaches here when it is evictable (lock_ref == 0), so no
-        # active request holds its node; dropping our sidecar reference frees it
-        # unless a branch still references the tensor, which eviction must not
-        # free — that reference keeps the tensor alive independent of this store.
-        self.drop_sidecar(node)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)

@@ -390,6 +390,7 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
+    decision_memory: Optional[List[Optional[torch.Tensor]]] = None
     copy_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
 

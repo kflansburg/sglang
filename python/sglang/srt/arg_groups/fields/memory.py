@@ -68,6 +68,14 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    joint_schema_prefix_memory_mb: A[
+        int,
+        "Device memory, in MiB, for the joint schema head memory of cached prompt "
+        "prefixes. A Clef checkpoint is served without the radix cache unless "
+        "this is positive; with it, decision requests that share a prefix, such "
+        "as the questions of one state, reuse its backbone cache and head memory. "
+        "This memory is not part of --mem-fraction-static.",
+    ] = 0
     enable_page_major_kv_layout: A[
         bool,
         "Store the Mamba state and full/SWA KV caches as one entry per token "

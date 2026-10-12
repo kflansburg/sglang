@@ -298,6 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.decision_prefix_memory import create_decision_prefix_memory
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -712,6 +713,8 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_output_streamer()
+
+        self.maybe_init_decision_prefix_memory()
 
         self.init_batch_result_processor()
 
@@ -2538,6 +2541,11 @@ class Scheduler(
             future_map=self.future_map,
         )
 
+    def maybe_init_decision_prefix_memory(self) -> None:
+        self.decision_prefix_memory = create_decision_prefix_memory(
+            model_config=self.model_config, tree_cache=self.tree_cache
+        )
+
     def init_batch_result_processor(self) -> None:
         self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -2561,6 +2569,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            decision_prefix_memory=self.decision_prefix_memory,
         )
 
     def init_internal_state(self) -> None:
@@ -4105,7 +4114,9 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache, decision_prefix_memory=self.decision_prefix_memory
+            )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4759,6 +4770,7 @@ class Scheduler(
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
+                        decision_memory=pooler_output.decision_memory,
                         can_run_cuda_graph=can_run_cuda_graph,
                     )
                     ret.copy_to_cpu()
@@ -4770,6 +4782,7 @@ class Scheduler(
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
+                    decision_memory=pooler_output.decision_memory,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
@@ -5319,6 +5332,8 @@ class Scheduler(
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
+            if self.decision_prefix_memory is not None:
+                self.decision_prefix_memory.clear()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()

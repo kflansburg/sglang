@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.decision_prefix_memory import (
+    DecisionPrefixMemory,
+    cache_salt,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -113,6 +117,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    decision_prefix_memory: Optional[DecisionPrefixMemory] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -462,6 +467,14 @@ class SchedulerBatchResultProcessor:
                     continue
 
                 req.embedding = embeddings[i]
+                if result.decision_memory is not None:
+                    rows = result.decision_memory[i]
+                    if rows is not None:
+                        self.decision_prefix_memory.store(
+                            cache_salt(req.extra_key, req.cache_salt),
+                            req.origin_input_ids,
+                            rows,
+                        )
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:

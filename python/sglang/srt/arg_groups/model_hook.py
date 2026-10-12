@@ -979,20 +979,34 @@ def handle_model_capability_adjustments(server_args: Any):
         )
 
     # A Clef checkpoint's joint schema head reads the final hidden state of
-    # every prompt token in one pass, so each request is one complete prefill
-    # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    # every uncached prompt token in one pass, so each request is one prefill
+    # with no decode: embedding mode without chunking. Without head memory for
+    # cached prefixes there is no prefix reuse either, which also puts the FA
+    # backend on its raw K/V path, skipping the KV pool. Prefix reuse needs the
+    # extra_buffer Mamba strategy, the one that keeps recurrent state where a
+    # later prompt branches off.
     if model_config.joint_head_config is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
                 "since the joint schema head reads full LM head rows"
             )
-        for key, value in (
-            ("is_embedding", True),
-            ("disable_radix_cache", True),
-            ("chunked_prefill_size", -1),
-        ):
+        adjustments = [("is_embedding", True), ("chunked_prefill_size", -1)]
+        if cfg.joint_schema_prefix_memory_mb <= 0:
+            adjustments.append(("disable_radix_cache", True))
+        elif cfg.disable_radix_cache:
+            raise ValueError(
+                "--joint-schema-prefix-memory-mb needs the radix cache, which "
+                "--disable-radix-cache turns off"
+            )
+        elif cfg.mamba_radix_cache_strategy == "auto":
+            adjustments.append(("mamba_radix_cache_strategy", "extra_buffer"))
+        elif cfg.mamba_radix_cache_strategy != "extra_buffer":
+            raise ValueError(
+                "--joint-schema-prefix-memory-mb needs "
+                "--mamba-radix-cache-strategy extra_buffer"
+            )
+        for key, value in adjustments:
             declare_resolution(
                 server_args, "_handle_model_capability_adjustments", **{key: value}
             )
@@ -1006,7 +1020,8 @@ def handle_model_capability_adjustments(server_args: Any):
             )
         logger.info(
             "Clef joint schema head detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+            "embedding mode without chunked prefill or CUDA graphs, and with the "
+            "radix cache only when --joint-schema-prefix-memory-mb is set."
         )
 
     if (

@@ -43,6 +43,8 @@ class EmbeddingPoolerOutput:
     # due to different per-request matryoshka dim truncation
     embeddings: torch.Tensor | list[torch.Tensor]
     pooled_hidden_states: Optional[torch.Tensor | list[torch.Tensor]] = None
+    # Joint schema head memory rows of each request's prompt prefix, kept on device
+    decision_memory: Optional[list[Optional[torch.Tensor]]] = None
 
 
 def pool_hidden_states(

@@ -115,6 +115,11 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.decision_prefix_memory import (
+    DecisionPrefixMemory,
+    cache_salt,
+    decision_prefix_limit,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
@@ -1087,13 +1092,9 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
         self.decision_layout = decision_layout
-        # Projected prefix memory retrieved from the radix-cache sidecar for
-        # a reused CLEF prefix (None until the scheduler's match fills it).
-        # Consumed by ForwardBatch.decision_prefix_memory -> JointSchemaPooler.
-        self.decision_prefix_memory = None
-        # The radix node of the matched prefix (when the prefix is reused).
-        # On a miss the pooler attaches the projected memory to this node.
-        self.decision_prefix_node = None
+        # Joint schema head memory rows of the prefix reused from the radix cache.
+        self.decision_prefix_memory: Optional[torch.Tensor] = None
+        self.return_decision_memory = False
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -1625,6 +1626,7 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        decision_prefix_memory: Optional[DecisionPrefixMemory] = None,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1661,6 +1663,16 @@ class Req(ReqDllmMixin):
             token_ids_to_match = array("q")
             key_limit = None
 
+        prefix_memory = None
+        if self.decision_layout is not None and key_limit is not None:
+            key_limit, prefix_memory = decision_prefix_limit(
+                self.decision_layout,
+                token_ids_to_match,
+                key_limit,
+                cache_salt(self.extra_key, self.cache_salt),
+                decision_prefix_memory,
+            )
+
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
@@ -1674,23 +1686,13 @@ class Req(ReqDllmMixin):
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
-
-            # CLEF: after the prefix match, carry a cached head sidecar (the
-            # projected prefix memory) onto the request so the pooler reuses it
-            # instead of reprojecting the shared state. Best-effort: on a KV-only
-            # hit or identity mismatch the request stays uncached.
-            if self.decision_layout is not None and self.prefix_len > 0:
-                # Remember the matched prefix node so the pooler can attach a
-                # sidecar after computing the prefix's hidden states on a miss.
-                self.decision_prefix_node = (
-                    getattr(self, "last_device_node", None)
-                    or getattr(self, "last_node", None)
+            if self.decision_layout is not None:
+                self.decision_prefix_memory = (
+                    prefix_memory[: self.prefix_len] if self.prefix_len else None
                 )
-                from sglang.srt.mem_cache.clef_sidecar import (
-                    try_attach_decision_sidecar,
+                self.return_decision_memory = (
+                    decision_prefix_memory is not None and not self.prefix_len
                 )
-
-                try_attach_decision_sidecar(self, tree_cache)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
