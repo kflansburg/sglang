@@ -197,22 +197,40 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        prefix_memory: Optional[List[Optional[torch.Tensor]]] = None,
+        prefix_lengths: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         """One FP32 logit vector per request, its questions' options in layout order.
 
         ``hidden`` holds the final hidden states of the requests back to back.
+        When ``prefix_memory`` and ``prefix_lengths`` are given for a request, that
+        request's first ``prefix_lengths[i]`` hidden positions are a cached prefix:
+        its attention memory is the supplied projected prefix memory concatenated
+        with freshly projected memory for the branch, instead of projecting every
+        position. With both None (the joint path), every position is projected, as
+        before; the result is unchanged.
         """
         outputs: List[torch.Tensor] = []
         start = 0
         for group in _groups(lengths, layouts):
             group_lengths = [lengths[i] for i in group]
             end = start + sum(group_lengths)
+            group_prefix = None
+            group_prefix_lengths = None
+            if prefix_memory is not None:
+                group_prefix = [
+                    (prefix_memory[i] if prefix_memory is not None else None)
+                    for i in group
+                ]
+                group_prefix_lengths = [prefix_lengths[i] for i in group]
             outputs += self._forward_group(
                 hidden[start:end],
                 input_ids[start:end],
                 group_lengths,
                 [layouts[i] for i in group],
                 output_embedding_weight,
+                group_prefix,
+                group_prefix_lengths,
             )
             start = end
         return outputs
@@ -224,6 +242,8 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        prefix_memory: Optional[List[Optional[torch.Tensor]]] = None,
+        prefix_lengths: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         device, dtype = hidden.device, hidden.dtype
         batch = len(layouts)
@@ -304,11 +324,36 @@ class JointSchemaHead(nn.Module):
         token_cu_t, question_cu_t, option_cu_t = (
             cu_t.to(torch.int32).view(3, batch + 1).unbind(0)
         )
-        token_bounds = (token_cu_t, max(lengths))
+        # Attention over `memory` must slice by the extended (prefix + branch)
+        # per-request lengths, which equal the plain lengths when no prefix is set.
+        if any(plen for _, plen, _, _ in memory_parts):
+            token_cu_t = torch.tensor(
+                extended_token_cu, dtype=torch.int32, device=device
+            )
+            max_mem = max(int(plen) + length for _, plen, _, length in memory_parts)
+            token_bounds = (token_cu_t, max_mem)
+        else:
+            token_bounds = (token_cu_t, max(lengths))
         question_bounds_cu = (question_cu_t, max(len(q) for q in layouts))
         option_bounds_cu = (option_cu_t, max(option_counts))
 
         normalized = self.hidden_norm(hidden)
+        # Per-request attention memory: the supplied projected prefix (cached state
+        # tokens) concatenated with freshly projected branch memory. Without a
+        # prefix (the joint path), memory is the projection of every position, as
+        # before; token_cu then matches the plain input lengths.
+        memory_parts = []
+        if prefix_lengths is None or prefix_memory is None:
+            prefix_lens_list = [0] * batch
+        else:
+            prefix_lens_list = list(prefix_lengths)
+        for request, length in enumerate(lengths):
+            plen = 0
+            cached = None
+            if prefix_memory is not None and prefix_memory[request] is not None:
+                cached = prefix_memory[request]
+                plen = cached.shape[0]
+            memory_parts.append((cached, plen, request, length))
         # Running sums over each schema region, after one zero row per request.
         region_total = region_offsets[-1] + batch
         hidden_prefix = torch.zeros(
@@ -337,7 +382,23 @@ class JointSchemaHead(nn.Module):
             sums = prefix[bounds[:, 1]] - prefix[bounds[:, 0]]
             return (sums / (bounds[:, 1] - bounds[:, 0]).unsqueeze(-1)).to(dtype)
 
-        memory = self.memory_projection(normalized)
+        projected = self.memory_projection(normalized)
+        # Memory rows per request: cached prefix rows, then this branch's rows. The
+        # per-request branch rows are the projected hidden states of its tokens.
+        branch_rows = []
+        branch_offsets, cursor = [], 0
+        for length in lengths:
+            branch_offsets.append(cursor)
+            cursor += length
+        mem_seqs = []
+        extended_token_cu = [0]
+        for request, (cached, plen, req_i, length) in enumerate(memory_parts):
+            rows = projected[branch_offsets[request] : branch_offsets[request] + length]
+            if cached is not None:
+                rows = torch.cat([cached.to(rows.dtype), rows], dim=0)
+            mem_seqs.append(rows)
+            extended_token_cu.append(extended_token_cu[-1] + int(plen) + length)
+        memory = torch.cat(mem_seqs, dim=0)
         global_vectors = normalized[last_tokens_t]
         question_vectors = span_means(hidden_prefix, question_bounds_t)
         option_contexts = span_means(hidden_prefix, option_bounds_t)

