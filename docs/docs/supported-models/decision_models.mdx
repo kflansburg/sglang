@@ -209,18 +209,6 @@ These models mix full and linear attention. Answer probabilities can move by up 
 
 `POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. For ordinary generation models, the route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below. A decision checkpoint such as [PPLX-Decider-v1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B) instead gets the prompt, answer codes, and calibrated temperature it was trained with. When its `decision_config.json` sets `attention_mode` to `noncausal_full_attention`, as [PPLX-Decider-v1.1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B) does, its full-attention layers read the whole prompt, and the server turns off the radix cache and chunked prefill, which would show those layers only part of it. A joint schema checkpoint such as [Clef](/cookbook/autoregressive/Cloudflare/clef) answers all questions from one prompt in one prefill, scored by its joint schema head, and does not use the chat template.
 
-### Independent question mode for Clef
-
-By default a joint schema checkpoint answers every question of a `/v1/systemone` request from one shared prompt in one prefill, so questions can carry cross-question context and the answer to one field can influence another. Independent mode is an opt-in alternative that scores each question on its own, without that context.
-
-Launch the server with `--systemone-clef-question-mode` set to one of:
-
-- `joint` (default): the existing behavior, one shared prompt and prefill for all questions. Unchanged unless the flag is set.
-- `independent`: expand each request into one single-question prompt per question. Every question is rendered as the schema's only field (numbered `FIELD 1`) with its original id, its own options, and an identical copy of the retained state, then scored by the joint schema head from its own full, uncached prefill. The branches run batched/concurrently, and the route reassembles the answers into the same response shape as joint mode, one answer per question id. `usage.input_tokens` is the sum of every branch's prompt tokens, so the state is counted once per question.
-
-Because each branch holds the full state, independent mode computes the state once per question rather than once per request; it isolates questions from one another at the cost of more prefill work. A Clef checkpoint is trained for joint decisions, so independent answers can differ from joint answers, and a request's accuracy under independent mode is not guaranteed to match joint mode. To use it, launch the server with `--systemone-clef-question-mode independent`.
-
-
 ```bash Command
 pip install typesafe-sdk
 ```
@@ -260,9 +248,17 @@ What to expect from this route:
 - Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `images` is accepted as an SGLang extension. Clef rejects nonempty `chat_template_kwargs` because it uses the prompt its head was trained with; other models check this field against their own template rules.
 - Unlike `/v1/decisions`, an empty `state` and empty or blank question ids are accepted, as the System One schema allows.
 - Invalid requests return 422 with the location of the error, other refusals return 400, and neither is retried by the SDKs.
-- `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, or once for a joint schema checkpoint, and `usage.output_tokens` is 0.
+- `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, or once for a joint schema checkpoint in its default joint mode, and `usage.output_tokens` is 0.
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.
 - The SDKs time out after 10 seconds and retry, so raise their timeout for requests with many questions over a long state. A request whose client gives up still finishes its encoding and part of its prefill, so each retry repeats at least the encoding.
+
+### Independent question mode for Clef
+
+By default a Clef checkpoint answers every question of a `/v1/systemone` request from one prompt, so one question can change the answer to another. Launching the server with `--systemone-clef-question-mode independent` instead scores each question on its own.
+
+In independent mode, each question gets the prompt that a request holding only that question would get, and its own prefill. The questions run concurrently and the response has the same shape as joint mode. When the state must be truncated, it is truncated once, to fit the longest question, so every question sees the same state. `usage.input_tokens` is the sum over all the prompts, so the state is counted once per question.
+
+Clef was trained to decide all fields together, so independent answers can differ from joint answers, and can be more or less accurate on a given workload. The default is `joint`.
 
 ## Build decisions without `/v1/decisions`
 

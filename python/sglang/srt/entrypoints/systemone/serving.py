@@ -47,7 +47,7 @@ from sglang.srt.entrypoints.systemone.protocol import (
 )
 from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_schedule, get_serving
 from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
@@ -117,12 +117,6 @@ class SystemOneServing(OpenAIServingDecisions):
     ]:
         views = [_view(question) for question in request.questions.values()]
         if self.joint_head_config is not None:
-            if self._clef_question_mode() == "independent":
-                # Each question gets its own prompt and prefill; no joint context.
-                return self._independent_schema_request(request, views), (
-                    request,
-                    views,
-                )
             return self._joint_schema_request(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
@@ -149,9 +143,11 @@ class SystemOneServing(OpenAIServingDecisions):
             or None,
         )
 
-    async def _encode_joint_schema_prompt(
+    async def _encode_joint_schema_prompts(
         self, adapted_request: EmbeddingReqInput, request: SystemOneRequest
-    ) -> None:
+    ) -> List[EmbeddingReqInput]:
+        """One prompt for all questions, or in independent mode one per question,
+        each a request the joint schema head scores in its own prefill."""
         tokenizer_manager = self.tokenizer_manager
         max_length = min(
             REFERENCE_MAX_LENGTH,
@@ -167,14 +163,33 @@ class SystemOneServing(OpenAIServingDecisions):
             adapted_request.image_data, image_token_counts = await self._read_images(
                 adapted_request.image_data
             )
-        input_ids, layout = encode_joint_schema(
-            tokenizer_manager.tokenizer,
-            request,
-            max_length=max_length,
-            image_token_counts=image_token_counts,
-        )
-        adapted_request.input_ids = input_ids
-        adapted_request.decision_layout = layout
+        if get_serving().systemone_clef_question_mode == "joint":
+            input_ids, layout = encode_joint_schema(
+                tokenizer_manager.tokenizer,
+                request,
+                max_length=max_length,
+                image_token_counts=image_token_counts,
+            )
+            adapted_request.input_ids = input_ids
+            adapted_request.decision_layout = layout
+            return [adapted_request]
+        return [
+            EmbeddingReqInput(
+                input_ids=input_ids,
+                decision_layout=layout,
+                image_data=(
+                    None
+                    if adapted_request.image_data is None
+                    else list(adapted_request.image_data)
+                ),
+            )
+            for _, input_ids, layout in encode_independent_schema(
+                tokenizer_manager.tokenizer,
+                request,
+                max_length=max_length,
+                image_token_counts=image_token_counts,
+            )
+        ]
 
     async def _read_images(
         self, images: List[ImageData]
@@ -199,11 +214,14 @@ class SystemOneServing(OpenAIServingDecisions):
         views: List[QuestionView],
         raw_request: Request,
     ) -> ORJSONResponse:
-        await self._encode_joint_schema_prompt(adapted_request, request)
-        ret = await self.tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
-        logits = ret["embedding"]
+        prompts = await self._encode_joint_schema_prompts(adapted_request, request)
+        rets = await asyncio.gather(
+            *(
+                self.tokenizer_manager.generate_request(prompt, raw_request).__anext__()
+                for prompt in prompts
+            )
+        )
+        logits = [score for ret in rets for score in ret["embedding"]]
         names = [
             [name for name, _ in joint_schema_options(question)]
             for question in request.questions.values()
@@ -235,132 +253,9 @@ class SystemOneServing(OpenAIServingDecisions):
         response = SystemOneResponse(
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
-            usage=SystemOneUsage(input_tokens=ret["meta_info"]["prompt_tokens"]),
-        )
-        # The head scores only the allowed options, so there is no label mass.
-        return ORJSONResponse(
-            content=response.model_dump(
-                exclude={"answers": {"__all__": {"x_label_mass"}}}
-            )
-        )
-
-    def _clef_question_mode(self) -> str:
-        """How this Clef checkpoint serves /v1/systemone: joint (default) or
-        independent single-question branches."""
-        try:
-            return get_context().config_leaf("systemone_clef_question_mode")
-        except Exception:
-            return "joint"
-
-    def _independent_schema_request(
-        self, request: SystemOneRequest, views: List[QuestionView]
-    ) -> EmbeddingReqInput:
-        """One placeholder; each question's own prompt is encoded per branch.
-
-        The prompts differ per question, so the handler encodes them once it has
-        read the image sizes, then runs every branch as its own prefill."""
-        for question_id, view in zip(request.questions, views):
-            if view.kind == "score":
-                _check_legend(question_id, view)
-        return EmbeddingReqInput(
-            image_data=[
-                ImageData(url=image.url, detail=image.detail or "auto")
-                for image in request.images
-            ]
-            or None,
-        )
-
-    async def _encode_independent_prompts(
-        self, adapted_request: EmbeddingReqInput, request: SystemOneRequest
-    ) -> List[Tuple[str, List[int], List[int]]]:
-        tokenizer_manager = self.tokenizer_manager
-        max_length = min(
-            REFERENCE_MAX_LENGTH,
-            max_joint_prompt_tokens(
-                context_len=tokenizer_manager.context_len,
-                num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
-                max_req_input_len=tokenizer_manager.max_req_input_len,
-                max_prefill_tokens=get_schedule().max_prefill_tokens,
+            usage=SystemOneUsage(
+                input_tokens=sum(ret["meta_info"]["prompt_tokens"] for ret in rets)
             ),
-        )
-        image_token_counts = []
-        if adapted_request.image_data:
-            adapted_request.image_data, image_token_counts = await self._read_images(
-                adapted_request.image_data
-            )
-        return encode_independent_schema(
-            tokenizer_manager.tokenizer,
-            request,
-            max_length=max_length,
-            image_token_counts=image_token_counts,
-        )
-
-    async def _answer_independent_schema(
-        self,
-        adapted_request: EmbeddingReqInput,
-        request: SystemOneRequest,
-        views: List[QuestionView],
-        raw_request: Request,
-    ) -> ORJSONResponse:
-        """Score each question from its own prefill, then reassemble the response.
-
-        Branches run concurrently; each is an uncached single-question prefill,
-        so no question's prompt carries another question's context."""
-        branches = await self._encode_independent_prompts(adapted_request, request)
-        image_data = adapted_request.image_data
-        total_prompt_tokens = 0
-
-        async def run_branch(question_id, input_ids, layout):
-            nonlocal total_prompt_tokens
-            branch = EmbeddingReqInput(
-                input_ids=input_ids,
-                decision_layout=layout,
-                image_data=image_data,
-            )
-            ret = await self.tokenizer_manager.generate_request(
-                branch, raw_request
-            ).__anext__()
-            total_prompt_tokens += ret["meta_info"]["prompt_tokens"]
-            return question_id, ret["embedding"]
-
-        results = await asyncio.gather(
-            *(run_branch(*branch) for branch in branches)
-        )
-        logits_by_id = dict(results)
-
-        names = {
-            question_id: [name for name, _ in joint_schema_options(question)]
-            for question_id, question in request.questions.items()
-        }
-        answers = {}
-        view_by_id = dict(zip(request.questions, views))
-        for question_id in request.questions:
-            logits = logits_by_id[question_id]
-            question_names = names[question_id]
-            if len(logits) != len(question_names):
-                raise RuntimeError("the joint schema head did not score this request")
-            top = max(logits)
-            weights = [math.exp(score - top) for score in logits]
-            total = math.fsum(weights)
-            by_name = {
-                name: weight / total for name, weight in zip(question_names, weights)
-            }
-            view = view_by_id[question_id]
-            # The head scores true then false, which the view names yes and no.
-            answers[question_id] = _answer(
-                view=view,
-                probabilities=(
-                    [by_name["true"], by_name["false"]]
-                    if view.kind == "yes_no"
-                    else [by_name[name] for name in view.names]
-                ),
-                mass=1.0,
-                question_id=question_id,
-            )
-        response = SystemOneResponse(
-            model=self.tokenizer_manager.served_model_name,
-            answers=answers,
-            usage=SystemOneUsage(input_tokens=total_prompt_tokens),
         )
         # The head scores only the allowed options, so there is no label mass.
         return ORJSONResponse(
@@ -472,10 +367,6 @@ class SystemOneServing(OpenAIServingDecisions):
     ) -> ORJSONResponse:
         request, views = processed
         if self.joint_head_config is not None:
-            if self._clef_question_mode() == "independent":
-                return await self._answer_independent_schema(
-                    adapted_request, request, views, raw_request
-                )
             return await self._answer_joint_schema(
                 adapted_request, request, views, raw_request
             )

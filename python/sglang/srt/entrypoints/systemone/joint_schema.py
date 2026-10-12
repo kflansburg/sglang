@@ -10,7 +10,7 @@ each piece is tokenized on its own.
 from __future__ import annotations
 
 import json
-from typing import Any, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceQuestion,
@@ -18,13 +18,6 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneQuestion,
     SystemOneRequest,
 )
-
-__all__ = [
-    "REFERENCE_MAX_LENGTH",
-    "encode_independent_schema",
-    "encode_joint_schema",
-    "joint_schema_options",
-]
 from sglang.srt.layers.joint_schema_head import (
     QUESTION_TYPES,
     LayoutQuestion,
@@ -55,13 +48,6 @@ def _render(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-# The words of the trained prompt that imply cross-question influence. An
-# independent branch renders one field and must not promise joint decisions.
-_INDEPENDENT_SYSTEM_PROMPT = (
-    "Read the complete state and schema. Decide the field. Each answer "
-    "must be exactly one of that field's allowed options."
-)
-
 def joint_schema_options(question: SystemOneQuestion) -> List[Tuple[str, Any]]:
     """Each option's name and description, in the order the head scores them."""
     if isinstance(question, SystemOneNoulQuestion):
@@ -75,25 +61,13 @@ def joint_schema_options(question: SystemOneQuestion) -> List[Tuple[str, Any]]:
     return [(str(level), detail) for level, detail in enumerate(question.criteria)]
 
 
-def encode_joint_schema(
-    tokenizer: Any,
-    request: SystemOneRequest,
-    max_length: int,
-    image_token_counts: Sequence[int],
-) -> Tuple[List[int], List[int]]:
-    """The prompt ids and their decision layout.
-
-    Each image's placeholder expands to its count in ``image_token_counts``, and
-    the state is truncated so that the expanded prompt has at most
-    ``max_length`` tokens, as encode_record budgets the expanded media.
-    """
-
-    def tokens(text: str) -> List[int]:
-        return tokenizer.encode(text, add_special_tokens=False)
-
+def _encode_schema(
+    tokens: Callable[[str], List[int]], questions: Dict[str, SystemOneQuestion]
+) -> Tuple[List[int], List[Tuple[int, Tuple[int, int], List[Tuple[int, int]]]]]:
+    """The schema ids and, per question, its type and spans within them."""
     schema = tokens("\n\nSCHEMA FIELDS:\n")
-    questions = []
-    for index, (question_id, question) in enumerate(request.questions.items()):
+    layout = []
+    for index, (question_id, question) in enumerate(questions.items()):
         schema += tokens(
             f"\nFIELD {index + 1}\nID: {question_id}\nTYPE: {question.type}\n"
             "INSTRUCTION: "
@@ -118,23 +92,19 @@ def encode_joint_schema(
             option_spans.append((option_start, len(schema)))
             schema += tokens("\n")
         schema += tokens("END FIELD\n")
-        questions.append(
+        layout.append(
             (QUESTION_TYPES.index(question.type), question_span, option_spans)
         )
+    return schema, layout
 
-    prefix = tokens(_PREFIX)
-    if request.images:
-        prefix += tokens(_IMAGE * len(request.images) + "\n")
-    suffix = tokens(_SUFFIX)
-    # Each image's single <|image_pad|> becomes that image's tokens.
-    expansion = sum(count - 1 for count in image_token_counts)
-    fixed_length = len(prefix) + expansion + len(schema) + len(suffix)
-    if fixed_length > max_length:
-        raise ValueError(
-            f"the questions need {fixed_length} prompt tokens before the state, "
-            f"but the prompt holds at most {max_length}"
-        )
-    state = tokens(_render(request.state))[: max_length - fixed_length]
+
+def _assemble(
+    prefix: List[int],
+    state: List[int],
+    schema: List[int],
+    suffix: List[int],
+    questions: List[Tuple[int, Tuple[int, int], List[Tuple[int, int]]]],
+) -> Tuple[List[int], List[int]]:
     offset = len(prefix) + len(state)
     input_ids = prefix + state + schema + suffix
     layout = pack_decision_layout(
@@ -151,103 +121,79 @@ def encode_joint_schema(
     return input_ids, layout
 
 
+def _frame(
+    tokens: Callable[[str], List[int]],
+    request: SystemOneRequest,
+    image_token_counts: Sequence[int],
+) -> Tuple[List[int], List[int], int]:
+    """The ids before the state, the ids after the schema, and the image expansion."""
+    prefix = tokens(_PREFIX)
+    if request.images:
+        prefix += tokens(_IMAGE * len(request.images) + "\n")
+    # Each image's single <|image_pad|> becomes that image's tokens.
+    expansion = sum(count - 1 for count in image_token_counts)
+    return prefix, tokens(_SUFFIX), expansion
+
+
+def encode_joint_schema(
+    tokenizer: Any,
+    request: SystemOneRequest,
+    max_length: int,
+    image_token_counts: Sequence[int],
+) -> Tuple[List[int], List[int]]:
+    """The prompt ids and their decision layout.
+
+    Each image's placeholder expands to its count in ``image_token_counts``, and
+    the state is truncated so that the expanded prompt has at most
+    ``max_length`` tokens, as encode_record budgets the expanded media.
+    """
+
+    def tokens(text: str) -> List[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    schema, questions = _encode_schema(tokens, request.questions)
+    prefix, suffix, expansion = _frame(tokens, request, image_token_counts)
+    fixed_length = len(prefix) + expansion + len(schema) + len(suffix)
+    if fixed_length > max_length:
+        raise ValueError(
+            f"the questions need {fixed_length} prompt tokens before the state, "
+            f"but the prompt holds at most {max_length}"
+        )
+    state = tokens(_render(request.state))[: max_length - fixed_length]
+    return _assemble(prefix, state, schema, suffix, questions)
+
+
 def encode_independent_schema(
     tokenizer: Any,
     request: SystemOneRequest,
     max_length: int,
     image_token_counts: Sequence[int],
 ) -> List[Tuple[str, List[int], List[int]]]:
-    """One single-question prompt per question, as encode_joint_schema renders it.
+    """``(question_id, input_ids, layout)`` per question, in request order.
 
-    Each branch holds the same retained state and this request's question alone,
-    rendered as FIELD 1 with its original ID, under a system message that does
-    not promise joint decisions; its layout is the branch's packed single-field
-    layout. The state is truncated once against the widest branch, so every
-    branch keeps an identical retained state. Adding, deleting, or reordering
-    other questions changes no branch's prompt.
-
-    Returns ``(question_id, input_ids, layout)`` in request order.
+    Each branch is the prompt encode_joint_schema renders for a request holding
+    only that question. The state is truncated once, against the longest branch,
+    so every branch keeps the same state, and a branch equals its standalone
+    request whenever the whole state fits.
     """
 
     def tokens(text: str) -> List[int]:
         return tokenizer.encode(text, add_special_tokens=False)
 
-    # The joint prefix, with a system message that does not promise joint
-    # decisions; the user framing, media placeholders, and STATE: stay intact.
-    prefix = tokens(
-        f"<|im_start|>system\n{_INDEPENDENT_SYSTEM_PROMPT}"
-        "\n<|im_start|>user\nSTATE:\n"
-    )
-    if request.images:
-        prefix += tokens(_IMAGE * len(request.images) + "\n")
-    expansion = sum(count - 1 for count in image_token_counts)
-    suffix = tokens(_SUFFIX)
-
-    branches = []
-    for question_id, question in request.questions.items():
-        schema = tokens("\n\nSCHEMA FIELDS:\n")
-        schema += tokens(
-            f"\nFIELD 1\nID: {question_id}\nTYPE: {question.type}\n"
-            "INSTRUCTION: "
-        )
-        instructions = question.instructions
-        if instructions is None or instructions == "":
-            instructions = question_id
-        question_start = len(schema)
-        schema += tokens(_render(instructions))
-        question_span = (question_start, len(schema))
-        schema += tokens("\nALLOWED OPTIONS:\n")
-        option_spans = []
-        for option_index, (name, description) in enumerate(
-            joint_schema_options(question)
-        ):
-            schema += tokens(f"OPTION {option_index + 1}: ")
-            option_start = len(schema)
-            semantics = {"option_id": name}
-            if description is not None:
-                semantics["description"] = description
-            schema += tokens(_render(semantics))
-            option_spans.append((option_start, len(schema)))
-            schema += tokens("\n")
-        schema += tokens("END FIELD\n")
-        branches.append(
-            (
-                question_id,
-                QUESTION_TYPES.index(question.type),
-                schema,
-                question_span,
-                option_spans,
-            )
-        )
-
-    # Truncate the state once, against the widest branch, so all branches keep
-    # the identical retained state and either all fit or none does.
-    widest = max(
-        len(prefix) + expansion + len(schema) + len(suffix)
-        for _, _, schema, _, _ in branches
-    )
-    if widest > max_length:
+    prefix, suffix, expansion = _frame(tokens, request, image_token_counts)
+    branches = [
+        (question_id, *_encode_schema(tokens, {question_id: question}))
+        for question_id, question in request.questions.items()
+    ]
+    fixed_length = len(prefix) + expansion + len(suffix)
+    fixed_length += max(len(schema) for _, schema, _ in branches)
+    if fixed_length > max_length:
         raise ValueError(
-            f"the widest question needs {widest} prompt tokens before the state, "
-            f"but the prompt holds at most {max_length}"
+            f"the longest question needs {fixed_length} prompt tokens before the "
+            f"state, but the prompt holds at most {max_length}"
         )
-    state = tokens(_render(request.state))[: max_length - widest]
-
-    out = []
-    for question_id, question_type, schema, question_span, option_spans in branches:
-        offset = len(prefix) + len(state)
-        input_ids = prefix + state + schema + suffix
-        layout = pack_decision_layout(
-            len(input_ids),
-            [
-                LayoutQuestion(
-                    question_type,
-                    (question_span[0] + offset, question_span[1] + offset),
-                    tuple(
-                        (start + offset, end + offset) for start, end in option_spans
-                    ),
-                )
-            ],
-        )
-        out.append((question_id, input_ids, layout))
-    return out
+    state = tokens(_render(request.state))[: max_length - fixed_length]
+    return [
+        (question_id, *_assemble(prefix, state, schema, suffix, questions))
+        for question_id, schema, questions in branches
+    ]
