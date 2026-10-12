@@ -617,6 +617,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
 
+    # Projected prefix memory for CLEF joint-schema requests that reuse a cached
+    # state prefix (the radix-cache sidecar for that prefix), one tensor or None
+    # per request. Read by JointSchemaPooler to feed the head. None = no sidecar.
+    decision_prefix_memory: Optional[List[Optional["torch.Tensor"]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1272,6 +1277,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             if any(r.decision_layout is not None for r in batch.reqs):
                 self.decision_layouts = [r.decision_layout for r in batch.reqs]
+
+            if any(
+                getattr(r, "decision_prefix_memory", None) is not None
+                for r in batch.reqs
+            ):
+                self.decision_prefix_memory = [
+                    getattr(r, "decision_prefix_memory", None) for r in batch.reqs
+                ]
 
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None

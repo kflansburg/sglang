@@ -560,23 +560,35 @@ class JointSchemaPooler(nn.Module):
         lengths = list(forward_batch.extend_seq_lens_cpu)
         prefix_lengths = forward_batch.extend_prefix_lens_cpu or [0] * len(lengths)
         raw_layouts = forward_batch.decision_layouts
+        # Projected prefix memory retrieved from the radix cache sidecars, one
+        # tensor (or None) per request. Absent attribute means no sidecar support.
+        sidecars = getattr(forward_batch, "decision_prefix_memory", None)
         embeddings: List[torch.Tensor] = [
             hidden_states.new_empty(0, dtype=torch.float32) for _ in lengths
         ]
         # The tokenizer manager checks every layout against its prompt, and the
         # server runs each prompt in one uncached prefill. A layout that no longer
         # fits its prompt, as after a truncation, gets no scores, which the
-        # decision route reports as a server error.
+        # decision route reports as a server error. A request with a shared
+        # (cached) prefix is scored only when its projected prefix memory is
+        # available as a sidecar; without one — a KV-only hit — it is skipped here
+        # so serving can fall back to a complete uncached prefill.
         layouts = {}
+        used_prefix_memory: List[Optional[torch.Tensor]] = [None] * len(lengths)
         for i, (layout, prefix, length) in enumerate(
             zip(raw_layouts, prefix_lengths, lengths)
         ):
-            if layout is None or prefix != 0:
+            if layout is None:
+                continue
+            sidecar = sidecars[i] if sidecars is not None else None
+            if prefix != 0 and sidecar is None:
                 continue
             try:
                 layouts[i] = parse_decision_layout(layout, length)
             except ValueError:
                 continue
+            if sidecar is not None:
+                used_prefix_memory[i] = sidecar
         offsets = [0]
         for length in lengths:
             offsets.append(offsets[-1] + length)
@@ -594,6 +606,8 @@ class JointSchemaPooler(nn.Module):
                 [lengths[i] for i in run],
                 [layouts[i] for i in run],
                 self._output_embedding(),
+                prefix_memory=[used_prefix_memory[i] for i in run],
+                prefix_lengths=[prefix_lengths[i] for i in run],
             )
             for i, values in zip(run, logits):
                 embeddings[i] = values
