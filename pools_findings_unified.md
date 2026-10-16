@@ -10,6 +10,36 @@ SWA + hybrid mamba (Kimi K3: --mamba-radix-cache-strategy extra_buffer), disaggr
 
 ## Findings (incremental)
 
+## Coverage status (2026-10-16)
+- unified_sub_pool.py: READ END-TO-END (2680 lines). Verdict: engineered sound by construction;
+  defense gaps F0 (hardened) + F1 (contract, unenforced).
+- unified_memory_pool.py: READ END-TO-END (2376): init factories sizing additive-exact (full+swa+mamba
+  byte sums, bs1 floors exact, _reserved_floor_bytes single source, anchors all 0 asserted);
+  views/stride math validated; UnifiedMambaSlotAllocator v2p gather propagates -1 as sentinel
+  (translate(v)=-1 -> consumers must skip; mamba-auditor F-1 caller-side).
+- allocator/unified_hybrid_swa.py: READ END-TO-END (1654): 2-END joint K1/K2/K3 capacity math sound
+  (under-count = denial, never over-alloc); tail-prealloc page accounting consistent at page 64;
+  ensure_capacity flush ladder + float policy verified; tri-pool _fits_page_demand ordering correct.
+- allocator/unified_mamba.py: READ FULLY. DCP widening consistent; free paths defer to F0 hardening.
+- unified_draft_pool.py: READ FULLY — sound, fail-loud on unsupported ops.
+- swa_memory_pool.py (composite SWAKVPool): READ FULLY — mapping mechanism sound; latent
+  move_kv_cache -1 scenario requires caller violation; maybe_detect_oob is env-gated in prod.
+- mamba_checkpoint_pool.py / allocator/mamba.py / mamba_slot_fused.py: READ FULLY (pool mechanics);
+  free-list no-dedup + fused-kernel trusted bounds are caller-contract (mamba-auditor); int8 store
+  index math exact; estimate_mem_usage_bytes == real layout incl slot-0 reserve.
+- kv_cache_configurator.py: configurator-auditor full verdict (no runtime bug; 2 LOW budget items —
+  board #47); I added the allocplan-seam int32 DCP assert (_assert_dcp_widened_ids_fit_int32) with 4
+  tests, committed.
+- allocation.py / kv_index_translator.py / kv_loc_plan.py / allocation_sizing.py: allocplan-auditor
+  full verdict — clean with evidence; 1 latent int32 class -> my config-time assert above.
+- deepseek_v4 pool mechanics: dsv4-pool-auditor full verdict (F1 fixed+tested, F2 PD-trust logged,
+  F3 hisparse data_ptrs -> #hicache); board #24 approved by me.
+- pools_fuzz added by this team: model-checker (pair+tri, ps=4/64), stale-free hardening suite,
+  DCP int32 bound suite, dsv41 window layout suite, mamba slot suite, kernel hardening suite
+  (pools-lead), alloc_extend boundary sweep (pools-lead), allocplan 20k-trial pure fuzz.
+
+
+
 ### F0. Known-class verification status (upstream HEAD, 2026-10-16)
 
 - "unified sub-pool double-free and -1 sink OOB write": PARTIALLY MITIGATED by design.
@@ -114,4 +144,3 @@ the SAME virtual page enters `free_virtual_ids` twice -> same virtual page alloc
 -> cross-request KV aliasing (silent corruption, no OOB). Contract comment at free_segment says
 "a page must be freed by only one call per group" — not asserted. Callers: radix/scheduler paths; flag
 to radix-lead to confirm the invariant is maintained at cache_finished/unfinished with page 64.
-
