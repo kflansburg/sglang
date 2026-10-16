@@ -334,6 +334,17 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
+    def _all_reduce_pp_group(self, tensor: torch.Tensor, op) -> None:
+        """Fold ``tensor`` across the PP pipeline; no-op at pp_size == 1.
+
+        Every rank must enter this exactly once per batch (call-site contract,
+        e.g. linker finish_loads), so the collective stays order-consistent
+        with the other per-batch collectives on each rank.
+        """
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
+
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.

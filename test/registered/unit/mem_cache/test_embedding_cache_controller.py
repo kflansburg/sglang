@@ -1,6 +1,7 @@
 """Unit tests for EmbeddingCacheController paged host pool behavior."""
 
 import threading
+import time
 import unittest
 from queue import Queue
 from unittest.mock import MagicMock
@@ -69,12 +70,15 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
         "total_evicted": 0,
         "eviction_count": 0,
         "allocation_failures": 0,
+        "late_store_ops": 0,
     }
     ctrl.ongoing_prefetch = {}
     ctrl.prefetch_queue = Queue()
     ctrl.insert_queue = Queue()
     ctrl.lock = threading.Lock()
     ctrl.stop_event = threading.Event()
+    ctrl.store_op_deadline_s = 120.0
+    ctrl._late_ops = []
     ctrl.io_thread = MagicMock()
     ctrl.prefetch_tp_group = None
     ctrl._copy_streams = {}
@@ -473,22 +477,395 @@ class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
             ["emb_b"], [[22]], [[4]]
         )
 
-    def test_batch_get_multi_buffers_maps_positive_result_to_true(self):
+    def test_batch_get_multi_buffers_requires_exact_byte_count(self):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
             MooncakeEmbeddingStore,
         )
 
         store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
         store.store = MagicMock()
+        # Full read for "a" (4+4=8 bytes), error for "b".
         store.store.batch_get_into_multi_buffers.return_value = [8, -1]
 
         results = store.batch_get_into_multi_buffers(
             ["a", "b"],
-            [[11], [22]],
-            [[4], [4]],
+            [[11, 12], [22]],
+            [[4, 4], [8]],
         )
 
         self.assertEqual(results, [True, False])
+
+    def test_batch_get_multi_buffers_short_read_is_failure(self):
+        """Regression: a short read (0 < bytes < requested) must be a failure.
+
+        Previously res > 0 was treated as success: a partially filled buffer
+        was cached and served to every later request hitting the hash.
+        """
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+            MooncakeEmbeddingStore,
+        )
+
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = MagicMock()
+        # 4 bytes read of the 8 requested for "a".
+        store.store.batch_get_into_multi_buffers.return_value = [4]
+
+        results = store.batch_get_into_multi_buffers(
+            ["a"],
+            [[11, 12]],
+            [[4, 4]],
+        )
+
+        self.assertEqual(results, [False])
+
+    def test_batch_get_short_read_is_failure(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+            MooncakeEmbeddingStore,
+        )
+
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = MagicMock()
+        store.store.batch_get_into.return_value = [4, 8, -1]
+
+        results = store.batch_get(["a", "b", "c"], [11, 22, 33], [8, 8, 8])
+
+        self.assertEqual(results, [False, True, False])
+
+
+class TestStoreCancelAndPrefetchReap(unittest.TestCase):
+    def test_cancel_store_to_pool_frees_filling_entries(self):
+        """Regression: abandoned D2H handles must not strand FILLING entries.
+
+        FILLING entries are never added to the evictable LRU, so without a
+        cancel path their pages leak permanently.
+        """
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=page_runs,
+            state=EntryState.FILLING,
+        )
+        ctrl.entries["h"] = entry
+        handle = MagicMock()
+
+        ctrl.cancel_store_to_pool([(entry, handle)])
+
+        handle.wait.assert_called_once_with()
+        self.assertNotIn("h", ctrl.entries)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 4)
+
+    def test_cancel_store_to_pool_survives_handle_error(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=page_runs,
+            state=EntryState.FILLING,
+        )
+        ctrl.entries["h"] = entry
+        handle = MagicMock()
+        handle.wait.side_effect = RuntimeError("copy failed")
+
+        ctrl.cancel_store_to_pool([(entry, handle)])
+
+        self.assertNotIn("h", ctrl.entries)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 4)
+
+    def test_prefetch_same_req_id_replaces_stale_op(self):
+        """Regression: a repeated prefetch for one req_id must not leak the
+        older op in ongoing_prefetch (the new op replaces it)."""
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+
+        ctrl.prefetch("req", ["h1"], [2], Modality.IMAGE)
+        stale = ctrl.ongoing_prefetch["req"]
+        ctrl.prefetch("req", ["h2"], [2], Modality.IMAGE)
+
+        self.assertIsNot(ctrl.ongoing_prefetch["req"], stale)
+        self.assertIn("h2", ctrl.ongoing_prefetch["req"].keys)
+
+    def test_release_prefetch_reaps_abandoned_op(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+
+        ctrl.prefetch("req", ["h"], [2], Modality.IMAGE)
+        self.assertIn("req", ctrl.ongoing_prefetch)
+
+        ctrl.release_prefetch("req")
+
+        self.assertNotIn("req", ctrl.ongoing_prefetch)
+        # The FILLING entry remains for the io thread to resolve.
+        self.assertIn("h", ctrl.entries)
+
+
+class TestStoreLaunchFailureCleanup(unittest.TestCase):
+    def test_copy_launch_failure_evicts_pending_entries(self):
+        """Regression: if _copy_tensor_to_pool raises mid-loop, every entry
+        created by this store_to_pool_async call must be freed (they would
+        otherwise leak as FILLING forever), and issued copies are awaited
+        first so pages are not freed under an in-flight D2H."""
+
+        class _FakeCudaTensor:
+            """Minimal stand-in passing the CUDA-device guard and the shape
+            introspection done by store_to_pool_async."""
+
+            ndim = 2
+            shape = (2, 4)
+
+            @property
+            def device(self):
+                class _Dev:
+                    type = "cuda"
+
+                return _Dev()
+
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        issued = []
+        real_copy = ctrl._copy_tensor_to_pool
+
+        def fake_copy(t, entry, pool):
+            if entry.hash == "second":
+                raise RuntimeError("launch failed")
+            handle = MagicMock()
+            issued.append((entry, handle))
+            return handle
+
+        ctrl._copy_tensor_to_pool = fake_copy
+        try:
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                ctrl.store_to_pool_async(
+                    ["first", "second", "third"],
+                    [_FakeCudaTensor(), _FakeCudaTensor(), _FakeCudaTensor()],
+                    Modality.IMAGE,
+                )
+        finally:
+            ctrl._copy_tensor_to_pool = real_copy
+
+        # All three entries must be gone and all pages free again.
+        self.assertEqual(ctrl.entries, {})
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 8)
+        # The issued copy for "first" was awaited before freeing its pages.
+        issued[0][1].wait.assert_called_once_with()
+
+
+class TestWedgedStoreDoesNotBlockIoLoop(unittest.TestCase):
+    """Regression (spec-auditor C1): a hung batch_get must not wedge the
+    io thread; later ops keep flowing, and the late op's pages are reclaimed
+    only after its store call actually returns (never while in flight).
+    """
+
+    def test_wedged_get_marks_late_and_recovers_on_return(self):
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+        calls = []
+
+        def store_get(keys, ptrs, sizes):
+            calls.append(list(keys))
+            if keys == ["h1"]:
+                gate.wait(timeout=10)  # simulate wedged backend
+                return [True]
+            return [True] * len(keys)
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        ctrl.embedding_store.batch_put_from_multi_buffers = MagicMock(
+            return_value=[True]
+        )
+
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            free_after_req1 = ctrl.vision_pool.allocator.free_pages
+            self.assertLess(free_after_req1, 8)
+
+            # Wait past the deadline: the op must be marked late, its pages
+            # NOT freed (transfer may be in flight), and the loop still alive.
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertEqual(
+                ctrl.vision_pool.allocator.free_pages, free_after_req1
+            )
+            self.assertEqual(ctrl.entries["h1"].state, EntryState.FILLING)
+
+            # A later op on another key still completes while the first is wedged.
+            ctrl.prefetch("req2", ["h2"], [2], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    h2 = ctrl.entries.get("h2")
+                    done = h2 is not None and h2.state == EntryState.READY
+                if done:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(ctrl.entries["h2"].state, EntryState.READY)
+            self.assertTrue(ctrl.check_prefetch_progress("req2"))
+
+            # Un-wedge: when the store call finally returns, the late op's
+            # entries resolve (READY here since the fake returns success).
+            gate.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(ctrl._late_ops, [])
+            self.assertEqual(ctrl.entries["h1"].state, EntryState.READY)
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
+
+    def test_wedged_get_failure_frees_pages_on_late_return(self):
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+
+        def store_get(keys, ptrs, sizes):
+            gate.wait(timeout=10)
+            return [False]
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertLess(ctrl.vision_pool.allocator.free_pages, 8)
+
+            gate.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    gone = "h1" not in ctrl.entries
+                if gone and not ctrl._late_ops:
+                    break
+                time.sleep(0.01)
+            self.assertNotIn("h1", ctrl.entries)
+            self.assertEqual(ctrl.vision_pool.allocator.free_pages, 8)
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
+
+
+    def test_insert_completes_and_stats_track_while_get_wedged(self):
+        """Third case (from spec-auditor): an insert on another key drains
+        and unpins while a GET is wedged past deadline; observability moves.
+        """
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+
+        def store_get(keys, ptrs, sizes):
+            gate.wait(timeout=10)
+            return [True]
+
+        put_calls = []
+
+        def store_put(keys, ptrs, sizes):
+            put_calls.append(list(keys))
+            return [True] * len(keys)
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        ctrl.embedding_store.batch_put_from_multi_buffers = store_put
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertEqual(ctrl.stats["late_store_ops"], 1)
+            stats = ctrl.get_stats()  # takes lock; call OUTSIDE ctrl.lock
+            self.assertEqual(stats["late_ops_outstanding"], 1)
+
+            tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+            _insert_ready_entry(ctrl, "hp", tensor)
+            t0 = time.time()
+            ctrl.insert_batch(["hp"], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    if ctrl.entries["hp"].ref_count == 0:
+                        break
+                time.sleep(0.01)
+            self.assertLess(time.time() - t0, ctrl.store_op_deadline_s + 2)
+            self.assertEqual(ctrl.entries["hp"].ref_count, 0)
+            self.assertEqual(put_calls, [["hp"]])
+            self.assertEqual(len(ctrl._late_ops), 1)  # GET still wedged
+            gate.set()
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
+
+
+class TestPoolViewPinPairing(unittest.TestCase):
+    def test_release_only_pinned_hashes_preserves_other_pin(self):
+        """Regression for asymmetric pin/unpin (board EMB-#18).
+
+        Request A calls get_pool_views while H is FILLING -> returns None,
+        no pin. H then becomes READY and request B pins it. A must NOT pass
+        H to release_pool_views; when A releases only the hashes it pinned,
+        B's pin survives (ref_count stays 1, no premature evictability).
+        """
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        ctrl.entries["h"] = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=[PageRun(0, 1)],
+            state=EntryState.FILLING,
+        )
+
+        results = ctrl.get_pool_views(["h"])
+        self.assertEqual(results, [None])
+
+        entry = ctrl.entries["h"]
+        entry.state = EntryState.READY
+        ctrl._mark_ready(entry)
+
+        b_views = ctrl.get_pool_views(["h"])
+        self.assertIsNotNone(b_views[0])
+        self.assertEqual(entry.ref_count, 1)
+        self.assertNotIn("h", ctrl.vision_pool.evictable)
+
+        # Correct caller behavior: A only releases hashes with non-None views.
+        a_pinned = [h for h, s in zip(["h"], results) if s is not None]
+        self.assertEqual(a_pinned, [])
+        ctrl.release_pool_views(a_pinned)
+
+        self.assertEqual(entry.ref_count, 1)
+        self.assertNotIn("h", ctrl.vision_pool.evictable)
+
+        ctrl.release_pool_views(["h"])
+        self.assertEqual(entry.ref_count, 0)
+        self.assertIn("h", ctrl.vision_pool.evictable)
+
+    def test_duplicate_hashes_pin_and_unpin_with_same_multiplicity(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        entry = _insert_ready_entry(ctrl, "h", tensor)
+
+        views = ctrl.get_pool_views(["h", "h"])
+        self.assertEqual(len(views), 2)
+        self.assertEqual(entry.ref_count, 2)
+
+        ctrl.release_pool_views(["h", "h"])
+        self.assertEqual(entry.ref_count, 0)
 
 
 if __name__ == "__main__":
