@@ -3306,8 +3306,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
+            # Under overlap one decode token is in flight but not yet in
+            # kv_committed_len, while prepare_for_decode allocates for
+            # seq_lens + 1 with seq_lens already counting that token. The
+            # pending-inclusive condition for a fresh page is therefore
+            # (committed + pending) % page_size == 0. Counting pending=1 is
+            # exact when a result is in flight and only conservatively
+            # over-estimates by one page per boundary-adjacent request when
+            # nothing is in flight (under-estimation retraction skips and
+            # alloc_decode later fails).
+            pending = 1 if self.enable_overlap else 0
             new_pages = sum(
-                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+                1
+                for r in requests
+                if (r.kv.kv_committed_len + pending) % page_size == 0
             )
             return new_pages * page_size + num_beam_member_rows(requests)
 

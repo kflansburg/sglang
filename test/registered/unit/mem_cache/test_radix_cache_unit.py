@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -504,6 +505,86 @@ class TestRadixCache(CustomTestCase):
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
+
+    def test_checkpoint_never_shrinks_cache_protected_len(self):
+        """Disagg-decode can checkpoint mid-generation (advancing
+        cache_protected_len into the output), and a stop-matched finish trims
+        owned_kv_len back below it. A later checkpoint at the trimmed length
+        must NOT shrink cache_protected_len: otherwise release_kv_cache frees
+        rows the tree still references (use-after-free, double-free at evict).
+        """
+        page_size = DEFAULT_PAGE_SIZE
+
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+            def write(self, indices, values):
+                self.req_to_token[indices] = values
+
+        allocator = PagedTokenToKVPoolAllocator(
+            size=16 * page_size,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(
+            mock_allocator=allocator, page_size=page_size
+        )
+        token_ids = array("q", range(1, 4 * page_size + 1))
+        kv_indices = allocator.alloc(len(token_ids))
+        self.assertIsNotNone(kv_indices)
+        cache.req_to_token_pool = ReqToTokenPool(kv_indices)
+        req = unittest.mock.Mock(
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
+            extra_key=None,
+            cache_salt=None,
+            priority=0,
+            last_node=cache.root_node,
+            lock=None,
+        )
+        req.full_untruncated_fill_ids = token_ids
+        req.origin_input_ids = token_ids[:page_size]
+        req.output_ids = token_ids[page_size:]
+
+        # Mid-generation checkpoint publishes two pages; the row is rebound
+        # onto the tree's copies.
+        cache.checkpoint(req, up_to=2 * page_size)
+        self.assertEqual(req.kv.cache_protected_len, 2 * page_size)
+        tree_page = (
+            cache.req_to_token_pool.req_to_token[0, page_size].item() // page_size
+        )
+        available_before = allocator.available_size()
+
+        # Trimmed finish: release checkpoints at owned_kv_len < protected.
+        trimmed = page_size + page_size // 2
+        cache.checkpoint(req, up_to=trimmed)
+        self.assertEqual(
+            req.kv.cache_protected_len,
+            2 * page_size,
+            "checkpoint must not shrink cache_protected_len",
+        )
+
+        # The release path frees [cache_protected_len, owned_kv_len); nothing
+        # here may come back to the allocator while the tree references it.
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, trimmed)])
+        self.assertEqual(allocator.available_size(), available_before)
+        self.assertNotIn(
+            tree_page, set(allocator.get_all_free_pages().tolist())
+        )
+
+        # The tree still serves the full protected prefix...
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids[: 2 * page_size]))
+        )
+        self.assertEqual(match.device_prefix_len, 2 * page_size)
+
+        # ...and a later allocation must not collide with the tree-owned page.
+        nxt = allocator.alloc(page_size)
+        self.assertIsNotNone(nxt)
+        self.assertNotEqual(nxt[0].item() // page_size, tree_page)
 
     def _checkpoint_split_request(self, priority):
         """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
