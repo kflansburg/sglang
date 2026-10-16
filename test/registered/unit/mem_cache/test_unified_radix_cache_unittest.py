@@ -329,6 +329,7 @@ class _PagedFullComponent(FullComponent):
 
 
 class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "host pool ledger counters need CUDA")
     def test_ledgers_count_reclaimable_tokens(self):
         """The evictable and protected ledgers are in the allocator's units:
         prefill admission adds the evictable ledger to the allocator's free
@@ -1051,6 +1052,8 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     cache.sanity_check()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     cfg = CacheConfig(
         page_size=4,
@@ -1321,6 +1324,8 @@ def _lora_names(**names_by_extra_key):
         table.register(req, names_by_extra_key[req.extra_key])
     return table, reqs
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -1849,6 +1854,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
         self.assertEqual(restored_gpu[0].session_id, "session-a")
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "UnifiedRadixCacheSuite cache fixtures need CUDA")
 
 class UnifiedRadixCacheSuite:
     cfg: CacheConfig
@@ -9712,6 +9719,8 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
         self.assertEqual(self._lru_order(lru), before)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
     """A prefix-cache hit must refresh only best_match_node's mamba state in the
     mamba LRU, not its ancestors. The base TreeComponent refresh is whole-chain
@@ -9778,6 +9787,8 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         self.assertGreater(order.index(a1), order.index(a2))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestMambaCheckpointGrid(CustomTestCase):
     """A donated mamba checkpoint is only reusable at a depth the tree can name.
 
@@ -9842,6 +9853,8 @@ class TestMambaCheckpointGrid(CustomTestCase):
         )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
     """A donated state must have consumed exactly the prefix its key names."""
 
@@ -9903,6 +9916,8 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                     self.assertIsNone(req.kv.mamba_pool_idx)
                 cache.sanity_check()
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
@@ -11183,6 +11198,8 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         self.assertEqual(cache.ongoing_prefetch, {})
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
     """Prefetch must not hang a backed-up host child under an un-backed-up parent.
 
@@ -11427,6 +11444,8 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestSWAWindowUnderBigramKey(CustomTestCase):
     """`checkpoint` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
@@ -11503,6 +11522,8 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.
@@ -12289,6 +12310,8 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
     )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+
 class TestStreamingSessionLockLifecycle(CustomTestCase):
     """A streaming session owns its record and prefix lock from the first
     turn's row allocation; every move of that lock keeps the tree balanced."""
@@ -12451,6 +12474,8 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache.session.release_session("s")
         cache.sanity_check()
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 
 class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
     def _matched_len(self, cache, tokens) -> int:
