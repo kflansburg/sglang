@@ -29,9 +29,24 @@ Status legend: [CAND] candidate, [CONF] confirmed against code, [CLEAN] checked,
 - _commit_hicache_local_restore_to_req: unlocks old req.lock, swaps to restore_lock, sets hicache_restore_lock=None to avoid double unlock. Clean.
 - init_load_back returns None in buffer mode → bare tuple unpack would TypeError; production uses page_first_direct (not buffer mode) so unreachable in production, but a latent crash for buffer-mode users. Low.
 
-## TODO
-- _pre_alloc / pop_preallocated paths (prealloc KV ownership)
-- retract + SWA offload guard (drain_before_retraction call site)
-- admission abort & grammar double release on decode side
-- decode_hicache_mixin + decode_schedule_batch_mixin
-- scheduler.py seams: ladder/timeout of deferred releases (is resolve_deferred_releases called every loop? what if event loop hops?)
+## Pass 3 (final coverage of lifecycle)
+
+- pop_preallocated FINISH_ABORT sweep (decode.py:1368-1391): only reqs not yet preallocated live in this queue (preallocated ones are popped to transfer queue in the same call), so kv_receiver.clear()+None suffices; no KV/lock held yet. Lock leak on reservation-not-fit avoided via unlock at 1543/1563. [CLEAN]
+- _update_handshake_waiters Failed -> prepare_abort; swept next pop. Handshake precedes prealloc, nothing held. [CLEAN]
+- hold_rebootstrap (decode.py:896): reqs held in held_rebootstrap_reqs while engine paused for weight update; their KV row was already freed by retract_all(offload_kv=False). RESIDUAL: abort_request does not scan held_rebootstrap_reqs -> a client abort during a paused engine is never delivered to these reqs; on resume they recompute prefill for a dead client (leak of a running request, not memory safety). [CAND-4, low]
+- retract guard: drain_before_retraction RuntimeError is UNCAUGHT in event loop path (scheduler.py:4399 inside update_running_batch) and pause path (:5727) -> decode process dies when OOM-retract coincides with in-flight offload D2H (prod config: decode offload enabled). Memory-safe but availability-hostile; the correct behavior is a one-iteration defer. [CAND-3]
+- _commit_transfer_to_req: metadata bootstrap_room validation present (0 -> abort; mismatch -> abort). kv_receiver.clear()+None on every exit incl. abort. [CLEAN]
+- decode_schedule_batch_mixin: process_prebuilt grammar uses to_finish (single release). PREBUILT writes out_cache_loc from pre-committed req_to_token rows; indexes from prefix lock. [CLEAN]
+- resolve_deferred_releases committed 3338 in process_decode_queue each loop -> timeouts fire. release_memory_occupation drops deferred entries only under is_fully_idle assert + flush_cache. [CLEAN-ish, see CAND-2 residual]
+
+## Items verified clean (known-bug checklist)
+- deferred decode KV release: present upstream (on by default), drain-ack + timeout; timeout escape hatch = CAND-1.
+- disaggregation admission abort: decode-side abort handled in abort_request for all four states (prealloc queue, transfer queue, retracted, waiting, running). [CLEAN]
+- grammar double release: fixed upstream via to_FINISH single-path. [CLEAN]
+- retract with SWA offload guard: fixed upstream (drain + synchronous backup). [CLEAN, but CAND-3 crash-on-guard]
+- prefill abort cache leak (decode side of the seam): transfer-queue failure always releases prealloc'd KV via _release_request or deferred release. [CLEAN]
+
+## Not deeply covered (handoff notes)
+- HiSparse direct-to-host path (decode.py:2260-2278 alloc_for_decode_prealloc_hisparse, host pool rows): production runs DSA trtllm on DeepSeek V4, hisparse coordinator is adjacent; only lightly checked.
+- _pre_alloc_host sidecar_pool_specs indices (extra pools from tree_cache.sidecar_pool_specs) reuse the same host_indices — assumed by construction.
+- Who catches kv_receiver.abort() during prealloc queue abort while prefill might already hold destinations: Mooncake conn agent should verify abort_notified semantics (force_arm on partial publish seen at decode.py:2815).
