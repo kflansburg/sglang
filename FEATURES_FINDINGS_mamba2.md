@@ -419,3 +419,20 @@ retract/abort) are CLOSED as clean at HEAD.
    the one production-impact mamba finding from this audit; fix for HEAD =
    hicache-lead C4 MIN-reduce; prod .14-.17/K3 need the local patch carried
    (version-triage has the row).
+
+---
+
+## Version-transfer check (items 1-2 machinery across prod tags)
+- donate_mamba_ping_pong_slot + free_mamba_cache + _alloc_ping_pong_buffer exist in
+  v0.5.14 (49e384ce:861/884/823), v0.5.16 (fdebc938:1393/1416/1355), v0.5.20
+  (94602c9c:1628/1651/1585) with the SAME keep/other + lazy -1-filter semantics on
+  free. v0.5.14 keep_idx = next_track_idx(lazy)/other(next)(non-lazy)
+  (memory_pool.py:813-821 at that tag) where HEAD uses mamba_last_track_idx —
+  bookkeeping-rename, same invariant ("keep points at the slot holding latest
+  state"); my harness models keep-as-latest, so the 180k-transition verdict
+  transfers.
+- v0.5.14's donate(-1) assert is ALWAYS-ON (memory_pool.py:871-876 at tag);
+  HEAD gates it behind _MAMBA_DEBUG_ASSERTS (memory_pool.py:1815). So the
+  always-on guard I suggest as defense-in-depth actually RESTORES the v0.5.14
+  behavior — a regression in guard strength, though no reachable trigger found
+  at any version. Worth the 1-line restore.
