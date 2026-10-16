@@ -943,8 +943,24 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
+        # The radix-hit prefix's compressed slots may still be tree- or
+        # creator-owned; alloc_device_buffer must not zero their mapping or
+        # free their device pages (F-5, board #51). The compressed translation
+        # is order-preserving, so the first ``prefix_compressed_len`` entries
+        # of compressed_logical_indices are exactly the prefix region.
+        prefix_token_len = min(req.prefix_len, allocated_len)
+        prefix_compressed_len = 0
+        if prefix_token_len > 0:
+            prefix_compressed_len = len(
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, :prefix_token_len
+                    ]
+                )
+            )
+
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
+            compressed_logical_indices, alloc_size, prefix_len=prefix_compressed_len
         )
         if buffer_indices is None:
             logger.error(

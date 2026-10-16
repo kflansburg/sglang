@@ -10,6 +10,21 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.mem_cache.unified_cache.mamba_cow import MambaCowLock
+
+
+def _release_mamba_cow_lock_if_any(req) -> None:
+    """If a deferred mamba COW lock was staged on this req, release it.
+    lmcache flows clear mamba_cow_src_index directly (dropping the pending
+    copy); the paired source lock would otherwise leak (F-1)."""
+    if req is None:
+        return
+    lock = getattr(req.kv, "mamba_cow_lock", None)
+    if lock is not None:
+        assert isinstance(lock, MambaCowLock)
+        lock.release()
+        req.kv.mamba_cow_lock = None
+
 import torch
 from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheExternalFlow,
@@ -338,6 +353,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load_req is not None
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
+                _release_mamba_cow_lock_if_any(flow.load_req)
                 flow.load_req.kv.mamba_cow_src_index = None
         if flow.load is None:
             if flow.total_hit is not None:
@@ -621,6 +637,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.req_to_token_pool.mamba_allocator.free(request_mamba_value)
                 req.kv.mamba_pool_idx = None
             if req.kv.mamba_cow_src_index is mamba_value:
+                _release_mamba_cow_lock_if_any(req)
                 req.kv.mamba_cow_src_index = None
             flow.mamba_value = None
             flow.request_mamba_value = None
@@ -671,6 +688,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load_req is not None
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
+                _release_mamba_cow_lock_if_any(flow.load_req)
                 flow.load_req.kv.mamba_cow_src_index = None
             flow.mamba_value = None
         if (
@@ -714,6 +732,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load_req is not None
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
+                _release_mamba_cow_lock_if_any(flow.load_req)
                 flow.load_req.kv.mamba_cow_src_index = None
             self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
             flow.mamba_value = None

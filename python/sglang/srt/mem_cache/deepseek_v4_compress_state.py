@@ -94,8 +94,15 @@ def c4_state_transfer_indices(
         raise ValueError(
             f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
         )
-
-    seq_len = max(0, int(seq_len))
+    # Callers pass scheduler-local ids (decode.py/prefill.py wire-free per
+    # disagg-lead trace). Corrupt local bookkeeping (negative idx/seq) would
+    # silently wrap transfer rows into a DIFFERENT request's ring — raise
+    # instead of clamping (defense in depth; always-on, pure python).
+    if int(req_pool_idx) < 0:
+        raise ValueError(f"c4 transfer: negative req_pool_idx {req_pool_idx}")
+    if int(seq_len) < 0:
+        raise ValueError(f"c4 transfer: negative seq_len {seq_len}")
+    seq_len = int(seq_len)
     state_len = seq_len % 4 + 4
     positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
     rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
@@ -113,6 +120,12 @@ def request_scoped_state_transfer_indices(
     """PD transfer indices of a request-scoped compress state: the one pending
     partial block of ``ratio`` tokens, as the request's single online row or the
     ring page that holds it. Nothing pends at a block boundary."""
+    # See c4_state_transfer_indices: caller ids are scheduler-local; a negative
+    # id would silently wrap into another request's ring — fail loud.
+    if int(req_pool_idx) < 0:
+        raise ValueError(f"transfer indices: negative req_pool_idx {req_pool_idx}")
+    if int(seq_len) < 0:
+        raise ValueError(f"transfer indices: negative seq_len {seq_len}")
     if seq_len == 0 or seq_len % ratio == 0:
         return np.empty((0,), dtype=np.int32)
     if online:
