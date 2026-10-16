@@ -2571,3 +2571,40 @@ class TestMooncakeKvIndexMismatch(CustomTestCase):
             manager.failure_records[room],
         )
 
+
+class TestMooncakeRegistrationFailure(CustomTestCase):
+    """Regression: a failed batch_register must abort startup (fail fast), not
+    leave the process serving with unregistered KV buffers so every later
+    transfer errors at runtime."""
+
+    def _make_manager(self, register_ret):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000],
+            kv_data_lens=[1024],
+            aux_data_ptrs=[0x5000],
+            aux_data_lens=[16],
+            state_data_ptrs=[[0x9000]],
+            state_data_lens=[[256]],
+        )
+        manager.engine = Mock()
+        manager.engine.batch_register = Mock(return_value=register_ret)
+        manager.engine.batch_deregister = Mock(return_value=0)
+        return manager
+
+    def test_batch_register_failure_raises(self):
+        manager = self._make_manager(register_ret=-1)
+        with self.assertRaisesRegex(RuntimeError, "failed to register"):
+            manager.register_buffer_to_engine()
+        manager.engine.batch_register.assert_called_once_with(
+            [0x1000, 0x5000, 0x9000], [1024, 16, 256]
+        )
+
+    def test_batch_register_success_is_silent(self):
+        manager = self._make_manager(register_ret=0)
+        manager.register_buffer_to_engine()
+
+    def test_staging_register_failure_raises(self):
+        manager = self._make_manager(register_ret=-1)
+        with self.assertRaisesRegex(RuntimeError, "staging buffer"):
+            manager._register_staging_memory(0x7000, 4096)

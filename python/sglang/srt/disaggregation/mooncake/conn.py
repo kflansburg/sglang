@@ -389,13 +389,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            ret = self.engine.batch_register(list(ptrs), list(lens))
+            if ret != 0:
+                # Running with unregistered buffers does not fail at startup:
+                # every transfer errors later (sessions churn through 300s
+                # waiting timeouts) and, worse, a partially-registered batch
+                # leaves batch_deregister below unregistering regions that may
+                # not all be registered. Fail fast instead.
+                raise RuntimeError(
+                    f"Mooncake failed to register {len(regions)} KV/aux/state "
+                    f"memory region(s) with the transfer engine (ret={ret}); "
+                    "check RDMA device health (--disaggregation-ib-device)."
+                )
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
-            self.engine.batch_deregister(list(ptrs))
+            ret = self.engine.batch_deregister(list(ptrs))
+            if ret != 0:
+                # Teardown stays best-effort (role switch must not crash the
+                # process), but silence here leaves regions pinned in the
+                # engine after the manager is gone.
+                logger.error(
+                    "Mooncake failed to deregister %d memory region(s) "
+                    "(ret=%d); the transfer engine may still pin them.",
+                    len(regions),
+                    ret,
+                )
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -514,7 +535,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        ret = self.engine.batch_register([ptr], [size])
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake failed to register the staging buffer "
+                f"(ptr=0x{ptr:x}, size={size}) with the transfer engine "
+                f"(ret={ret}); check RDMA device health."
+            )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
