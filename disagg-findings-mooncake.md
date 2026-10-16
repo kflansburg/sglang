@@ -211,3 +211,14 @@ Reference commit: 3420bae (origin/main at audit time).
   _send_abort_ack best-effort one-shot; transient zmq failure loses the ACK
   -> decode device path frees at 30s regardless (V4 compound; disagg-decode's
   fix removes the deadline-release entirely).
+
+## Update 2
+- F12 FIXED (board #42): AUX_DATA bounds validation (codec + mooncake handler
+  room liveness + mori parity). Wire-controlled aux_index*item_len writes can
+  no longer land outside the addressed metadata buffer or on re-issued slots.
+- V7 settle-order rationale (posted in #disagg for lead sign-off): per-chunk
+  exception handler poisons the deferred drain-ack FIRST (no ack => under the
+  V4 device-hold contract the pages can never be freed), balances the
+  dequeue-time _staging_outstanding increment, then conclude_failure. The
+  Failed status carries no freeing power; safety invariant is the poison.
+- Merge: MR 11 queued for V5+V6+V7 (board #37, reviewed/approved).
