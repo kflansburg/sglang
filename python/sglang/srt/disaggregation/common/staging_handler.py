@@ -99,15 +99,21 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        # room -> watermark subscriber key, so unregister_decode_req can prune
+        # the subscriber once no remaining room talks to that prefill session.
+        self._wm_key_by_room: dict = {}
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
 
-    def register_wm_subscriber(self, receiver, session_id: str) -> None:
+    def register_wm_subscriber(
+        self, room: int, receiver, session_id: str
+    ) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
+        self._wm_key_by_room[room] = key
         if key in self._wm_subscribers:
             return
 
@@ -200,6 +206,21 @@ class DecodeStagingHandler:
             self.release_room(room, decode_req, receiver)
         self.kv_manager._staging_ctx.room_receivers.pop(room, None)
         self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        self._prune_wm_subscriber(room)
+
+    def _prune_wm_subscriber(self, room: int) -> None:
+        """Drop the room's watermark subscription once no room needs it.
+
+        Without this, _wm_subscribers grows by one prefill-session entry per
+        staging request forever, and every staging free broadcasts ZMQ
+        watermarks to long-dead peers (handled exceptions per send).
+        """
+        key = self._wm_key_by_room.pop(room, None)
+        if key is None:
+            return
+        if key in self._wm_key_by_room.values():
+            return
+        self._wm_subscribers.pop(key, None)
 
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
@@ -492,6 +513,14 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
     wm_round = int(msg_parts[1].decode("ascii"))
     wm_tail = int(msg_parts[2].decode("ascii"))
     wm_session = msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
+    if wm_round < 0 or wm_tail < 0:
+        logger.warning(
+            "WATERMARK dropped: out-of-range (round=%s, tail=%s) session=%s",
+            wm_round,
+            wm_tail,
+            wm_session,
+        )
+        return
     with staging_ctx.watermark_cv:
         prev = staging_ctx.remote_watermarks.get(wm_session, (0, 0))
         if (wm_round, wm_tail) > prev:
@@ -510,6 +539,14 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_round = int(msg_parts[4].decode("ascii"))
     stg_end = int(msg_parts[5].decode("ascii"))
     stg_session = msg_parts[6].decode("ascii")
+    if stg_chunk_idx < 0:
+        logger.warning(
+            "STAGING_RSP dropped: negative chunk_idx=%s room=%s session=%s",
+            stg_chunk_idx,
+            stg_room,
+            stg_session,
+        )
+        return
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
     if tinfo is not None:
@@ -539,6 +576,12 @@ class StagingTransferInfo:
     ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
+        # The index ultimately decodes from a wire frame: never allow Python
+        # negative-index aliasing, which would silently overwrite another
+        # chunk's (offset, round, end) and redirect this transfer into a
+        # staging region owned by a different allocation.
+        if idx < 0:
+            raise ValueError(f"staging chunk index must be non-negative, got {idx}")
         while len(self.offsets) <= idx:
             self.offsets.append(-1)
             self.rounds.append(0)
@@ -782,6 +825,22 @@ def handle_staging_req(
     session_id = msg[4].decode("ascii")
     requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
 
+    if room < 0 or chunk_idx < 0 or chunk_num_pages <= 0:
+        # Wire-decoded fields: a negative chunk_idx would alias another
+        # chunk's bookkeeping entry via Python negative indexing;
+        # chunk_num_pages <= 0 would either regress the ring head (negative)
+        # or record a zero-byte allocation (zero), both breaking the
+        # no-overlap invariant the watermark protocol rests on.
+        logger.warning(
+            "STAGING_REQ dropped: out-of-range fields room=%s chunk_idx=%s "
+            "chunk_num_pages=%s session=%s",
+            room,
+            chunk_idx,
+            chunk_num_pages,
+            session_id,
+        )
+        return
+
     if staging_allocator is None:
         logger.warning(
             "STAGING_REQ ignored: allocator is None room=%s chunk=%s",
@@ -833,7 +892,19 @@ def handle_staging_req(
             bytes_per_head_per_token,
             num_kv_layers,
         )
-        result = staging_allocator.assign(required)
+        try:
+            result = staging_allocator.assign(required)
+        except ValueError:
+            # Non-positive layout (unreachable via the wire guard above;
+            # kept as defense-in-depth against future layout inputs).
+            logger.exception(
+                "STAGING_REQ dropped: non-positive layout room=%s chunk=%s "
+                "num_pages=%s",
+                room,
+                chunk_idx,
+                chunk_num_pages,
+            )
+            return
         if result is None:
             logger.error(
                 "[STAGING_REQ] alloc failed room=%s chunk=%d (need %d bytes, "
@@ -925,7 +996,7 @@ class StagingManagerMixin:
 
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
-            handler.register_wm_subscriber(receiver, session_id)
+            handler.register_wm_subscriber(room, receiver, session_id)
 
 
 def prefetch_staging_reqs(

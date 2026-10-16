@@ -1,6 +1,5 @@
 """Lifecycle tests for the shared pre-allocation bootstrap rendezvous."""
 
-import itertools
 import unittest
 from unittest.mock import patch
 
@@ -36,7 +35,18 @@ class TestDeferredBootstrap(unittest.TestCase):
                 self.assertEqual(result, (self.endpoint, False))
 
     def test_cancel_at_every_point_prevents_later_ready(self):
-        for order in itertools.permutations(("open", "register", "cancel")):
+        # Once a room is KNOWN (open or register materialized it), a cancel at
+        # any later point must prevent readiness. A cancel naming a
+        # never-registered room is refused (see
+        # test_cancel_of_unknown_room_is_refused), so the permutations here
+        # start with the room-defining step.
+        for order in (
+            ("open", "register", "cancel"),
+            ("open", "cancel", "register"),
+            ("register", "open", "cancel"),
+            ("register", "cancel", "open"),
+            ("cancel", "open", "register"),  # cancel refused: normal flow
+        ):
             with self.subTest(order=order):
                 table = DeferredBootstrap(10)
                 notifications = []
@@ -47,9 +57,36 @@ class TestDeferredBootstrap(unittest.TestCase):
                         notifications.append(table.register(1, self.endpoint))
                     else:
                         notifications.append(table.fail(1))
-                self.assertTrue(table.rooms[1].failed)
-                self.assertIsNone(table.complete(1, self.owner))
-                self.assertIn((self.endpoint, True), notifications)
+                if order == ("cancel", "open", "register"):
+                    # The refused cancel must not poison the room: the
+                    # legitimate transfer proceeds and reaches readiness.
+                    self.assertFalse(table.rooms[1].failed)
+                    self.assertEqual(
+                        table.complete(1, self.owner), (self.endpoint, False)
+                    )
+                else:
+                    self.assertTrue(table.rooms[1].failed)
+                    self.assertIsNone(table.complete(1, self.owner))
+                    self.assertIn((self.endpoint, True), notifications)
+
+    def test_cancel_of_unknown_room_is_refused(self):
+        """F18: ABORT naming a never-registered room must not poison it.
+
+        Room ids are recycled over a deployment's life and the ZMQ abort
+        channel is unauthenticated; materializing a tombstone for an unknown
+        id lets a stale/corrupt ABORT kill the next legitimate use of that
+        room id. Refuse and log instead.
+        """
+        table = DeferredBootstrap(10)
+        self.assertIsNone(table.fail(4242))
+        self.assertNotIn(4242, table.rooms)
+        # The room's legitimate lifecycle is unaffected.
+        state = table.open(4242, self.owner)
+        self.assertFalse(state.failed)
+        self.assertEqual(table.register(4242, self.endpoint), None)
+        self.assertEqual(
+            table.complete(4242, self.owner), (self.endpoint, False)
+        )
 
     def test_duplicate_source_cannot_replace_owner(self):
         self.table.open(1, self.owner)
@@ -113,6 +150,7 @@ class TestDeferredBootstrap(unittest.TestCase):
         ):
             self.table.open(1, self.owner)
             self.table.register(2, self.endpoint)
+            self.table.register(3, self.endpoint)
             self.table.fail(3)
             self.table.open(4, object())
             owner = self.table.rooms[4].owner
@@ -125,6 +163,7 @@ class TestDeferredBootstrap(unittest.TestCase):
         self.assertIs(self.table.rooms[1].owner, self.owner)
 
     def test_cancelled_source_owns_cleanup(self):
+        self.table.register(1, self.endpoint)
         self.table.fail(1)
         state = self.table.open(1, self.owner)
         self.assertTrue(state.failed)
