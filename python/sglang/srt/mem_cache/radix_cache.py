@@ -612,6 +612,10 @@ class RadixCache(BasePrefixCache):
 
         delta = 0
         while node != self.root_node:
+            assert node.lock_ref > 0, (
+                "dec_lock_ref underflow: releasing a node whose lock_ref is "
+                f"already 0 (corrupts evictable/protected accounting; id={node.id})"
+            )
             if node.lock_ref == 1:
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)

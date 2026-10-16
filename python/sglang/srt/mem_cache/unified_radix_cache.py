@@ -1024,6 +1024,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def unlock(self, lock: Optional[TreeLock]) -> None:
         if lock is None:
             return
+        assert not lock.released, (
+            "TreeLock released twice: dec_lock_ref without a matching inc_lock_ref "
+            "underflows lock_ref and corrupts evictable/protected accounting"
+        )
+        lock.released = True
         self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
 
     def release_swa(self, lock: Optional[TreeLock]) -> None:

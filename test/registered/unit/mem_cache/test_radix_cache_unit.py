@@ -586,6 +586,38 @@ class TestRadixCache(CustomTestCase):
         self.assertIsNotNone(nxt)
         self.assertNotEqual(nxt[0].item() // page_size, tree_page)
 
+    def test_double_unlock_is_rejected(self):
+        """Releasing the same TreeLock twice must raise: a dec without the
+        matching inc drives lock_ref negative, poisons the 0->1 and 1->0
+        accounting transitions for every later lock on that node, and leaves
+        request-held prefixes evictable."""
+        cache = RadixCache.create_simulated()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+        lock = cache.lock(match.last_device_node)
+        cache.unlock(lock)
+        with self.assertRaises(AssertionError):
+            cache.unlock(lock)
+
+    def test_dec_lock_ref_without_inc_is_rejected(self):
+        """dec_lock_ref must refuse to decrement a node whose lock_ref is 0
+        (underflow guard)."""
+        cache = RadixCache.create_simulated()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(match.last_device_node)
+
     def _checkpoint_split_request(self, priority):
         """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
 
