@@ -165,15 +165,27 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
     def padded_to_bucket(
-        self, *, padded_bs: int, cap: Optional[int] = None
+        self,
+        *,
+        padded_bs: int,
+        cap: Optional[int] = None,
+        last_row_cap: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         """Pad to the captured slot count. The full-coverage variant (cap=None)
-        keeps sum(verify_lens) == graph_num_tokens, so padding rows (or, with
-        no padding rows, the last real row) can exceed the per-request verify
-        window. Dense-layout consumers (mamba/KDA) must pass cap=N: rows are
-        clamped to N and the layout no longer covers the tier's leftover
-        tokens -- those collapse into the consumer's ghost slot. Real tokens
-        map identically under both variants."""
+        keeps sum(verify_lens) == graph_num_tokens, so padding rows can exceed
+        the per-request verify window to cover the tier. Dense-layout consumers
+        (mamba/KDA) must pass cap=N: rows are clamped to N and the layout no
+        longer covers the tier's leftover tokens -- those collapse into the
+        consumer's ghost slot. Real tokens map identically under both variants.
+
+        ``last_row_cap`` (R-1 fix): when there is NO padding row (full tier),
+        the legacy fold pushed the entire leftover into the LAST REAL row,
+        widening its verify past its drafted width -- the row's positions
+        then read never-allocated table entries (stale prior-owner slot ids;
+        content exposure, board R-1). Consumers of the full-coverage variant
+        must pass last_row_cap = num_draft_tokens: the fold is clamped at the
+        row's draft budget and the uncovered remainder is dropped (ghost
+        semantics of the clamped layout, total_verify_tokens=None)."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
@@ -183,6 +195,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=self.graph_num_tokens,
             bs=self.bs,
             padded_bs=padded_bs,
+            last_row_cap=last_row_cap,
         )
         if cap is not None:
             padded = torch.clamp(padded, max=cap)
@@ -190,7 +203,11 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         return RaggedVerifyLayout._assemble_device(
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
-            total_verify_tokens=None if cap is not None else self.graph_num_tokens,
+            total_verify_tokens=(
+                None
+                if (cap is not None or last_row_cap is not None)
+                else self.graph_num_tokens
+            ),
             cap=cap,
         )
 

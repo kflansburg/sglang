@@ -242,11 +242,17 @@ class DecLockRefParams:
 @dataclasses.dataclass
 class TreeLock:
     """``receipt`` replays the acquire on release; ``swa_released`` marks the
-    SWA part released early, so neither release takes it twice."""
+    SWA part released early, so neither release takes it twice.
+
+    ``released`` guards unlock(): releasing the same TreeLock twice silently
+    underflows lock_ref (a node at 0 is decremented to -1, its evictable
+    accounting double-counted, and later incs rebalance against the poisoned
+    count), so a second release raises instead."""
 
     node: Any
     receipt: DecLockRefParams
     swa_released: bool = False
+    released: bool = False
 
 
 @dataclasses.dataclass
@@ -530,8 +536,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
 
     def unlock(self, lock: Optional[TreeLock]) -> None:
-        if lock is not None:
-            self.dec_lock_ref(lock.node, lock.receipt)
+        if lock is None:
+            return
+        assert not lock.released, (
+            "TreeLock released twice: dec_lock_ref without a matching inc_lock_ref "
+            "underflows lock_ref and corrupts evictable/protected accounting"
+        )
+        lock.released = True
+        self.dec_lock_ref(lock.node, lock.receipt)
 
     def path_device_indices(self, node: Any) -> torch.Tensor:
         """Device KV indices on the path from the root to ``node``; valid until

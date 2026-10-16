@@ -1947,9 +1947,14 @@ class MoriKVManager(CommonKVManager):
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
 
-        AuxDataCodec.deserialize_data_to_buffer(
-            self.kv_args, buffer_index, aux_index, data
-        )
+        try:
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+        except ValueError:
+            logger.exception(
+                f"Refusing out-of-bounds AUX_DATA write for bootstrap_room {room}"
+            )
 
     def _submit_kv_transfer(
         self,

@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+import threading
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -142,6 +143,14 @@ class MooncakeTransferEngine:
         self.session_id = NetworkAddress(
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
+        # (ptr, len) regions currently registered, for idempotent
+        # register/deregister: role-switch teardown can skip deregistration
+        # when worker threads are still stuck in a transfer (see
+        # MooncakeKVManager.teardown), and the next manager must then not
+        # fail re-registering the same regions (the engine rejects double
+        # registration).
+        self._registered_regions: Set[Tuple[int, int]] = set()
+        self._registered_regions_lock = threading.Lock()
 
     def register(self, ptr, length) -> None:
         try:
@@ -164,24 +173,52 @@ class MooncakeTransferEngine:
             )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
-        """Batch register multiple memory regions."""
-        try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark batch register as failed
-            ret_value = -1
-            if not hasattr(self.engine, "batch_register_memory"):
-                raise RuntimeError(
-                    "Mooncake's batch register requires a newer version of "
-                    "mooncake-transfer-engine. Please upgrade Mooncake."
-                )
+        """Batch register multiple memory regions.
 
-        if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
-        return ret_value
+        Idempotent: regions already tracked as registered (e.g. a previous
+        KVManager tore down without deregistering because its workers were
+        stuck) are skipped and reported as success.
+        """
+        with self._registered_regions_lock:
+            todo_ptrs, todo_lens = [], []
+            for ptr, length in zip(ptrs, lengths):
+                if (ptr, length) in self._registered_regions:
+                    logger.debug(
+                        "Mooncake memory region (0x%x, %d) already registered; "
+                        "skipping",
+                        ptr,
+                        length,
+                    )
+                    continue
+                todo_ptrs.append(ptr)
+                todo_lens.append(length)
+            if not todo_ptrs:
+                return 0
+            try:
+                ret_value = self.engine.batch_register_memory(todo_ptrs, todo_lens)
+            except Exception:
+                # Mark batch register as failed
+                ret_value = -1
+                if not hasattr(self.engine, "batch_register_memory"):
+                    raise RuntimeError(
+                        "Mooncake's batch register requires a newer version of "
+                        "mooncake-transfer-engine. Please upgrade Mooncake."
+                    )
+
+            if ret_value != 0:
+                logger.debug("Mooncake batch memory registration failed.")
+            else:
+                self._registered_regions.update(zip(todo_ptrs, todo_lens))
+            return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:
-        """Batch deregister multiple memory regions."""
+        """Batch deregister multiple memory regions.
+
+        Idempotent on the tracker: registered regions whose ptr appears in
+        this list are dropped on success. Unknown ptrs are still passed to
+        the engine (it logs/ignores them); registration of a batch may have
+        failed partway before the tracker was updated.
+        """
         try:
             ret_value = self.engine.batch_unregister_memory(ptrs)
         except Exception:
@@ -190,6 +227,14 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake batch memory deregistration failed.")
+            return ret_value
+        with self._registered_regions_lock:
+            ptr_set = set(ptrs)
+            self._registered_regions = {
+                (ptr, length)
+                for ptr, length in self._registered_regions
+                if ptr not in ptr_set
+            }
         return ret_value
 
     def initialize(

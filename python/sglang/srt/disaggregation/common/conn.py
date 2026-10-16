@@ -1644,7 +1644,7 @@ class CommonKVManager(BaseKVManager):
         start_layer = self.kv_args.prefill_start_layer
         num_draft = getattr(self.kv_args, "num_draft_entries", 0) or 0
         num_kv_layers = (len(src_kv_ptrs) - num_draft) // 2
-        end_layer = self.kv_args.prefill_end_layer
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
         if end_layer is None:
             end_layer = start_layer + num_kv_layers
         # Full-model main layer count, used to locate the peer's main V block:
