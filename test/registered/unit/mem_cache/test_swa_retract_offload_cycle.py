@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+
 try:
     from sglang.srt.mem_cache.allocator.swa import (  # noqa: F401
         BaseSWAKVPool,
@@ -52,6 +53,7 @@ except ImportError:  # no full sglang install here (e.g. bare merge-queue venv)
     CustomTestCase = unittest.TestCase
 
 
+
 class _FakeSWAKVPool(BaseSWAKVPool):
     swa_req_ring_size = None
     swa_uses_full_indices = False
@@ -66,6 +68,21 @@ class _FakeSWAKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices):
         return self.full_to_swa_index_mapping[kv_indices]
+
+    def get_state_buf_infos(self):
+        return [], [], []
+
+    def get_key_buffer(self, layer_id):
+        raise NotImplementedError()
+
+    def get_value_buffer(self, layer_id):
+        raise NotImplementedError()
+
+    def get_kv_buffer(self, layer_id):
+        raise NotImplementedError()
+
+    def set_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError()
 
 
 @dataclass
