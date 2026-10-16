@@ -248,3 +248,15 @@ buffer. If any backend's verify kernel changes (esp. the XPU triton fallback), t
 contract MUST hold or the clamp(min=0) defense silently mis-compacts cross-request data.
 Regression pin: test/registered/unit/spec/test_accept_index_coord_safety.py; comment added at
 eagle_utils.py verify_tree_greedy_func XPU branch (comment-only, no XPU behavior change).
+  9. H2D LOAD-BACK SUPERSEDE (6th clear site = components/mamba.py:1044-46, _MambaBufferLoadBackContext.
+     finalize_allocation(success=True)): when a request goes through HiCache load-back, the deferred COW
+     is superseded (replay write_pos + clears cow_src_metadata). If fix locks src at staging, this path
+     MUST dec-lock as well, else permanent tree lock leak for reqs that get load-backed. NOTE the
+     load-back prepare path may re-alloc mamba_pool_idx for !holds_mamba REQS — check req.kv.holds_mamba
+     was set at staging so prepare_buffer_load_back's alloc is skipped consistently (it sets holds via
+     dst_index assignment staging? staging sets req.kv.mamba_pool_idx but does it set holds_mamba=True? —
+     check Req.kv.holds_mamba semantics vs unified path): DST slot ownership confusion if both paths
+     allocate. Verify under attack run #9.
+  10. finalize_load_back(success=False) (components/mamba.py:728-735): frees allocated slot + clears
+     pool idx but does NOT clear cow_src_metadata — if COW was staged AND load-back failed, req carries
+     stale cow_src into later phases + fix's lock still held with no dec on this path.
