@@ -99,9 +99,32 @@ class AuxDataCodec:
 
     @staticmethod
     def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
-        """Deserialize bytes into target memory buffer."""
+        """Deserialize bytes into target memory buffer.
+
+        buffer_index / aux_index / data all cross the wire: validate before
+        computing the destination address. An out-of-bounds index is not a
+        contract violation we can tolerate -- the raw-pointer write would
+        corrupt neighboring metadata (or arbitrary registered memory) with
+        no further check downstream.
+        """
+        if not 0 <= buffer_index < len(kv_args.aux_data_ptrs):
+            raise ValueError(
+                f"aux buffer_index {buffer_index} out of range "
+                f"({len(kv_args.aux_data_ptrs)} buffers)"
+            )
         dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
         item_len = kv_args.aux_item_lens[buffer_index]
+        if item_len <= 0 or len(data) != item_len:
+            raise ValueError(
+                f"aux buffer {buffer_index}: data length {len(data)} != "
+                f"item_len {item_len}"
+            )
+        num_slots = kv_args.aux_data_lens[buffer_index] // item_len
+        if not 0 <= aux_index < num_slots:
+            raise ValueError(
+                f"aux_index {aux_index} out of range for aux buffer "
+                f"{buffer_index} ({num_slots} slots)"
+            )
         dst_addr = dst_aux_ptr + item_len * aux_index
         buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
         buffer[:] = data

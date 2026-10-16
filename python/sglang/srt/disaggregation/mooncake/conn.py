@@ -1850,10 +1850,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if len(data) != data_length:
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
+        if room not in self.request_status:
+            # Unknown or already-concluded room: writing its claimed aux slot
+            # would land on metadata that may have been re-issued to another
+            # request. Late/dup delivery is benign; log and drop.
+            logger.warning(
+                f"AUX_DATA for unknown/concluded bootstrap_room {room}; dropping"
+            )
+            return
 
-        AuxDataCodec.deserialize_data_to_buffer(
-            self.kv_args, buffer_index, aux_index, data
-        )
+        try:
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+        except ValueError:
+            # Out-of-bounds buffer/aux index or bad length would otherwise
+            # become a raw-pointer write into arbitrary memory.
+            logger.exception(
+                f"Refusing out-of-bounds AUX_DATA write for bootstrap_room {room}"
+            )
+            return
 
         logger.debug(
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
