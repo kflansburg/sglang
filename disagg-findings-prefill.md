@@ -152,3 +152,27 @@ Impact bounded (room Failed -> decode discards) but late reads of reissued
 pages still possible on prefill side's own caches... actually only reads, so
 worst case is wrong bytes sent for an aborted room = harmless. Withdrawn
 unless someone shows decode-side reuse; the real teeth are F8/F9 (fixed).
+
+## Round 4 (2026-10-16 ~04:00)
+
+### Fixed & in review
+- F15 (board #30): get_mha_kv_ptrs_with_pp rewritten; anchor = kv_args.hidden_kv_layers
+  (populated in prefill.py from model_config.num_hidden_layers). NOTE for backports to
+  v0.5.14-17 (before hidden_kv_layers existed): plumb the draft count at the
+  registration site from dst ptr counts instead. All prod versions .14..HEAD affected.
+- F9/V4-prefill (board #31): abort-notify retry + drained-ACK retry queue.
+- F12 codec side (board #43): AuxDataCodec bounds check. Handler side -> mooncake.
+
+### pp>1 abort double-finish (lead's open item a) — LOW, no memory unsafety
+pp>1 abort marks finished_reason on reqs that stay queued; pop paths then conclude
+via handle_bootstrap_failure which re-runs prepare_abort (overwrites reason) and
+re-streams output. tree_cache.finish(ABORT) re-entrant: release_aborted_request is a
+no-op for plain radix; unified's is pop-if-present (verified style). Result: duplicate
+abort responses to tokenizer (tolerated; tokenizer dedups per-rid retire) and a
+slightly wronger finish message. Not memory-unsafe; recommend later dedup via
+"if req.finished_reason is not None: skip re-prepare" in handle_bootstrap_failure.
+
+### Env/test status
+Shared env picked up via sandbox_reset. test_utils import breaks collection
+(datasets missing; lead adding). My three new test files avoid test_utils;
+all pass locally: mha 7, abort-retry 4, aux-codec 5.
