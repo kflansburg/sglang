@@ -23,6 +23,34 @@ silently restore the sync. Note discovered while pinning: token-id `_free_lazy`
 legitimately calls `torch.unique` (page-rep dedup, unified_sub_pool.py:1377); the
 sync-free contract applies specifically to the page-reps/`free_*_segment` hot paths.
 
+## Shipped fixes (merged/queued on agent/unified-auditor)
+1. F0 stale-free hardening (board #40, MR #34): virtual_slot.py kernel + CPU guards p>=0;
+   _filter_stale_frees sync policy (prod no-sync + async tripwire / debug sync+raise);
+   byte-accounting value checks; _stats_n_stale_frees. Containment pins for the pre-#38
+   single-page and #59 k-page double-free routes; version: affected code across unified-pool
+   tags (.15p1/.17 precursor multi_ended_allocator.py, .20/HEAD unified_sub_pool.py);
+   .14 absent.
+2. DSA kpool-compress tail-buffer budget bias (board #47, MR #37):
+   DSATokenToKVPool.estimate_compress_tail_bytes + DefaultPoolConfigurator charges it at
+   calculate_pool_sizes; exact dp-divided bound user-set / resolver-mirrored upper bound
+   (min(4096, est(token_cap_ub), token_cap_ub//2)) auto-route; ~8.3 GB at V4-class dims was
+   unbudgeted -> OOM-margin class fixed. Direction-pinned by 7 tests.
+3. int32 DCP-id threshold helper + tests (test_dcp_int32_bound.py): arithmetic pin of the
+   production guards now living in logical_token_capacity + DSATokenToKVPool.index_buf_size
+   (pools-lead's #32).
+
+## Caller-reachability verdicts (from coordination)
+- F0 double-free / F1 same-page-in-group: post-#38 HEAD = "no by construction" (radix-sched,
+  msg #877: disjoint free ranges per request; page-aligned second range; holds_kv gate
+  assert-loud; beam rows distinct). Historical triggers: pre-fix #38 checkpoint-shrink
+  (double-frees tree-owned rows INTO the allocator; containment tested) and #59 unified-cache
+  multi-page shrink under -O (containment tested at k=4). Verdict: CONTRACT-DEFENSE with
+  documented historical triggers; current-HEAD live reachability: none found. Version matrix
+  for #38/#59 owed by radix-lead, cross-linked in final report.
+- allocplan fp8 non-aiter seam (forward_mha.py:691): REJECTED by dsa-auditor with
+  single-producer trace (page_table_1_flattened from raw req_to_token rows; widened variant
+  applied only to page_table_1); debug-mode max_idx probe noted as follow-up.
+
 ## Coverage status (2026-10-16)
 - unified_sub_pool.py: READ END-TO-END (2680 lines). Verdict: engineered sound by construction;
   defense gaps F0 (hardened) + F1 (contract, unenforced).
