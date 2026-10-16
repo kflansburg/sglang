@@ -586,6 +586,65 @@ class TestRadixCache(CustomTestCase):
         self.assertIsNotNone(nxt)
         self.assertNotEqual(nxt[0].item() // page_size, tree_page)
 
+    def test_double_unlock_is_rejected(self):
+        """Releasing the same TreeLock twice must raise: a dec without the
+        matching inc drives lock_ref negative, poisons the 0->1 and 1->0
+        accounting transitions for every later lock on that node, and leaves
+        request-held prefixes evictable."""
+        cache = RadixCache.create_simulated()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+        lock = cache.lock(match.last_device_node)
+        cache.unlock(lock)
+        with self.assertRaises(AssertionError):
+            cache.unlock(lock)
+
+    def test_dec_lock_ref_without_inc_is_rejected(self):
+        """dec_lock_ref must refuse to decrement a node whose lock_ref is 0
+        (underflow guard)."""
+        cache = RadixCache.create_simulated()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(match.last_device_node)
+
+    def test_lock_on_evicted_node_is_rejected(self):
+        """Locking a node whose branch was evicted must raise: the release
+        would decrement live ancestors the caller never locked (lock_ref
+        underflow). Stale tree handles are a caller bug; fail loudly."""
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4]))))
+        stale_node = match.last_device_node
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertIsNone(stale_node.parent)  # evict severs stale handles
+        with self.assertRaises(AssertionError):
+            cache.inc_lock_ref(stale_node)
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(stale_node)
+
     def _checkpoint_split_request(self, priority):
         """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
 
@@ -1307,3 +1366,15 @@ class TestRadixCache(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvictionPolicyGuard(unittest.TestCase):
+    def test_tlru_rejected_on_legacy_cache(self):
+        """TLRU needs _tlru_* stats only unified-tree nodes carry; the legacy
+        TreeNode would AttributeError inside the eviction loop under memory
+        pressure. Reject at startup."""
+        with self.assertRaises(ValueError):
+            RadixCache.create_simulated(eviction_policy="tlru")
+
+    def test_lru_default_ok(self):
+        RadixCache.create_simulated(eviction_policy="lru")

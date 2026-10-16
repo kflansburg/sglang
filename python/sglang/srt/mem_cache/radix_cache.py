@@ -308,6 +308,15 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        if self.eviction_policy == "tlru":
+            # TLRU needs _tlru_history_len / _tlru_cached_prefix_len, which
+            # only unified_tree_core nodes carry; on the legacy TreeNode the
+            # first eviction under memory pressure would raise AttributeError
+            # and kill the eviction loop. Fail at startup instead.
+            raise ValueError(
+                "eviction policy 'tlru' is only supported by the unified radix"
+                " cache (its TreeNode lacks T-LRU stats)"
+            )
         self.eviction_strategy = get_eviction_strategy(
             "lru" if self.disable else self.eviction_policy,
             None if self.disable else params.eviction_policy_config,
@@ -325,6 +334,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         dynamo_kv_event_format: bool = False,
         kv_event_lora_names: Optional[LoRANameTable] = None,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -335,6 +345,7 @@ class RadixCache(BasePrefixCache):
             enable_kv_cache_events=enable_kv_cache_events,
             dynamo_kv_event_format=dynamo_kv_event_format,
             kv_event_lora_names=kv_event_lora_names,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
@@ -516,6 +527,16 @@ class RadixCache(BasePrefixCache):
         key_limit = (
             ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
         )
+        # cache_protected_len is monotone: publishing a shorter key than the
+        # tree already owns for this request would shrink cache_protected_len
+        # backwards, letting release_kv_cache free rows the tree still
+        # references (e.g. disagg-decode checkpoints advance protection into
+        # generated output, and a stop-matched finish trims owned_kv_len back
+        # below it). Skip the no-op checkpoint instead.
+        key_len = len(token_ids) if key_limit is None else min(key_limit, len(token_ids))
+        aligned_len = key_len // self.page_size * self.page_size
+        if aligned_len <= req.kv.cache_protected_len:
+            return
         radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True
         )
@@ -568,11 +589,19 @@ class RadixCache(BasePrefixCache):
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
+            parent = x.parent
             self._delete_leaf(x)
+            # Sever the stale node's link: inc/dec_lock_ref on a node whose branch
+            # was evicted must fail loudly (its release would decrement live
+            # ancestors the caller never locked). Held locks are sever-safe by
+            # construction: locked nodes never enter evictable_leaves, and only
+            # unlocked leaves / newly-childless unlocked parents are popped, so
+            # no live lock's parent chain is ever severed.
+            x.parent = None
 
-            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            if len(parent.children) == 0 and parent.lock_ref == 0:
+                new_priority = self.eviction_strategy.get_priority(parent)
+                heapq.heappush(eviction_heap, (new_priority, parent))
 
             self.kv_events.record_remove(x)
 
@@ -585,6 +614,12 @@ class RadixCache(BasePrefixCache):
 
         delta = 0
         while node != self.root_node:
+            assert node.parent is not None, (
+                "inc_lock_ref on a detached node: the caller holds a stale tree "
+                "handle (e.g. a last_node whose branch was evicted after the "
+                "match); the release would decrement live ancestors it never "
+                "locked, underflowing their lock_ref"
+            )
             if node.lock_ref == 0:
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
@@ -602,16 +637,21 @@ class RadixCache(BasePrefixCache):
 
         delta = 0
         while node != self.root_node:
+            assert node.lock_ref > 0, (
+                "dec_lock_ref underflow: releasing a node whose lock_ref is "
+                f"already 0 (corrupts evictable/protected accounting; id={node.id})"
+            )
             if node.lock_ref == 1:
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
             self._update_leaf_status(node)
-            if node.parent is None:
-                assert node is self.root_node, (
-                    "This request holds the node from another tree"
-                )
+            assert node.parent is not None, (
+                "dec_lock_ref reached a detached node: the caller holds a stale "
+                "tree handle (its branch was evicted); releasing would decrement "
+                "live ancestors it never locked"
+            )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
