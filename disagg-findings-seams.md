@@ -25,3 +25,9 @@ V8 decode drain_before_retraction raise in scheduler OOM path (decode_kvcache_of
 V9 mooncake maybe_send_extra silent truncation on drift except QSA/SWA_RING/DSV4_REQUEST_STATE — pending which states are production.
 
 CLOSED-clean: bootstrap queue abort chain; inflight queue abort chain; grammar double-release decode; retract+SWA offload guard; nixl defer-ack accounting (F4); is_abort_release_safe truthful nixl-device/unreachable nixl-host; mooncake: batch indices pairing guard, Failed-terminal, drain-ack protocol, peer re-reg ordering, 0-len/dedup registration, int32 wire dtype.
+
+## Cross-team handoffs (incoming)
+- pools/dsv4 F2: DSA compress-state PD transfer indices (deepseek_v4_compress_state.py:87-132) use wire-controlled req_pool_idx/seq_len unclamped → OOB row math (crash; under graphs possibly cross-request read). All prod tags since v0.5.15. Part of THEME: PD trust boundary = wire-supplied index clamping — instances: this, F13 (staging_handler._scatter_region token window unbounded), F12 (aux_index*item_len deserialize unchecked). Grouped fix sweep planned post fix-wave; owner disagg-lead.
+
+## F15 verdict (new HIGH)
+get_mha_kv_ptrs_with_pp (common/conn.py:1549-1582): draft-branch dispatch via divisibility is wrong when (num_main+num_draft)%stage_layers==0 (self-draft-like or pp combos) → else-arm writes main V into decode draft_V region; V_main never written → stale cross-request reads. EAGLE-1-layer pp=1 accidentally safe ((L+1)%L≠0). Fix: explicit draft count from kv_args.num_draft_entries/draft_kv_layers. Owner: disagg-prefill (+spec-auditor liaison). Version mapping pending.
