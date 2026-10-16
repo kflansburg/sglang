@@ -283,3 +283,22 @@ abort ack for that room (so pending decode-side abort ACKs are never claimed),
 staging-accounted one, then (c) concludes the room Failed. Worker thread
 itself continues (serves other rooms). add_transfer_request must also refuse
 new chunks on a shard whose worker is dead (F4 part 2).
+
+## Version-matrix extension: V6 (registration fail-fast)
+`MooncakeTransferEngine.batch_register` logs a debug and returns the error code;
+`MooncakeKVManager.register_buffer_to_engine` calls it and ignores the return.
+A failed registration -> decode-side RDMA into unregistered memory on the peer
+(NIC DMA into arbitrary VA) at first transfer — fail-silent until corruption shows
+up in output. Same shape on all versions:
+- batch_register wrapper:
+  - v0.5.14       : distributed/device_communicators/mooncake_transfer_engine.py:168-169
+  - v0.5.15.post1 : ...:168-169
+  - v0.5.17       : ...:173-174
+- caller (register_buffer_to_engine) ignores return:
+  - v0.5.14       : mooncake/conn.py:244-258
+  - v0.5.15.post1 : mooncake/conn.py:244-258
+  - v0.5.17       : mooncake/conn.py:282-296
+My V6 commit 33cf531 fixed the caller side (raise on !=0); the engine wrapper
+still logs+returns as before (only the caller policy changed). Backport: raise in
+register_buffer_to_engine on failure, do not touch the engine wrapper on the
+server-side (it's used for other purposes on NIXL paths too).
