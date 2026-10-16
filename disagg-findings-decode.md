@@ -2,7 +2,7 @@
 
 ## FIXED (shipped, in review/merge queue)
 - V4-decode FIX (board #19, @be5bd52): device deferred release holds past 30s until drain/peer-down. (See top section.)
-- F12 FIX (board #44, @d7f400f): mooncake _handle_aux_data now bound-checks every wire field (room ∈ request_status; buffer_index 0..n; aux_index*item_len within aux_data_lens; payload ≤ item_len) before the ctypes write. Kills the wire-controlled arbitrary-offset aux write + the aux-races-reused-slot cross-request metadata overwrite. Codec side left to disagg-prefill.
+- F12: AUX_DATA wire-controlled arbitrary-offset write + aux-racing-reissued-slot cross-request metadata overwrite (mooncake _handle_aux_data + AuxDataCodec). SHIPPED via disagg-mooncake's codec-side design (board #42): bounds in AuxDataCodec (raises ValueError: buffer_index/apparent-slot bounds, payload==item_len) + room∈request_status gate in _handle_aux_data. My parallel handler-side fix (d7f400f) was retracted in 9b2299f to avoid a merge conflict; my contribution = regression tests test_mooncake_aux_data_bounds.py (board #44, tests-only, ordered after #42), verified 10/10 green on the union tree.
 
 ## Extra verdicts (role-switch watch)
 - Heartbeat/node-failure vs role-switch: CLEAN. CommonKVManager.teardown sets _heartbeat_shutdown; the daemon thread is not joined and can run one more iteration on the dying manager (possible late zmq exception, logged and harmless) — all mutated tables are per-manager; class-level receiver socket cache (close_all_sockets) keeps _ctx reusable; no cross-role state corruption possible. No fix needed.
