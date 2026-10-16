@@ -22,18 +22,35 @@ full_kv_pool/swa_kv_pool attributes and register_mapping are consumed on this
 path), CPU tensors, page_size=4, need_sort=False (naive kernels on CPU).
 """
 
+import importlib.util
+import os
 import unittest
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+try:
+    from sglang.srt.mem_cache.allocator.swa import (  # noqa: F401
+        BaseSWAKVPool,
+        SWATokenToKVPoolAllocator,
+    )
+    from sglang.test.ci.ci_register import register_cpu_ci
+    from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+    register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+except ImportError:  # no full sglang install here (e.g. bare merge-queue venv)
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    _spec = importlib.util.spec_from_file_location(
+        "_swa_allocator_loader", os.path.join(_HERE, "_swa_allocator_loader.py")
+    )
+    _loader = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_loader)
+    _swa_mod = _loader.load()[3]
+    SWATokenToKVPoolAllocator = _swa_mod.SWATokenToKVPoolAllocator
+    BaseSWAKVPool = _swa_mod.BaseSWAKVPool
+    CustomTestCase = unittest.TestCase
 
 
-class _FakeSWAKVPool:
+class _FakeSWAKVPool(BaseSWAKVPool):
     """SWAKVPool is not constructed here; the allocator only reads these."""
 
     swa_req_ring_size = None
