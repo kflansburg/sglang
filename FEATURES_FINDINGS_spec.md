@@ -179,3 +179,16 @@ deployments). Confirm via git tag diff before filing.
    guarded by explicit raise.
 3. (1) tail files spec_tp_sync.py / spec_sampling_mask.py / adaptive_spec_params.py — no KV
    lifecycle; CLEAN. (spec_tp_sync prevents TP divergence in spec decisions.)
+
+## G2 close-out (kvpool-auditor handoff: set_kv_buffer_prefix_valid input validation)
+- memory_pool.set_kv_buffer_prefix_valid (memory_pool.py:3226) validates: loc_2d rank-2,
+  commit_lens shape == batch, cache_k/cache_v rows == loc_2d.numel (raises otherwise),
+  normalizes dtype/device, contiguous.
+- Kernel set_kv_buffer_prefix_valid_tiled (kernels/ops/kvcache/cache_move.py:14): per-row
+  clamp `row >= commit_len -> return`; byte-mask bounded by ROW_BYTES. commit_len > shape[1]
+  is a no-op (bounded by grid dim = shape[1]); commit_len smaller = partial commit (silent
+  truncation, NOT corruption; spec caller's kv_committed_len uses the same commit inputs).
+- Spec caller side: kv_index_translator.commit computes commit_i = min(plan target commit_lens,
+  verify staging verify_lens) (kv_index_translator.py:1213-1218) and pcl plan commit_lens <= seq
+  bounds validated (pcl/target_planner.py:206-229) — invariant handed to spec callers holds.
+- VERDICT: no memory-unsafe window; the API contracts on the spec callers hold at HEAD.
