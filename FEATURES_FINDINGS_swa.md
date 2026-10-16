@@ -256,3 +256,67 @@ Result: conservation exact at every phase; mapping always coherent; no
 bleed over 5 cycles. The SWA+offload retract guard class is CLEAN at
 HEAD as seen from the allocator; the earlier static verdict now has a
 runtime pin.
+
+## F-4 backport reference diffs (apply with `patch` or 3-way; verified anchors present in each tag)
+
+### v0.5.14 / v0.5.15.post1 / v0.5.17 — IDENTICAL alloc_decode body; one patch serves all three
+```diff
+--- a/python/sglang/srt/mem_cache/allocator/swa.py
++++ b/python/sglang/srt/mem_cache/allocator/swa.py
+@@ def alloc_decode
+         assert self.page_size > 1
+         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+ 
++        # F-4: both pools must serve the same page crossings; pre-flight the
++        # exact count so a SWA shortfall cannot strand freshly-popped full
++        # pages (rollback-by-free would release live pages of non-boundary
++        # requests: their alloc_decode output aliases a still-held page).
++        num_new_pages = get_num_new_pages(
++            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
++        )
++        if not self.new_pages_available(num_new_pages, num_new_pages):
++            return None
++
+         alloc_full_indices = self.full_attn_allocator.alloc_decode(
+             seq_lens, seq_lens_cpu, last_loc
+         )
+```
+Anchors verified: `new_pages_available` at v0.5.14:157, v0.5.15.post1:166,
+v0.5.17:166; `get_num_new_pages` imported from sglang.srt.utils.common in
+all three; alloc_decode body byte-identical across the three tags.
+Note: these tags lack the `_swa_req_ring` branch, so the patch hunk context
+is simply `assert self.page_size > 1; swa_last_loc = ...`.
+
+### v0.5.20 — same patch inserted AFTER the `_swa_req_ring` early return
+```diff
+--- a/python/sglang/srt/mem_cache/allocator/swa.py
++++ b/python/sglang/srt/mem_cache/allocator/swa.py
+@@ def alloc_decode
+             return self.full_attn_allocator.alloc_decode(
+                 seq_lens, seq_lens_cpu, last_loc
+             )
+ 
+         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+ 
++        # F-4 pre-flight: see comment in module history / PR notes — a SWA
++        # shortfall after full pops pages strands them (never rolled back).
++        num_new_pages = get_num_new_pages(
++            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
++        )
++        if not self.new_pages_available(num_new_pages, num_new_pages):
++            return None
++
+         alloc_full_indices = self.full_attn_allocator.alloc_decode(
+             seq_lens, seq_lens_cpu, last_loc
+         )
+```
+Anchors verified: `new_pages_available` at v0.5.20:234 (ring-aware);
+`get_num_new_pages` imported in v0.5.20; `_swa_req_ring` early-return block
+directly precedes `swa_last_loc`. The Kimi K3 branch (base ~v0.5.16) sits
+between .15p1 and .17 in this file and matches the first diff unless it
+carries the ring back-port; check for `_swa_req_ring` to pick the variant.
+
+### Kimi K3 (mamba-radix cache fork): verify presence of
+`SWATokenToKVPoolAllocator._swa_req_ring`; if present use the v0.5.20
+variant else the v0.5.14/.15p1/.17 variant. Same bug shape confirmed via
+git tags spanning the era.
