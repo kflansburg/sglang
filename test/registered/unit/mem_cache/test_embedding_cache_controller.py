@@ -759,6 +759,59 @@ class TestWedgedStoreDoesNotBlockIoLoop(unittest.TestCase):
             io_thread.join(timeout=5)
 
 
+    def test_insert_completes_and_stats_track_while_get_wedged(self):
+        """Third case (from spec-auditor): an insert on another key drains
+        and unpins while a GET is wedged past deadline; observability moves.
+        """
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+
+        def store_get(keys, ptrs, sizes):
+            gate.wait(timeout=10)
+            return [True]
+
+        put_calls = []
+
+        def store_put(keys, ptrs, sizes):
+            put_calls.append(list(keys))
+            return [True] * len(keys)
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        ctrl.embedding_store.batch_put_from_multi_buffers = store_put
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertEqual(ctrl.stats["late_store_ops"], 1)
+            stats = ctrl.get_stats()  # takes lock; call OUTSIDE ctrl.lock
+            self.assertEqual(stats["late_ops_outstanding"], 1)
+
+            tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+            _insert_ready_entry(ctrl, "hp", tensor)
+            t0 = time.time()
+            ctrl.insert_batch(["hp"], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    if ctrl.entries["hp"].ref_count == 0:
+                        break
+                time.sleep(0.01)
+            self.assertLess(time.time() - t0, ctrl.store_op_deadline_s + 2)
+            self.assertEqual(ctrl.entries["hp"].ref_count, 0)
+            self.assertEqual(put_calls, [["hp"]])
+            self.assertEqual(len(ctrl._late_ops), 1)  # GET still wedged
+            gate.set()
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
+
+
 class TestPoolViewPinPairing(unittest.TestCase):
     def test_release_only_pinned_hashes_preserves_other_pin(self):
         """Regression for asymmetric pin/unpin (board EMB-#18).
