@@ -7,9 +7,12 @@ control endpoint. It performs no I/O, including while holding its lock.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 BootstrapNotification = tuple[tuple[str, int], bool] | None
 
@@ -85,10 +88,23 @@ class DeferredBootstrap:
 
     def fail(self, room: int) -> BootstrapNotification:
         with self.lock:
-            state = self._room(room)
+            state = self.rooms.get(room)
+            if state is None:
+                # Do not materialize a tombstone for a room this prefill never
+                # saw: a cancellation only matters for a room with a live or
+                # closed source (open/complete/close), and an unauthenticated
+                # ABORT frame naming a never-registered (possibly recycled or
+                # stale) room id would otherwise poison that room id for its
+                # next legitimate use until tombstone expiry.
+                logger.warning(
+                    "Dropping bootstrap cancellation for never-registered room %s",
+                    room,
+                )
+                return None
             if state.failed:
                 return None
             state.failed = True
+            state.expires_at = time.monotonic() + self.timeout
             return self._notification(state)
 
     def close(

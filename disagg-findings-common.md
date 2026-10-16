@@ -67,3 +67,8 @@ Status codes: CANDIDATE (reasoning shown, needs repro/second review), VERIFIED, 
 - common/utils.py FastQueue/pack/unpack: safe; AuxDataCodec OOB = F12.
 - compute_grid_segments/staging_grid_tokens: arithmetic checked, aligned; no off-by-one found.
 - gather/scatter kernels: masks guard tails; head-slice OOB refuted (F4); F5 OOM-class transient gather_idx int64 expansion (268MB @32k tokens x 8 heads x 128 dim) kept as candidate (memory blowup in transfer worker).
+
+## F18 RESOLUTION (in this branch): register-first refusal landed in bootstrap.py fail() — an ABORT for a never-registered room is dropped+logged, no tombstone; known rooms keep cancel semantics. Tests adapted in test_deferred_bootstrap.py + dedicated refusal test. Rationale: every legit flow has open() (sender ctor) before any decode can ABORT the room (decode bootstraps only via prefill-registered bootstrap entries), so pre-cancel tombstones only ever consumed stale frames.
+
+## FOLLOW-UP DESIGN (deferred per disagg-lead): room-integrity generation token for BOOTSTRAP/ABORT frames.
+Key choice points: (1) minter: decode receiver, when it first registers to a room, alongside bootstrap_room; (2) wire placement: extra trailing frame on BOOTSTRAP and ABORT multipart messages (old peers ignore trailing frames -> wire-compatible rollout; same pattern as the optional generation frame already on AbortNotification); (3) prefill stores (room, token) at DeferredBootstrap.register and requires match on fail(); (4) cross-version: absence of token = legacy behavior (accept), presence-with-mismatch = drop + warn; (5) token source: 64-bit random per request (NOT the room generation counter, which increments per decode instance lifecycle and is guessable). Defer until fix wave clears.
