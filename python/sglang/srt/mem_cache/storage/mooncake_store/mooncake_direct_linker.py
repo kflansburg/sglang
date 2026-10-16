@@ -306,6 +306,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.load_layer_wise(counter_index, list(pending.values()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
+                    # The forward of the aborted batch may never drive the
+                    # broadcast to the last layer; drop the entry's device
+                    # tensors now instead of keeping them until reset().
+                    self.broadcast_loads.pop(counter_index, None)
                     logger.exception("Mooncake layer-wise load batch failed")
             finally:
                 self.load_queue.task_done()

@@ -1,0 +1,96 @@
+diff --git a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+index ef195d9f..15a8c1e9 100644
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+@@ -821,6 +821,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+ 
+         return PoolTransferResult(final_pages, hit_count)
+ 
++    def _expected_io_bytes(
++        self, transfers: List[PoolTransfer]
++    ) -> List[int]:
++        expected = []
++        for transfer in transfers:
++            first_slice = transfer.slices[0]
++            offset = first_slice.slice_start_idx * transfer.prior_canonical_data_size
++            total = offset + sum(
++                s.data_size for s in transfer.slices
++            )
++            expected.append(total)
++        return expected
++
+     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+         # Unified v2 I/O path: each PoolTransfer can expand to one or more
+         # storage objects per logical page, but API still reports page-level result.
+@@ -983,7 +996,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+             (
+                 all(res == 0 for res in group)
+                 if is_set_operate
+-                else all(res > 0 for res in group)
++                else all(res == group_size for res in group)
+             )
+             for group in result_groups
+         ]
+@@ -1087,6 +1100,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+         exist_result = self._batch_exist([key])
+         if exist_result[0] == 1:
+             return True
++        if key is None:
++            return False
+         put_result = self._put_batch_zero_copy_impl(
+             [key], [target_location], [target_sizes]
+         )
+@@ -1158,9 +1173,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+     ) -> bool:
+         assert target_location is not None and target_sizes is not None
+         get_result = self._get_batch_zero_copy_impl(
+-            [key], [target_location], [target_sizes]
++            [key],
++            [target_location],
++            [target_sizes],
++            expected_sizes=target_sizes,
+         )
+-        return get_result[0] >= 0
++        return get_result[0] == target_sizes[0]
+ 
+     def batch_get(
+         self,
+@@ -1174,7 +1192,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+ 
+         start_time = time.perf_counter()
+         get_result = self._get_batch_zero_copy_impl(
+-            keys, target_locations, target_sizes
++            keys,
++            target_locations,
++            target_sizes,
++            expected_sizes=target_sizes,
+         )
+         end_time = time.perf_counter()
+ 
+@@ -1190,7 +1211,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+             )
+ 
+         for i in range(len(keys)):
+-            if get_result[i] < 0:
++            if get_result[i] != target_sizes[i]:
+                 return i // key_multiplier
+         return len(keys) // key_multiplier
+ 
+@@ -1265,11 +1286,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+ 
+     def _get_batch_zero_copy_impl(
+-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
++        self,
++        key_strs: List[str],
++        buffer_ptrs: List[Any],
++        buffer_sizes: List[Any],
++        expected_sizes: Optional[List[int]] = None,
+     ) -> List[int]:
+         if self._uses_multi_buffer(buffer_ptrs):
+             return self.store.batch_get_into_multi_buffers(
+-                key_strs, buffer_ptrs, buffer_sizes
++                key_strs, buffer_ptrs, buffer_sizes, expected_sizes
+             )
+         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+ 

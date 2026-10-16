@@ -213,6 +213,14 @@ class StagingAllocator:
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
         """Allocate a region. Returns (alloc_id, offset, round) or None."""
+        if required_bytes <= 0:
+            # A non-positive request (e.g. a negative page count decoded from
+            # a corrupt wire frame) would otherwise PASS the bounds checks
+            # below while regressing self.head, silently overlapping an
+            # outstanding same-round allocation.
+            raise ValueError(
+                f"staging allocation size must be positive, got {required_bytes}"
+            )
         with self.lock:
             if required_bytes > self.total_size:
                 return None

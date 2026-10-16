@@ -1,0 +1,42 @@
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -241,21 +241,36 @@
+     def register_buffer_to_engine(self):
+         # Batch register KV data buffers
+         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+-            self.engine.batch_register(
++            ret = self.engine.batch_register(
+                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+             )
++            if ret != 0:
++                raise RuntimeError(
++                    "Mooncake KV data buffer registration failed "
++                    f"(err={ret}); the NIC would DMA into unregistered "
++                    "memory at the first transfer"
++                )
+ 
+         # Batch register auxiliary data buffers
+         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
+-            self.engine.batch_register(
++            ret = self.engine.batch_register(
+                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+             )
++            if ret != 0:
++                raise RuntimeError(
++                    "Mooncake aux data buffer registration failed "
++                    f"(err={ret}); aux metadata would silently corrupt"
++                )
+ 
+         for ptrs, lens in zip(
+             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+         ):
+             if ptrs and lens:
+-                self.engine.batch_register(ptrs, lens)
++                ret = self.engine.batch_register(ptrs, lens)
++                if ret != 0:
++                    raise RuntimeError(
++                        f"Mooncake state buffer registration failed (err={ret})"
++                    )
+ 
+     def deregister_buffer_to_engine(self):
+         if self.kv_args.kv_data_ptrs:

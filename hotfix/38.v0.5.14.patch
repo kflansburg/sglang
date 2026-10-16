@@ -1,0 +1,44 @@
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index b4365b55c9..0878d4c827 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -460,8 +460,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
+         key_len = len(radix_key)
+         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+ 
++        # Guard: never insert or free below the tree's recorded protection for
++        # this request. A trimmed finish (e.g. stop-string / strip-thinking /
++        # spec-verify overshoot) after an unfinished checkpoint advanced
++        # cache_protected_len into generated output would otherwise hand
++        # tree-owned rows back to the allocator (freed double at evict and
++        # aliased by the next allocation). The freed tail is clamped to start
++        # past the protected prefix either way.
++        protected_len = req.cache_protected_len
++
+         # Radix Cache takes one ref in memory pool
+-        if is_insert:
++        if is_insert and key_len > protected_len:
+             priority = getattr(req, "priority", 0) or 0
+             result = self.insert(
+                 InsertParams(key=radix_key, value=values, priority=priority)
+@@ -471,12 +480,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
+                 kv_indices[req.cache_protected_len : result.prefix_len]
+             )
+         else:
+-            self.token_to_kv_pool_allocator.free(
+-                kv_indices[req.cache_protected_len : key_len]
+-            )
++            if key_len > protected_len:
++                self.token_to_kv_pool_allocator.free(
++                    kv_indices[req.cache_protected_len : key_len]
++                )
+ 
+-        # free the unaligned tail
+-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
++        # free the unaligned tail (clamped past the protected prefix)
++        self.token_to_kv_pool_allocator.free(
++            kv_indices[max(key_len, protected_len) :]
++        )
+ 
+         # Remove req slot release the cache lock
+         if req.last_node is not None:

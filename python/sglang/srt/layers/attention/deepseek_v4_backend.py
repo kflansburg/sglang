@@ -1276,7 +1276,12 @@ class DeepseekV4AttnBackend(
             )
         # Invariants are checked in RaggedVerifyLayout.__post_init__; a device-side
         # check here would D2H-sync the host-free verify prep path.
-        layout = layout.padded_to_bucket(padded_bs=bs)
+        # R-1: cap the no-padding-row fold at the request's draft budget; the
+        # legacy uncapped fold widened the last real row's verify past its
+        # drafted width and read stale prior-owner table content.
+        layout = layout.padded_to_bucket(
+            padded_bs=bs, last_row_cap=self.speculative_num_draft_tokens
+        )
         return layout
 
     def _target_verify_graph_key(

@@ -1,0 +1,75 @@
+From 032e92afbb628a12bb72efa783325b1bf6630007 Mon Sep 17 00:00:00 2001
+From: kflansburg <kflansburg@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 05:55:39 +0000
+Subject: [PATCH] HOTFIX V3: bound NIXL healthy handle wait
+
+---
+ python/sglang/srt/disaggregation/nixl/conn.py | 22 +++++++++++++++++++
+ python/sglang/srt/environ.py                  |  4 ++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/python/sglang/srt/disaggregation/nixl/conn.py b/python/sglang/srt/disaggregation/nixl/conn.py
+index f60a8766a1..d686178a22 100644
+--- a/python/sglang/srt/disaggregation/nixl/conn.py
++++ b/python/sglang/srt/disaggregation/nixl/conn.py
+@@ -57,6 +57,14 @@ except ImportError:
+ logger = logging.getLogger(__name__)
+ 
+ GUARD = "NixlMsgGuard".encode("ascii")
++
++# Bound on how long a transfer worker waits on a batch in which NO handle has
++# reported ERR. A handle stuck in PROC forever (dead peer that never errors
++# out) must not wedge the worker and starve every other room sharded to its
++# queue; past the bound the worker fails the room and the decode side's
++# waiting-timeout path concludes the abort.
++def _healthy_settle_timeout_s() -> float:
++    return envs.SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S.get()
+ KV_MEM_KINDS = {"VRAM", "DRAM"}
+ 
+ 
+@@ -1190,6 +1198,9 @@ class NixlKVManager(CommonKVManager):
+                     # Chunk has been re-enqueued; do not advance status.
+                     continue
+ 
++                healthy_deadline = (
++                    time.monotonic() + _healthy_settle_timeout_s()
++                )
+                 while handles:
+                     all_done = True
+                     for handle in handles:
+@@ -1202,6 +1213,17 @@ class NixlKVManager(CommonKVManager):
+                             all_done = False
+                     if all_done:
+                         break
++                    if time.monotonic() >= healthy_deadline:
++                        logger.error(
++                            "NIXL healthy-settle timeout: transfer batch with no "
++                            "failed handle did not settle within %ss; treating it "
++                            "as wedged",
++                            _healthy_settle_timeout_s(),
++                        )
++                        raise RuntimeError(
++                            f"NIXL transfer for room {room} failed to settle: "
++                            "healthy-settle timeout"
++                        )
+                     time.sleep(0)
+ 
+                 if kv_chunk.is_last_chunk:
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 943d945066..5e16a02d3e 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -377,6 +377,10 @@ class Envs:
+     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
++    # Bound (seconds) a prefill transfer worker waits on a NIXL handle batch in
++    # which no handle has failed; a permanently-PROC handle would otherwise
++    # wedge the worker and starve every room sharded to its queue.
++    SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S = EnvFloat(300.0)
+     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+-- 
+2.47.3
+

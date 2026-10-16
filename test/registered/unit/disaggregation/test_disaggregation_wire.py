@@ -297,7 +297,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.is_hybrid_mla_backend = False
                 manager.pp_size = 1
                 manager.kv_args = SimpleNamespace(
-                    mla_compression_ratios=None, prefill_start_layer=0
+                    mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                 )
                 reason = manager._state_stride_mismatch(
                     src_data_ptrs=[0x1000, 0x1100],
@@ -1009,7 +1009,7 @@ class TestQwen4StateWire(unittest.TestCase):
                     manager.is_hybrid_mla_backend = False
                     manager.pp_size = 1
                     manager.kv_args = SimpleNamespace(
-                        mla_compression_ratios=None, prefill_start_layer=0
+                        mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                     )
                     reason = manager._state_stride_mismatch(
                         src_data_ptrs=[0x1000, 0x1100],
@@ -1043,7 +1043,7 @@ class TestQwen4StateWire(unittest.TestCase):
                     manager.is_hybrid_mla_backend = False
                     manager.pp_size = 1
                     manager.kv_args = SimpleNamespace(
-                        mla_compression_ratios=None, prefill_start_layer=0
+                        mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                     )
                     manager.state_strides_validated = set()
                     manager.enable_custom_mem_pool = False
@@ -1288,7 +1288,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             gpu_id=0,
             page_size=self.PAGE_SIZE,
             total_kv_head_num=total_heads,
-            prefill_start_layer=0,
+            prefill_start_layer=0, prefill_end_layer=None,
             state_types=[StateType.SWA],
             state_data_ptrs=[src_ptrs],
             state_item_lens=[[item_len] * len(src_ptrs)],
@@ -1398,13 +1398,16 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         prefill = object.__new__(CommonKVManager)
         prefill.attn_tp_size = 2
         prefill.kv_args = SimpleNamespace(
-            engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0
+            engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0, prefill_end_layer=None
         )
         for pp_size, layout, src_item_lens, dst_item_lens, message in (
             # SWA state has no layer ids, so a later PP stage would land on the
             # decode peer's first SWA layers.
             (2, "nhd", [16, 16], [8, 8], "pipeline parallelism"),
-            (1, "nhd", [64], [32], "per-layer K/V"),
+            # A single SWA-ring entry cannot be K/V-paired: post-F15 the
+            # geometry guard rejects odd source entropy BEFORE the outer
+            # per-layer-K/V check runs; either way this layout is rejected.
+            (1, "nhd", [64], [32], "Bad src KV geometry"),
             # One SWA head per rank on both sides, against 8 total KV heads.
             (1, "nhd", [8, 8], [8, 8], "do not split"),
             # Item lengths that are valid NHD, so only the layout can reject.
@@ -1547,8 +1550,9 @@ class TestStagingWatermark(unittest.TestCase):
         handler.staging_allocator = Mock()
         handler.staging_allocator.get_watermark.return_value = (3, 0)
         handler._wm_subscribers = {}
+        handler._wm_key_by_room = {}
 
-        handler.register_wm_subscriber(receiver, "session-new")
+        handler.register_wm_subscriber(0, receiver, "session-new")
 
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
@@ -2397,3 +2401,214 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestMooncakeKvIndexMismatch(CustomTestCase):
+    """Regression: a short decode dst_kv_indices list must fail the room, not
+    silently truncate the chunk (tail pages never written but room concluding
+    Success = cross-request stale KV read); and the shared kv_chunk must never
+    be mutated in place (sibling replicas of a multi-destination room iterate
+    over it, so a truncation poisons replica 2's length pairing).
+    """
+
+    def _make_manager(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000],
+            state_types=[],
+            state_data_ptrs=[],
+            state_item_lens=[],
+            state_dim_per_tensor=[],
+            state_layer_ids=[],
+            aux_data_ptrs=[0x5000],
+            aux_item_lens=[8],
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = manager.attn_cp_size = manager.pp_size = 1
+        manager.attn_tp_rank = manager.attn_cp_rank = manager.pp_rank = 0
+        manager.enable_trace = manager.enable_staging = False
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.bootstrap_port = 1234
+        manager.session_lock = threading.Lock()
+        manager.failure_lock = threading.Lock()
+        manager.failed_sessions = set()
+        manager.session_failures = defaultdict(int)
+        manager.state_layout_rejections = {}
+        manager.state_strides_validated = set()
+        manager.failure_records = {}
+        manager._staging_outstanding = defaultdict(int)
+        manager.request_status = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.transfer_infos = {}
+        manager.decode_kv_args_table = {}
+        manager.deferred_bootstrap = None
+        manager._deferred_ack_targets = {}
+        manager._deferred_ack_poisoned_rooms = set()
+        manager._dcp_pack_buffers = None
+        manager.enable_deferred_decode_kv_release = True
+        return manager
+
+    def _make_req(self, room, session, dst_kv_indices):
+        return TransferInfo(
+            room=room,
+            endpoint="127.0.0.1",
+            dst_port=1234,
+            mooncake_session_id=session,
+            dst_kv_indices=np.asarray(dst_kv_indices, dtype=np.int32),
+            dst_aux_index=5,
+            dst_state_indices=[],
+            required_dst_info_num=None,  # filled by caller
+            is_dummy=False,
+        )
+
+    def test_short_dst_kv_indices_fails_room_and_never_mutates_chunk(self):
+        manager = self._make_manager()
+        room = 100
+        # Replica A: correctly-sized destination. Replica B: short by one page.
+        req_a = self._make_req(room, "decode:a", [20, 21, 22, 23])
+        req_b = self._make_req(room, "decode:b", [30, 31, 32])
+        for req in (req_a, req_b):
+            req.required_dst_info_num = 2
+        manager.transfer_infos[room] = {req.mooncake_session_id: req for req in (req_a, req_b)}
+        for session in ("decode:a", "decode:b"):
+            manager.decode_kv_args_table[session] = SimpleNamespace(
+                requires_dcp_relayout=False,
+                dst_kv_ptrs=[0x2000],
+                dst_kv_layer_ids=[0],
+                dst_kv_item_len=64,
+                dst_state_data_ptrs=[],
+                dst_state_item_lens=[],
+                dst_state_dim_per_tensor=[],
+                dst_state_layer_ids=[],
+                dst_attn_tp_size=1,
+                dst_aux_ptrs=[0x6000],
+            )
+        manager.request_status[room] = KVPoll.Transferring
+        manager.req_to_decode_prefix_len[room] = 0
+
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([10, 11, 12, 13], dtype=np.int32),
+            index_slice=slice(0, 4),
+            is_last_chunk=True,
+            prefill_aux_index=2,
+            state_indices=None,
+        )
+        queue = FastQueue()
+        queue.put(chunk)
+        queue.put(None)
+
+        manager.send_kvcache = Mock(return_value=0)
+        manager.send_aux = Mock(return_value=0)
+        manager._send_multipart_locked = Mock()
+        manager._poison_unsettled_send = Mock()
+        manager.defer_decode_allocation = False
+
+        chunk_ref = chunk.prefill_kv_indices
+        manager.transfer_worker(queue, executor=None)
+
+        # Replica A transferred fully (all four pages), using the intact chunk.
+        manager.send_kvcache.assert_called_once()
+        sent = manager.send_kvcache.call_args
+        np.testing.assert_array_equal(sent.args[1], np.array([10, 11, 12, 13]))
+        np.testing.assert_array_equal(sent.args[3], np.array([20, 21, 22, 23]))
+        manager.send_aux.assert_called_once()  # only replica A reached aux
+
+        # The room concluded Failed (not Success) on replica B's short list...
+        self.assertEqual(manager.request_status.get(room), KVPoll.Failed)
+        self.assertIn("Destination KV index count mismatch", manager.failure_records[room])
+        self.assertIn("dst=3 vs prefill=4", manager.failure_records[room])
+        # ...transfer list drained, and the chunk object was never mutated.
+        np.testing.assert_array_equal(chunk_ref, np.array([10, 11, 12, 13]))
+        self.assertIs(chunk.prefill_kv_indices, chunk_ref)
+        self.assertFalse(manager.transfer_infos)
+        self.assertFalse(manager._staging_outstanding)
+        manager._poison_unsettled_send.assert_not_called()
+
+    def test_short_dst_device_kv_indices_fails_room(self):
+        manager = self._make_manager()
+        room = 200
+        req = self._make_req(room, "decode:c", [20, 21, 22, 23])
+        req.dst_device_kv_indices = np.array([40, 41], dtype=np.int32)
+        req.required_dst_info_num = 1
+        manager.transfer_infos[room] = {"decode:c": req}
+        manager.decode_kv_args_table["decode:c"] = SimpleNamespace(
+            requires_dcp_relayout=False,
+            dst_kv_ptrs=[0x2000],
+            dst_kv_layer_ids=[0],
+            dst_kv_item_len=64,
+            dst_state_data_ptrs=[],
+            dst_state_item_lens=[],
+            dst_state_dim_per_tensor=[],
+            dst_state_layer_ids=[],
+            dst_attn_tp_size=1,
+            dst_aux_ptrs=[0x6000],
+        )
+        manager.request_status[room] = KVPoll.Transferring
+        manager.req_to_decode_prefix_len[room] = 0
+
+        queue = FastQueue()
+        queue.put(
+            TransferKVChunk(
+                room=room,
+                prefill_kv_indices=np.array([10, 11, 12, 13], dtype=np.int32),
+                index_slice=slice(0, 4),
+                is_last_chunk=True,
+                prefill_aux_index=2,
+                state_indices=None,
+            )
+        )
+        queue.put(None)
+
+        manager.send_kvcache = Mock(return_value=0)
+        manager._send_multipart_locked = Mock()
+        manager._poison_unsettled_send = Mock()
+        manager.defer_decode_allocation = False
+
+        manager.transfer_worker(queue, executor=None)
+
+        manager.send_kvcache.assert_not_called()
+        self.assertEqual(manager.request_status.get(room), KVPoll.Failed)
+        self.assertIn(
+            "Destination device KV index count mismatch",
+            manager.failure_records[room],
+        )
+
+
+class TestMooncakeRegistrationFailure(CustomTestCase):
+    """Regression: a failed batch_register must abort startup (fail fast), not
+    leave the process serving with unregistered KV buffers so every later
+    transfer errors at runtime."""
+
+    def _make_manager(self, register_ret):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000],
+            kv_data_lens=[1024],
+            aux_data_ptrs=[0x5000],
+            aux_data_lens=[16],
+            state_data_ptrs=[[0x9000]],
+            state_data_lens=[[256]],
+        )
+        manager.engine = Mock()
+        manager.engine.batch_register = Mock(return_value=register_ret)
+        manager.engine.batch_deregister = Mock(return_value=0)
+        return manager
+
+    def test_batch_register_failure_raises(self):
+        manager = self._make_manager(register_ret=-1)
+        with self.assertRaisesRegex(RuntimeError, "failed to register"):
+            manager.register_buffer_to_engine()
+        manager.engine.batch_register.assert_called_once_with(
+            [0x1000, 0x5000, 0x9000], [1024, 16, 256]
+        )
+
+    def test_batch_register_success_is_silent(self):
+        manager = self._make_manager(register_ret=0)
+        manager.register_buffer_to_engine()
+
+    def test_staging_register_failure_raises(self):
+        manager = self._make_manager(register_ret=-1)
+        with self.assertRaisesRegex(RuntimeError, "staging buffer"):
+            manager._register_staging_memory(0x7000, 4096)

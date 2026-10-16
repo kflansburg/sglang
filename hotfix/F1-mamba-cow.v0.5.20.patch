@@ -1,0 +1,86 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 7811e4477a..e53406bdcc 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1913,6 +1913,12 @@ class Req(ReqDllmMixin):
+         self.kv.mamba_last_track_idx = None
+         self.kv.mamba_last_track_seqlen = None
+         self.mamba_branching_seqlen = None
++        # F-1 HOTFIX
++        _f1_lock = getattr(self.kv, 'mamba_cow_lock', None)
++        self.kv.mamba_cow_lock = None
++        if _f1_lock is not None:
++            _tc, _node, _res = _f1_lock
++            _tc.dec_lock_ref(_node, _res.to_dec_params())
+         self.kv.mamba_cow_src_index = None
+         self.kv.mamba_needs_clear = False
+         self.already_computed = 0
+@@ -2995,6 +3001,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             if req.kv.mamba_cow_src_index is not None:
+                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
++                # F-1 HOTFIX
++                _f1_lock = getattr(req.kv, 'mamba_cow_lock', None)
++                req.kv.mamba_cow_lock = None
++                if _f1_lock is not None:
++                    _tc, _node, _res = _f1_lock
++                    _tc.dec_lock_ref(_node, _res.to_dec_params())
+                 req.kv.mamba_cow_src_index = None
+                 req.kv.mamba_needs_clear = False
+             elif req.kv.mamba_needs_clear:
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 743c8afe06..94a5957543 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3956,7 +3956,14 @@ class Scheduler(
+                 if not added:
+                     # init_next_round_input() may stage deferred Mamba COW/clear
+                     # metadata before add_one_req() rejects the request.
++                    # F-1 HOTFIX
++                    _f1_lock = getattr(req.kv, 'mamba_cow_lock', None)
++                    req.kv.mamba_cow_lock = None
++                    if _f1_lock is not None:
++                        _tc, _node, _res = _f1_lock
++                        _tc.dec_lock_ref(_node, _res.to_dec_params())
+                     req.kv.mamba_cow_src_index = None
++
+                     req.kv.mamba_needs_clear = False
+                     if req.kv.holds_mamba and not getattr(req, "session", None):
+                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index e98bdec52d..6c4b6fffc5 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -1207,6 +1207,15 @@ class MambaRadixCache(BasePrefixCache):
+                     self.dec_lock_ref(last_node)
+                     assert dst_index is not None, "Can not alloc mamba cache"
+                 req.kv.mamba_pool_idx = dst_index[0]
++# F-1 HOTFIX: pin the COW source node for the deferral window.
++            # Supersede: release any previously staged lock first.
++            _f1_lock = getattr(req.kv, 'mamba_cow_lock', None)
++            req.kv.mamba_cow_lock = None
++            if _f1_lock is not None:
++                _tc, _node, _res = _f1_lock
++                _tc.dec_lock_ref(_node, _res.to_dec_params())
++            _f1_res = self.inc_lock_ref(last_node)
++            req.kv.mamba_cow_lock = (self, last_node, _f1_res)
+             req.kv.mamba_cow_src_index = last_node.mamba_value
+             req.kv.mamba_needs_clear = False
+ 
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 28333dffb1..5f0b8f0a84 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1706,6 +1706,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
+             req.kv.mamba_next_track_idx = None
+             req.kv.mamba_last_track_idx = None
+             req.kv.mamba_last_track_seqlen = None
++# F-1 HOTFIX: release staged mamba COW source lock at pool free.
++            _f1_lock = getattr(req.kv, 'mamba_cow_lock', None)
++            req.kv.mamba_cow_lock = None
++            if _f1_lock is not None:
++                _tc, _node, _res = _f1_lock
++                _tc.dec_lock_ref(_node, _res.to_dec_params())
+             req.kv.mamba_cow_src_index = None
+             req.kv.mamba_needs_clear = False
+ 

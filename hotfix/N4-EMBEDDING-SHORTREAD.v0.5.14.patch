@@ -1,0 +1,14 @@
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py
+@@ -38,7 +38,10 @@
+     ) -> List[bool]:
+         keys = [self.get_key(h) for h in hashes]
+         results = self.store.batch_get_into(keys, ptrs, sizes)
+-        return [res > 0 for res in results]
++        # Mooncake returns bytes read per key (negative on error); a short
++        # read must NOT count as success: a partially filled buffer would
++        # poison the cache entry and every later request for this hash.
++        return [res == size for res, size in zip(results, sizes)]
+ 
+     def batch_put(
+         self, hashes: List[str], ptrs: List[int], sizes: List[int]

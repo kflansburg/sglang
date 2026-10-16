@@ -1,0 +1,50 @@
+diff --git a/python/sglang/srt/disaggregation/encoder/server.py b/python/sglang/srt/disaggregation/encoder/server.py
+index 68877a0ed6..c6e181348a 100644
+--- a/python/sglang/srt/disaggregation/encoder/server.py
++++ b/python/sglang/srt/disaggregation/encoder/server.py
+@@ -1432,6 +1432,12 @@ class MMEncoder:
+                         f"Prefetch failed for req {ctx.req_id}: {e}. "
+                         f"Falling back to ViT for {len(hit_indices)} hit items."
+                     )
++                    # Reap the prefetch bookkeeping so the op cannot leak in
++                    # ongoing_prefetch (the io thread still resolves entries).
++                    try:
++                        self.mm_global_cache.release_prefetch(ctx.req_id)
++                    except Exception:
++                        logger.exception("Failed to release prefetch state")
+                     for idx in hit_indices:
+                         fallback_mask[idx] = 1
+ 
+diff --git a/python/sglang/srt/mem_cache/embedding_cache_controller.py b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+index 4a95d36351..a79e3aa606 100644
+--- a/python/sglang/srt/mem_cache/embedding_cache_controller.py
++++ b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+@@ -576,6 +576,13 @@ class EmbeddingCacheController:
+         keys, all_ptrs, all_sizes = [], [], []
+ 
+         with self.lock:
++            stale_op = self.ongoing_prefetch.pop(req_id, None)
++            if stale_op is not None:
++                logger.warning(
++                    f"Req {req_id}: dropping stale prefetch op "
++                    f"({len(stale_op.keys)} pending keys); the io thread "
++                    f"will still finish it."
++                )
+             for mm_hash, num_tokens in zip(mm_hashes, expected_tokens):
+                 entry = self.entries.get(mm_hash)
+                 if entry is not None:
+@@ -621,6 +628,14 @@ class EmbeddingCacheController:
+             self.ongoing_prefetch[req_id] = op
+             self.prefetch_queue.put(op)
+ 
++    def release_prefetch(self, req_id: str):
++        """Drop a request's prefetch op bookkeeping (e.g. after a wait
++        timeout or request abort). The io thread still completes the GET and
++        resolves the entries; only the req_id -> op bookkeeping is removed so
++        it cannot leak in ongoing_prefetch."""
++        with self.lock:
++            self.ongoing_prefetch.pop(req_id, None)
++
+     def insert_batch(
+         self,
+         mm_hashes: List[str],

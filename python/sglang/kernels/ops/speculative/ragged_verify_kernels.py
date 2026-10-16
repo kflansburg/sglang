@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import msgspec
+from typing import Optional
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +16,7 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        last_row_cap: Optional[int] = None,
     ) -> torch.Tensor:
         impl = cls.triton if verify_lens.is_cuda else cls.torch
         return impl(
@@ -22,6 +24,7 @@ class PaddedToBucket:
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            last_row_cap=last_row_cap,
         )
 
     @classmethod
@@ -32,12 +35,14 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        last_row_cap: Optional[int] = None,
     ) -> torch.Tensor:
         return pad_verify_lens_to_bucket(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            last_row_cap=last_row_cap,
         )
 
     @classmethod
@@ -48,12 +53,14 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        last_row_cap: Optional[int] = None,
     ) -> torch.Tensor:
         return pad_verify_lens_to_bucket_triton(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            last_row_cap=last_row_cap,
         )
 
 
@@ -63,6 +70,7 @@ def pad_verify_lens_to_bucket(
     graph_num_tokens: int,
     bs: int,
     padded_bs: int,
+    last_row_cap: Optional[int] = None,
 ) -> torch.Tensor:
     assert padded_bs >= bs, (
         f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold this "
@@ -80,8 +88,20 @@ def pad_verify_lens_to_bucket(
         )
         padded = torch.cat([padded, pad_block.to(torch.int32)])
     else:
+        # R-1: without a padding row to absorb the tier's leftover, folding it
+        # into the LAST REAL row can push that row past its drafted width
+        # (sum of other rows' rejected-drafts budget): the verify positions
+        # then run past seq + num_draft into never-allocated table entries
+        # (stale prior-owner slot content leaks into this row's attention).
+        # Cap the fold at last_row_cap (the per-request draft budget); the
+        # uncovered remainder collapses into the consumer's ghost handling,
+        # exactly as the cap=N layout variant semantics.
         padded = padded.clone()
-        padded[-1] = (padded[-1].to(torch.int64) + leftover).to(torch.int32)
+        fold = leftover
+        if last_row_cap is not None:
+            fold = min(int(leftover), last_row_cap - int(padded[-1]))
+            fold = max(fold, 0)
+        padded[-1] = (padded[-1].to(torch.int64) + fold).to(torch.int32)
     return padded
 
 
@@ -92,6 +112,7 @@ def _padded_to_bucket_kernel(
     bs,
     padded_bs,
     graph_num_tokens,
+    last_row_cap,  # constexpr(-1 = uncapped legacy fold)
     BLOCK: tl.constexpr,
 ):
     idx = tl.arange(0, BLOCK)
@@ -105,7 +126,15 @@ def _padded_to_bucket_kernel(
     rem = leftover - base * num_pad_safe
     pad_len = base + tl.where((idx - bs) < rem, 1, 0)
     final = tl.where(is_real, vl, pad_len)
-    final = final + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
+    # R-1: cap the last-real-row fold at last_row_cap (per-request draft
+    # budget); the uncovered remainder falls to the consumer's ghost
+    # handling instead of widening the last row's verify past its drafts.
+    if last_row_cap != -1:
+        last_len = tl.load(verify_lens_ptr + (bs - 1)).to(tl.int64)
+        fold = tl.minimum(leftover, tl.maximum(last_row_cap - last_len, 0))
+        final = final + tl.where((num_pad == 0) & (idx == bs - 1), fold, 0)
+    else:
+        final = final + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
     tl.store(out_ptr + idx, final.to(tl.int32), mask=valid)
 
 
@@ -115,6 +144,7 @@ def pad_verify_lens_to_bucket_triton(
     graph_num_tokens: int,
     bs: int,
     padded_bs: int,
+    last_row_cap: Optional[int] = None,
 ) -> torch.Tensor:
     assert padded_bs >= bs, (
         f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold this "
@@ -130,6 +160,7 @@ def pad_verify_lens_to_bucket_triton(
         bs,
         padded_bs,
         graph_num_tokens,
+        -1 if last_row_cap is None else last_row_cap,
         BLOCK=BLOCK,
     )
     return out

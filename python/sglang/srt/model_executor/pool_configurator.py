@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -221,6 +222,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self.kvc = kvc
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
@@ -248,10 +250,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
+        # The DSA kpool-compress request-tail buffers are likewise a fixed
+        # per-(request, layer) cost with no expressible per-token cell size
+        # (GBs at V4-class dims), so they ride the same fixed-overhead bias.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
 
-        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
-        # which holds for EAGLE/MTP drafts that reuse the target's attention config.
+        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV
+        # size, which holds for EAGLE/MTP drafts that reuse the target's
+        # attention config.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -611,10 +617,66 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
         )
 
+    def _dsa_compress_tail_overhead_bytes(
+        self, kvc: KVCacheConfigurator, *, available_bytes: int
+    ) -> int:
+        """Exact-or-upper-bounded fixed bytes of the DSA kpool-compress tails.
+
+        Charged against the KV budget before token sizing: these tails are a
+        fixed per-(request, layer) cost no per-token cell size can express
+        (GBs at V4-class dims -- see boards #47). Layer-count mirrors the
+        pool's allocate-if-not-skip-topk rule; a draft worker charges 0.
+
+        The ``max_running_requests`` the pool is ACTUALLY built with is
+        resolved AFTER sizing (resolve_max_num_reqs), so when it is unset the
+        budget mirrors the resolver's auto estimate against the token-cap
+        UPPER BOUND available_bytes//cell_size (the true token cap only falls
+        below it, so the estimate only over-counts: over-charge is slack that
+        comes back as headroom; under-charge is the OOM bug this fixes).
+        """
+        hf = kvc.model_config.hf_config
+        if not is_deepseek_dsa(hf):
+            return 0
+        num_alloc_index_layers = sum(
+            not dsa_layer_skips_topk(hf, layer_id)
+            for layer_id in _get_dsa_cache_layer_ids(
+                kvc, kvc.layer_info.num_effective_layers
+            )
+        )
+        user_max = get_schedule().max_running_requests
+        if user_max is not None:
+            # charge >= resolved: the post-sizing resolve only ever shrinks
+            # (min(user/dp, token_cap//2, mamba_cap) <= user/dp), so this
+            # bound can only over-count; slack comes back as headroom.
+            max_reqs_bound = user_max // kvc.attn_dp_size
+        else:
+            # resolve_max_num_reqs auto route, mirrored against the upper-bound
+            # token cap of this budget: est <= 4096, est <= token_cap_ub//2.
+            token_cap_ub = available_bytes // max(self._cell_size, 1)
+            estimated = int(token_cap_ub / kvc.model_config.context_len * 512)
+            estimated = max(min(estimated, 4096), 2048)
+            max_reqs_bound = min(estimated, token_cap_ub // 2)
+        return DSATokenToKVPool.estimate_compress_tail_bytes(
+            index_kpool=get_dsa_index_kpool(hf),
+            index_kpool_compress=get_dsa_index_kpool_compress(hf),
+            tail_extra_slots=max_speculative_num_draft_tokens() or 0,
+            index_head_dim=get_dsa_index_head_dim(hf),
+            num_alloc_index_layers=num_alloc_index_layers,
+            max_running_requests=max_reqs_bound,
+        )
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        # DSA compress-tail bias: exact when max_running_requests is pinned,
+        # otherwise upper-bounded from THIS budget's token-cap upper bound so
+        # the charge never under-counts what the pool will actually allocate.
+        if self._cell_size:
+            tail_bias = self._dsa_compress_tail_overhead_bytes(
+                self.kvc, available_bytes=available_bytes
+            )
+            available_bytes = max(available_bytes - tail_bias, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

@@ -1,0 +1,47 @@
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -1616,25 +1616,29 @@
+                                     req.dst_device_kv_indices[kv_chunk.index_slice]
+                                 )
+ 
+-                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+-                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+-                            if len(chunked_dst_kv_indice) < len(
++                            # HOTFIX V5: dst/prefill KV index count mismatch is
++                            # NOT benign: silent truncation aligns the two arrays
++                            # unequally and writes KV to the wrong decode slots
++                            # (stale/foreign-page cross-request leak). Fail the
++                            # room loudly instead of guessing.
++                            if len(chunked_dst_kv_indice) != len(
+                                 kv_chunk.prefill_kv_indices
+                             ):
+-                                logger.warning(
+-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
++                                logger.error(
++                                    f"Mooncake transfer worker: dst KV indices "
++                                    f"{len(chunked_dst_kv_indice)} != prefill KV indices "
++                                    f"{len(kv_chunk.prefill_kv_indices)} for bootstrap room "
++                                    f"{kv_chunk.room}, index_slice {kv_chunk.index_slice}; "
++                                    f"failing the room (was: silent truncation, "
++                                    f"cross-request leak)."
+                                 )
+-                                kv_chunk.prefill_kv_indices = (
+-                                    kv_chunk.prefill_kv_indices[
+-                                        : len(chunked_dst_kv_indice)
+-                                    ]
++                                self.conclude_failure(
++                                    bootstrap_room=kv_chunk.room,
++                                    failure_reason=(
++                                        "Mooncake dst/prefill KV index count mismatch"
++                                    ),
+                                 )
+-                            if chunked_dst_device_kv_indice is not None:
+-                                chunked_dst_device_kv_indice = (
+-                                    chunked_dst_device_kv_indice[
+-                                        : len(kv_chunk.prefill_kv_indices)
+-                                    ]
+-                                )
++                                continue
+ 
+                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                             target_rank_registration_info

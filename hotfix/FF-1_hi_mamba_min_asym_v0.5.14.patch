@@ -1,0 +1,59 @@
+diff --git a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+--- a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+@@ -1812,29 +1812,45 @@
+             operation
+         )
+ 
++        mamba_loaded_raw = 0
++        for transfer in operation.pool_transfers or []:
++            if transfer.name == PoolName.MAMBA:
++                mamba_loaded_raw = (
++                    1
++                    if operation.pool_storage_result.extra_pool_hit_pages.get(
++                        PoolName.MAMBA, 0
++                    )
++                    >= 1
++                    else 0
++                )
++                break
++
+         min_completed_tokens = completed_tokens
+         if self.tp_world_size > 1:
++            # FF-1: a mamba host slot is valid only if EVERY rank loaded it;
++            # fold the raw per-rank mamba hit into the same MIN reduce as the
++            # KV scalar. Without this, per-rank hit divergence (shared
++            # Mooncake store, group semantics) makes one rank free
++            # mamba_host_indices while another attaches it -> per-rank
++            # mamba_pool_host free lists diverge permanently -> later
++            # mamba_restore_transfers loads a foreign request's mamba state
++            # into this request's device slot (cross-request leak).
+             completed_tokens_tensor = torch.tensor(
+-                min_completed_tokens, dtype=torch.int
++                [min_completed_tokens, mamba_loaded_raw], dtype=torch.int
+             )
+             torch.distributed.all_reduce(
+                 completed_tokens_tensor,
+                 op=torch.distributed.ReduceOp.MIN,
+                 group=self.tp_group,
+             )
+-            min_completed_tokens = completed_tokens_tensor.item()
+-
++            min_completed_tokens = completed_tokens_tensor[0].item()
++            mamba_loaded_raw = completed_tokens_tensor[1].item()
++
++        mamba_loaded = bool(mamba_loaded_raw)
+         mamba_host_indices = None
+-        mamba_loaded = False
+         for transfer in operation.pool_transfers or []:
+             if transfer.name == PoolName.MAMBA:
+                 mamba_host_indices = transfer.host_indices
+-                mamba_loaded = (
+-                    operation.pool_storage_result.extra_pool_hit_pages.get(
+-                        PoolName.MAMBA, 0
+-                    )
+-                    >= 1
+-                )
+                 break
+ 
+         fetched_token_ids = token_ids[:min_completed_tokens]

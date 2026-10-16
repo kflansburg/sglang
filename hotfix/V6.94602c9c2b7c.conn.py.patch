@@ -1,0 +1,17 @@
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -326,7 +326,13 @@
+         regions = self._registerable_regions()
+         if regions:
+             ptrs, lens = zip(*regions)
+-            self.engine.batch_register(list(ptrs), list(lens))
++            ret = self.engine.batch_register(list(ptrs), list(lens))
++            if ret != 0:
++                raise RuntimeError(
++                    f"Mooncake buffer registration failed (err={ret}) for "
++                    f"{len(ptrs)} regions; serving would dereference "
++                    "unregistered memory through the NIC"
++                )
+ 
+     def deregister_buffer_to_engine(self):
+         regions = self._registerable_regions()

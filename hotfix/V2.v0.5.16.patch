@@ -1,0 +1,33 @@
+From a7c4f40326e2a1a2d38c6f965cd95baa4cf73d4b Mon Sep 17 00:00:00 2001
+From: kflansburg <kflansburg@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 05:55:39 +0000
+Subject: [PATCH] HOTFIX V2: nixl send_aux rejects mismatched aux geometry
+
+---
+ python/sglang/srt/disaggregation/nixl/conn.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/python/sglang/srt/disaggregation/nixl/conn.py b/python/sglang/srt/disaggregation/nixl/conn.py
+index f60a8766a1..118e66222b 100644
+--- a/python/sglang/srt/disaggregation/nixl/conn.py
++++ b/python/sglang/srt/disaggregation/nixl/conn.py
+@@ -1780,6 +1780,16 @@ class NixlKVManager(CommonKVManager):
+         dst_aux_index: int,
+         notif: str,
+     ):
++        # Positional pairing assumes identical aux geometry on both sides. A
++        # decode that registered more aux entries than prefill holds would be
++        # indexed out of range mid-loop (and fewer would silently truncate the
++        # aux payload); fail upfront instead.
++        if len(dst_aux_ptrs) != len(self.kv_args.aux_item_lens):
++            raise ValueError(
++                f"NIXL send_aux: aux geometry mismatch for peer {peer_name}: "
++                f"decode has {len(dst_aux_ptrs)} aux entries, "
++                f"prefill has {len(self.kv_args.aux_item_lens)}"
++            )
+         src_addrs = []
+         dst_addrs = []
+ 
+-- 
+2.47.3
+

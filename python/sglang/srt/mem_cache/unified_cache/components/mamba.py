@@ -58,6 +58,12 @@ if TYPE_CHECKING:
         UnifiedTreeNode,
     )
 
+from sglang.srt.mem_cache.unified_cache.mamba_cow import (
+    MambaCowLock,  # noqa: F401  (re-exported for callers/tests)
+    clear_mamba_cow,  # noqa: F401  (re-exported: single clear entry point)
+    stage_mamba_cow_lock,
+)
+
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
@@ -202,12 +208,22 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
+        # Pin the COW source node (all components; the tree's lock hierarchy
+        # requires full >= per-component) for the whole deferred window: from
+        # here until _collect_deferred_mamba_cow_and_clear hands the source
+        # index to the forward-stream copy. Without this lock the node may be
+        # evicted while the copy is still pending, freeing (or re-letting) the
+        # source slot — the deferred read would then leak another request's
+        # mamba state into this one (F-1).
+        stage_mamba_cow_lock(self.cache, result.best_match_node, req)
         if not req.kv.holds_mamba:
             dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if dst_index is None:
                 # Pin the window via inc/dec_lock_ref so evict's SWA release
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
+                # NOTE: the COW source lock taken above stays held across this
+                # retry; this second lock is the retry-local, short-lived pair.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
                 self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -729,9 +745,16 @@ class MambaComponent(TreeComponent):
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
-            req.kv.mamba_pool_idx = None
+        if not success:
+            if prep.allocated_mamba_slot is not None:
+                self.cache.req_to_token_pool.mamba_allocator.free(
+                    prep.allocated_mamba_slot
+                )
+                req.kv.mamba_pool_idx = None
+            # The superseded deferred COW never runs either: drop its source
+            # lock (F-1, site #10); otherwise the node pins forever.
+            if req is not None:
+                clear_mamba_cow(req)
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
@@ -1041,8 +1064,9 @@ class _MambaBufferLoadBackContext(BufferLoadBackContext):
         if write_pos is not None:
             slot = req.kv.mamba_pool_idx.unsqueeze(0)
             write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_needs_clear = False
+        # In particular the deferred COW will never read the source now;
+        # release its lock (F-1).
+        clear_mamba_cow(req)
 
     def get_insert_fields(self) -> dict[str, torch.Tensor]:
         return {"mamba_value": self.node_copy.device_indices}

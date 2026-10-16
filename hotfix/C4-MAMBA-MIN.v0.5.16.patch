@@ -1,0 +1,25 @@
+diff --git a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+index 249c970c..8151ca5e 100644
+--- a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+@@ -1888,6 +1888,20 @@ class HiMambaRadixCache(MambaRadixCache):
+                 )
+                 break
+ 
++        # HOTFIX C4 (hi_mamba mamba-loaded TP divergence): a host slot is
++        # valid only if EVERY rank loaded it. Without this fold, a rank whose
++        # sidecar read hit would attach the slot while a miss rank frees it,
++        # permanently diverging per-rank mamba host free lists (cross-request
++        # UAF). Mirrors unified_radix_cache.py's packed MIN of the pool hit.
++        if mamba_host_indices is not None and self.tp_world_size > 1:
++            mamba_loaded_tensor = torch.tensor(int(mamba_loaded), dtype=torch.int)
++            torch.distributed.all_reduce(
++                mamba_loaded_tensor,
++                op=torch.distributed.ReduceOp.MIN,
++                group=self.tp_group,
++            )
++            mamba_loaded = bool(mamba_loaded_tensor.item())
++
+         fetched_token_ids = token_ids[:min_completed_tokens]
+         written_indices = host_indices[:min_completed_tokens]
+         matched_length = self._insert_helper_host(

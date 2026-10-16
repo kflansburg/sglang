@@ -376,6 +376,15 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
+        # Drained ACKs whose zmq send raised, queued for bounded retry:
+        # (room, ip, port) -> (target, attempts, next_retry_ts). A lost drained
+        # ACK keeps decode's deferred-release gate closed forever; after the
+        # device-side hold-forever fix that is a permanent page leak, so the
+        # send path retries instead of dropping (same class as the aborted-room
+        # notification retry on the decode side).
+        self._pending_abort_acks: Dict[
+            Tuple[int, str, int], Tuple[AckTarget, int, float]
+        ] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
@@ -905,8 +914,16 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
+    _ABORT_ACK_MAX_ATTEMPTS = 6
+    _ABORT_ACK_BACKOFF_BASE_S = 0.5
+    _ABORT_ACK_BACKOFF_MAX_S = 8.0
+
     def _send_abort_ack(self, room: int, target: AckTarget) -> None:
-        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        """Ack that this rank's transfer for an aborted room drained.
+
+        A lost ACK keeps decode's deferred-release gate closed, which (after
+        the device-side hold-forever fix) leaks those pages permanently, so a
+        failed send is queued for bounded retry instead of dropped."""
         try:
             na = NetworkAddress(target.ip, target.port)
             self._send_multipart_locked(
@@ -915,11 +932,78 @@ class CommonKVManager(BaseKVManager):
                 is_ipv6=na.is_ipv6,
             )
         except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+            logger.warning(
+                f"Failed to send drained ABORT_ACK for room {room} to "
+                f"{target.ip}:{target.port}: {e}; queued for retry"
+            )
+            if not hasattr(self, "_pending_abort_acks"):
+                # Test doubles that build the manager without __init__
+                # hit the retry path without the field set.
+                self._pending_abort_acks = {}
+            self._pending_abort_acks[(room, target.ip, target.port)] = (
+                target,
+                1,
+                time.time() + self._ABORT_ACK_BACKOFF_BASE_S,
+            )
+
+    def _retry_pending_abort_acks(self, now: Optional[float] = None) -> None:
+        """Bounded retry for drained-ABORT_ACKs whose send raised.
+
+        Driven by later transfer completions on this manager (same thread
+        discipline as the drain path itself). Duplicate ACKs are harmless:
+        decode records them in a generation-guarded set. Retries give up with
+        a loud error; decode keeps the pages held rather than releasing them
+        early, so the failure mode is a bounded leak, not corruption."""
+        if not getattr(self, "_pending_abort_acks", None):
+            return
+        if now is None:
+            now = time.time()
+        for key, (target, attempts, next_ts) in list(self._pending_abort_acks.items()):
+            if now < next_ts:
+                continue
+            room = key[0]
+            if room in self._deferred_ack_poisoned_rooms:
+                # Drain can no longer be proven for this room; never tell
+                # decode it drained.
+                self._pending_abort_acks.pop(key, None)
+                continue
+            if attempts >= self._ABORT_ACK_MAX_ATTEMPTS:
+                self._pending_abort_acks.pop(key, None)
+                logger.error(
+                    f"Giving up sending drained ABORT_ACK for room {room} to "
+                    f"{target.ip}:{target.port} after {attempts} attempts; "
+                    "decode will keep the room's pages held"
+                )
+                continue
+            try:
+                na = NetworkAddress(target.ip, target.port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    AbortAck(
+                        room, self._prefill_unique_rank(), target.generation
+                    ).to_zmq(),
+                    is_ipv6=na.is_ipv6,
+                )
+                self._pending_abort_acks.pop(key, None)
+            except Exception as e:
+                logger.warning(
+                    f"Retry {attempts + 1} of drained ABORT_ACK for room {room} "
+                    f"to {target.ip}:{target.port} failed: {e}"
+                )
+                self._pending_abort_acks[key] = (
+                    target,
+                    attempts + 1,
+                    now
+                    + min(
+                        self._ABORT_ACK_BACKOFF_BASE_S * (1 << attempts),
+                        self._ABORT_ACK_BACKOFF_MAX_S,
+                    ),
+                )
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
+        self._retry_pending_abort_acks()
         if self._staging_outstanding.get(room, 0) > 0:
             return
         if room in self._deferred_ack_poisoned_rooms:
@@ -1548,33 +1632,66 @@ class CommonKVManager(BaseKVManager):
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+        """Pair this PP stage's main-model K/V pointers with the peer's.
+
+        Each side's pointer list is [K_main..., V_main...] with any draft
+        entries appended as [draft_K..., draft_V...]. Anchoring the K/V split
+        on half of the TOTAL (the previous modulo heuristic) lands inside the
+        draft block whenever one exists and silently reroutes the V transfer
+        into draft buffers, leaving decode's main V stale (cross-request
+        leak). The split must anchor on the main block of each side.
+        """
         start_layer = self.kv_args.prefill_start_layer
-        num_kv_layers = len(src_kv_ptrs) // 2
-        end_layer = start_layer + num_kv_layers
-        dst_num_total_layers = len(dst_kv_ptrs) // 2
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0) or 0
+        num_kv_layers = (len(src_kv_ptrs) - num_draft) // 2
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        if end_layer is None:
+            end_layer = start_layer + num_kv_layers
+        # Full-model main layer count, used to locate the peer's main V block:
+        # the peer's pointer list is [K_main(All), V_main(All), draft...] and
+        # its main half is only derivable from the model's layer count, not
+        # from the pointer list alone (a trailing draft block and a PP stage
+        # window are indistinguishable positionally).
+        num_main_layers_total = getattr(self.kv_args, "hidden_kv_layers", 0) or 0
+        if num_main_layers_total <= 0:
+            # Setup paths that never populated the field: fall back to the
+            # stage count, i.e. assume the peer registers exactly this stage's
+            # span (historically true only for pp == 1 without speculation).
+            num_main_layers_total = num_kv_layers
+        if num_kv_layers <= 0 or (len(src_kv_ptrs) - num_draft) % 2 != 0:
+            raise RuntimeError(
+                f"Bad src KV geometry: entries={len(src_kv_ptrs)}, "
+                f"draft={num_draft}; main block must be an even number of entries"
+            )
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
-        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        if num_kv_layers == dst_num_total_layers:
-            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
-            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-        elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
+        src_v_ptrs = src_kv_ptrs[num_kv_layers : 2 * num_kv_layers]
+
+        # The peer's main block is 2 * full-model layer count entries; the
+        # rest is its draft tail. Same-model peers share the layer count.
+        dst_num_entries = len(dst_kv_ptrs)
+        dst_main_entries = 2 * num_main_layers_total
+        dst_num_draft = dst_num_entries - dst_main_entries
+        if (
+            dst_num_draft < 0
+            or dst_num_draft % 2 != 0
+            or dst_main_entries <= 0
         ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
-            dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
-            ]
-        else:
-            # Decode pp size should be equal to prefill pp size or 1
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
-            ]
+            raise RuntimeError(
+                f"Bad dst KV geometry: entries={dst_num_entries}, full-model "
+                f"main layers={num_main_layers_total}, stage layers "
+                f"{num_kv_layers}; cannot split main K/V safely"
+            )
+        dst_num_total_layers = num_main_layers_total
+        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        dst_v_ptrs = dst_kv_ptrs[
+            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+        ]
+        if num_kv_layers != len(dst_k_ptrs) or num_kv_layers != len(dst_v_ptrs):
+            raise RuntimeError(
+                f"KV pointer pairing mismatch: stage has {num_kv_layers} "
+                f"layers, got dst_k={len(dst_k_ptrs)}, dst_v={len(dst_v_ptrs)}; "
+                "refusing to silently truncate the transfer"
+            )
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
@@ -2200,6 +2317,15 @@ class CommonKVReceiver(BaseKVReceiver):
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        # Per-rank abort-notification delivery tracking: indices (into
+        # bootstrap_infos) whose send raised, the attempts already made and the
+        # next time a retry is due. A rank that is never notified may still be
+        # RDMA-writing these pages, so the deferred-release ack gate only opens
+        # once every rank has acked; retrying here is what keeps that gate
+        # honest instead of silently corrupting reissued pages.
+        self._abort_notify_failed_ranks: List[int] = []
+        self._abort_notify_attempts: int = 0
+        self._abort_notify_next_retry_ts: float = 0.0
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._owns_bootstrap_room = not (
             mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
@@ -2291,6 +2417,8 @@ class CommonKVReceiver(BaseKVReceiver):
             return self._poll()
 
     def _poll(self) -> KVPoll:
+        if self._abort_notify_failed_ranks:
+            self._retry_abort_notifications()
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2605,8 +2733,29 @@ class CommonKVReceiver(BaseKVReceiver):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
             )
-        for bootstrap_info in self.bootstrap_infos:
-            # Best-effort notification to prefill side that this request was aborted.
+        failed = self._send_abort_notification_to_ranks(
+            range(len(self.bootstrap_infos))
+        )
+        self._abort_notify_failed_ranks = failed
+        self._abort_notify_attempts = 1
+        if failed:
+            # First retry quickly; subsequent retries back off from poll().
+            self._abort_notify_next_retry_ts = time.time() + 0.5
+
+    _ABORT_NOTIFY_MAX_ATTEMPTS = 6
+    _ABORT_NOTIFY_BACKOFF_BASE_S = 0.5
+    _ABORT_NOTIFY_BACKOFF_MAX_S = 8.0
+
+    def _send_abort_notification_to_ranks(self, rank_indices) -> List[int]:
+        """Send the abort notification to the given prefill ranks (indices into
+        bootstrap_infos). Returns the indices whose send raised.
+
+        Retried sends are idempotent on the prefill side: the room is already
+        Failed and duplicate ABORT_ACKs are harmless (ack tracking is
+        set-based and generation-guarded)."""
+        failed: List[int] = []
+        for i in rank_indices:
+            bootstrap_info = self.bootstrap_infos[i]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -2623,9 +2772,50 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
                 )
             except Exception as e:
-                logger.debug(
-                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                logger.warning(
+                    f"Failed to send abort notification for room "
+                    f"{self.bootstrap_room} to prefill rank "
+                    f"{bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}: {e}"
                 )
+                failed.append(i)
+        return failed
+
+    def _retry_abort_notifications(self, now: Optional[float] = None) -> None:
+        """Re-armed retry for ranks whose abort-notification send raised.
+
+        Bounded and non-blocking (driven by receiver polls); persistent
+        failure leaves the deferred-release ack gate closed forever for this
+        room, which is the safe failure mode: pages are held (and loudly
+        logged) instead of being reissued while a prefill rank may still be
+        RDMA-writing them."""
+        if not self._abort_notify_failed_ranks:
+            return
+        if getattr(self, "bootstrap_infos", None) is None:
+            self._abort_notify_failed_ranks = []
+            return
+        if now is None:
+            now = time.time()
+        if now < self._abort_notify_next_retry_ts:
+            return
+        if self._abort_notify_attempts >= self._ABORT_NOTIFY_MAX_ATTEMPTS:
+            logger.error(
+                f"Giving up notifying prefill ranks "
+                f"{self._abort_notify_failed_ranks} of aborted room "
+                f"{self.bootstrap_room} after {self._abort_notify_attempts} "
+                "attempts; those ranks may never ack, so the room pages must "
+                "stay held rather than be released to the allocator"
+            )
+            self._abort_notify_failed_ranks = []
+            return
+        self._abort_notify_attempts += 1
+        backoff = min(
+            self._ABORT_NOTIFY_BACKOFF_BASE_S * (1 << (self._abort_notify_attempts - 1)),
+            self._ABORT_NOTIFY_BACKOFF_MAX_S,
+        )
+        self._abort_notify_next_retry_ts = now + backoff
+        self._abort_notify_failed_ranks = self._send_abort_notification_to_ranks(
+            self._abort_notify_failed_ranks
+        )
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

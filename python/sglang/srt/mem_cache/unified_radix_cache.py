@@ -334,6 +334,17 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
+    def _all_reduce_pp_group(self, tensor: torch.Tensor, op) -> None:
+        """Fold ``tensor`` across the PP pipeline; no-op at pp_size == 1.
+
+        Every rank must enter this exactly once per batch (call-site contract,
+        e.g. linker finish_loads), so the collective stays order-consistent
+        with the other per-batch collectives on each rank.
+        """
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
+
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -1024,6 +1035,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def unlock(self, lock: Optional[TreeLock]) -> None:
         if lock is None:
             return
+        assert not lock.released, (
+            "TreeLock released twice: dec_lock_ref without a matching inc_lock_ref "
+            "underflows lock_ref and corrupts evictable/protected accounting"
+        )
+        lock.released = True
         self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
 
     def release_swa(self, lock: Optional[TreeLock]) -> None:
@@ -1152,6 +1168,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+
+        # cache_protected_len must be monotone: publishing a shorter key than
+        # the tree already owns for this request would shrink the protected
+        # watermark and let release_kv_cache free rows the tree still
+        # references. A shorter key happens when a finished request is
+        # trimmed below its previous checkpoint (e.g. strip_thinking_cache
+        # reports owned_kv_len == prompt while decode-time checkpoints
+        # already published generation): the insert would be a pure
+        # no-op/re-trim, so skip it and let components treat it as
+        # "no insert happened" (mirrors the effective_cache_len <= 0 path).
+        if page_aligned_len <= req.kv.cache_protected_len:
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=is_finished, insert_params=insert_params
+                )
+            return
+
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key

@@ -716,6 +716,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    # Bound (seconds) a prefill transfer worker waits on a NIXL handle batch in
+    # which no handle has failed; a permanently-PROC handle would otherwise
+    # wedge the worker and starve every room sharded to its queue.
+    SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S = EnvFloat(300.0)
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
@@ -727,6 +731,11 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+
+    # Max seconds drain_before_retraction waits for pending decode KV offload
+    # (device->host) copies before refusing retraction. Copies normally land in
+    # milliseconds; retraction while a copy reads device KV corrupts it.
+    SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S = EnvFloat(30.0)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -871,6 +880,11 @@ class Envs:
     # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    # How long MooncakeKVManager.teardown waits for worker threads to exit
+    # before skipping memory deregistration (the transfer engine's batch
+    # wall-clock timeout is ~30s; must exceed it so a wedged batch returns
+    # first).
+    SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S = EnvFloat(45.0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
     # true forces EPv2; false forces EPv1.

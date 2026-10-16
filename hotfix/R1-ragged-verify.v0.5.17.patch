@@ -1,0 +1,110 @@
+diff --git a/python/sglang/kernels/ops/speculative/ragged_verify_kernels.py b/python/sglang/kernels/ops/speculative/ragged_verify_kernels.py
+index 68f8ad8986..db0f111d85 100644
+--- a/python/sglang/kernels/ops/speculative/ragged_verify_kernels.py
++++ b/python/sglang/kernels/ops/speculative/ragged_verify_kernels.py
+@@ -63,6 +63,7 @@ def pad_verify_lens_to_bucket(
+     graph_num_tokens: int,
+     bs: int,
+     padded_bs: int,
++    last_row_cap=None,
+ ) -> torch.Tensor:
+     assert padded_bs >= bs, (
+         f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold this "
+@@ -80,8 +81,17 @@ def pad_verify_lens_to_bucket(
+         )
+         padded = torch.cat([padded, pad_block.to(torch.int32)])
+     else:
++        # R-1 HOTFIX: cap the last-real-row fold at last_row_cap (the
++        # per-request draft budget). Legacy uncapped fold widened the row's
++        # verify past its drafted width and read stale prior-owner table
++        # content (cross-request exposure). Remainder collapses into the
++        # consumer's ghost handling (same contract as the cap=N layout).
+         padded = padded.clone()
+-        padded[-1] = (padded[-1].to(torch.int64) + leftover).to(torch.int32)
++        fold = leftover
++        if last_row_cap is not None:
++            fold = min(int(leftover), last_row_cap - int(padded[-1]))
++            fold = max(fold, 0)
++        padded[-1] = (padded[-1].to(torch.int64) + fold).to(torch.int32)
+     return padded
+ 
+ 
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index f85b3bfc67..4475d037dd 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -599,7 +599,10 @@ class DeepseekV4AttnBackend(
+         # Layout invariants (verify_lens >= 1, total == sum) are enforced in
+         # RaggedVerifyLayout.__post_init__; don't re-check the device tensor
+         # here -- that would D2H-sync the host-free verify prep path.
+-        layout = layout.padded_to_bucket(padded_bs=bs)
++        # R-1 HOTFIX: cap the no-padding-row fold at the draft budget.
++        layout = layout.padded_to_bucket(
++            padded_bs=bs, last_row_cap=self.speculative_num_draft_tokens
++        )
+         return layout
+ 
+     def _target_verify_graph_key(
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 41ebbdea8e..212785c5db 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -2812,7 +2812,11 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata = self.target_verify_metadata[bs]
+                 ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                 if ragged_layout is not None:
+-                    padded = ragged_layout.padded_to_bucket(padded_bs=bs)
++                    # R-1 HOTFIX
++                    padded = ragged_layout.padded_to_bucket(
++                        padded_bs=bs,
++                        last_row_cap=self.speculative_num_draft_tokens,
++                    )
+                     geometry = build_ragged_target_verify_geometry(
+                         seq_lens=seq_lens, layout=padded
+                     )
+diff --git a/python/sglang/srt/layers/attention/trtllm_mha_backend.py b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+index 20881c2058..1ee3fa8e88 100644
+--- a/python/sglang/srt/layers/attention/trtllm_mha_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+@@ -847,7 +847,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+         """
+         seq_lens = forward_batch.seq_lens[:bs]
+         req_pool_indices = forward_batch.req_pool_indices[:bs]
+-        padded_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
++        # R-1 HOTFIX
++        padded_layout = ragged_layout.padded_to_bucket(
++            padded_bs=bs, last_row_cap=self.speculative_num_draft_tokens
++        )
+         geometry = build_ragged_target_verify_geometry(
+             seq_lens=seq_lens, layout=padded_layout
+         )
+diff --git a/python/sglang/srt/speculative/ragged_verify.py b/python/sglang/srt/speculative/ragged_verify.py
+index 92542e5530..76597e063c 100644
+--- a/python/sglang/srt/speculative/ragged_verify.py
++++ b/python/sglang/srt/speculative/ragged_verify.py
+@@ -165,7 +165,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
+         )
+ 
+     def padded_to_bucket(
+-        self, *, padded_bs: int, cap: Optional[int] = None
++        self, *, padded_bs: int, cap: Optional[int] = None, last_row_cap: Optional[int] = None
+     ) -> RaggedVerifyLayout:
+         """Pad to the captured slot count. The full-coverage variant (cap=None)
+         keeps sum(verify_lens) == graph_num_tokens, so padding rows (or, with
+@@ -183,6 +183,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
+             graph_num_tokens=self.graph_num_tokens,
+             bs=self.bs,
+             padded_bs=padded_bs,
++            last_row_cap=last_row_cap,
+         )
+         if cap is not None:
+             padded = torch.clamp(padded, max=cap)
+@@ -190,7 +191,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
+         return RaggedVerifyLayout._assemble_device(
+             verify_lens=padded,
+             graph_num_tokens=self.graph_num_tokens,
+-            total_verify_tokens=None if cap is not None else self.graph_num_tokens,
++            total_verify_tokens=None if (cap is not None or last_row_cap is not None) else self.graph_num_tokens,
+             cap=cap,
+         )
+ 
