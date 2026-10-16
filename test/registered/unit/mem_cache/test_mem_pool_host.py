@@ -261,29 +261,6 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn("Double-free", msg)
         self.assertIn(str(indices.tolist()), msg)
 
-    def test_free_rejects_negative_sentinel_indices(self):
-        # HiSparse/DSv4 request host tables are -1-padded; a -1 slipping into
-        # free() must fail loudly instead of wrapping to the LAST slot
-        # (slot_used[-1]) and later being issued as a valid slot id.
-        indices = self.host_pool.alloc(4)
-        tail = self.host_pool.alloc(2)
-        bad = torch.cat([indices[:2], torch.tensor([-1, -1])])
-        with self.assertRaisesRegex(AssertionError, "negative"):
-            self.host_pool.free(bad)
-        # The live tail slots must still be owned.
-        with self.assertRaises(AssertionError):
-            self.host_pool.free_slots = torch.cat(
-                [tail, self.host_pool.free_slots]
-            )
-            self.host_pool.alloc(2)
-
-    def test_free_rejects_out_of_range_indices(self):
-        self.host_pool.alloc(2)
-        with self.assertRaisesRegex(AssertionError, "out of range"):
-            self.host_pool.free(
-                torch.tensor([self.host_pool.logical_size], dtype=torch.int64)
-            )
-
     def test_shm_allocator(self):
         shm_host_pool = MHATokenToKVPoolHost(
             device_pool=self.device_pool,
@@ -309,6 +286,43 @@ class TestHostKVCache(CustomTestCase):
 
 
 class TestLazyHostPoolRelease(CustomTestCase):
+    @staticmethod
+    def _make_mha_stub_pool():
+        """A base-class HostKVCache stub that skips buffer allocation.
+
+        Lets the base-class free-list guard tests run without the
+        host-memory headroom a real host pool requires.
+        """
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.size = 8
+        pool.dcp_size = 1
+        pool.page_size = 2
+        pool.device = "cpu"
+        pool.lock = threading.RLock()
+        pool.clear()
+        return pool
+
+    def test_base_pool_free_rejects_negative_sentinel_indices(self):
+        # HiSparse/DSv4 request host tables are -1-padded; a -1 slipping into
+        # free() must fail loudly instead of wrapping to the LAST slot
+        # (slot_used[-1]) and later being issued as a valid slot id.
+        pool = self._make_mha_stub_pool()
+        tail = pool.alloc(4)
+        bad = torch.cat([tail[:2], torch.tensor([-1, -1])])
+        with self.assertRaisesRegex(AssertionError, "negative"):
+            pool.free(bad)
+        # The guard fired before any mutation: a legit free still works.
+        pool.free(tail[:2])
+        self.assertEqual(pool.num_release_slots, 2)
+
+    def test_base_pool_free_rejects_out_of_range_indices(self):
+        pool = self._make_mha_stub_pool()
+        pool.alloc(2)
+        with self.assertRaisesRegex(AssertionError, "out of range"):
+            pool.free(
+                torch.tensor([pool.logical_size], dtype=torch.int64)
+            )
+
     @staticmethod
     def _make_mamba_pool():
         pool = MambaPoolHost.__new__(MambaPoolHost)
