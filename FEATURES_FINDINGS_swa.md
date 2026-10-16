@@ -1,4 +1,52 @@
-# SWA KV-cache memory-safety audit — swa-auditor
+# SWA KV-cache audit — COVERAGE ROLL-UP (final)
+
+## Verdict table
+| Area | Verdict | Evidence | Prod versions affected |
+|---|---|---|---|
+| F-4 SWA alloc_decode one-sided full-pool page leak | CONFIRMED, FIXED (agent/swa-auditor, approved; MR #14) | CPU repro leaks exactly 1 page pre-fix (features-lead + me, independently); registered tests test_swa_alloc_decode_leak.py (3) pin the fix | v0.5.14, v0.5.15.post1, v0.5.17, v0.5.20, HEAD (byte-similar); backport diffs below |
+| Reserved page/token 0 handed to live requests | CLEAN | clear() starts free lists at 1 (paged + token); _release_swa filters swa>0; PureSWA free filters >0; free-path mapping reads guard the 0/padding sentinel | n/a |
+| alloc_extend / alloc_extend_swa_tail one-sided leaks | CLEAN | both pre-flight new_pages_available(n_full, n_swa) with exact page counts; unified_hybrid_swa uses ensure_capacity (asserts post-check) | n/a |
+| SWA+offload retract guard (decode offload/retract + resume) | CLEAN at HEAD | static trace + registered e2e test_swa_retract_offload_cycle.py: conservation exact after every phase, mapping coherent, 5 cycles zero bleed | n/a |
+| Unified tombstone-once (FreeDeviceKVFullOnly sites x3) | CLEAN | all three generation sites consistent with ratchet semantics; _set_swa clears mapping before free_full_segment; tripwires (GUARD expect, v2p>0 filters) back it up | n/a |
+| maybe_evict_swa trigger / overlap gating | CLEAN | page-64 math keeps window + page margin; decode_batch_idx==0 skip mirrors running extend; resumes reset counters; SGLANG_OPT_RELEASE_PREFILL_SWA default-OFF (not our configs) | n/a |
+| SWA-tail prealloc vs decode radix prefix assert | GUARDED (no bug) | _match_prefix_and_lock caps max_prefix_len = fill_len - swa_tail_len; release_swa drops prefix SWA tier before tail alloc | n/a |
+| SWAPrefillBudget admission math | CLEAN | fences (< remaining, +page headroom); over-commit surfaces as alloc failure, not corruption | n/a |
+| _filter_swa_cpu_copy chunk boundaries incl. fp8 per-token scales | CLEAN | exact-source exec stress: 8 shape combos x 4 masks; chunk contract + row alignment hold; per-token scale filtering aligned (no per-block scale pools exist) | n/a |
+| Pattern sweep for alloc-pair non-rollback siblings | CLEAN | only alloc_decode had the shape; all siblings pre-check (swa.py alloc_extend/x2, unified x4) | n/a |
+
+## Files & functions read (all at origin/main HEAD)
+- mem_cache/allocator/swa.py: SWATokenToKVPoolAllocator — alloc, alloc_extend, alloc_extend_swa_tail, alloc_decode, free*, groups, clear/resize, reclaim_for_prealloc, evict_to_free_tokens, _expand_to_full_pages, mapping writers — full trace. PureSWATokenToKVPoolAllocator — full trace.
+- mem_cache/allocator/paged.py + token.py: sub-allocator alloc/free semantics (merge_and_sort_free, release_page_ids, debug checks) for all used paths.
+- mem_cache/swa_memory_pool.py: full read (set_kv_buffer, move_kv_cache, get_cpu_copy, load_cpu_copy, _filter_swa_cpu_copy).
+- mem_cache/pure_swa_radix_cache.py: full read.
+- mem_cache/base_swa_memory_pool.py: full read (contract surface).
+- mem_cache/common.py: free_swa_out_of_window_slots, free_kv_row_segments, backup_kv_cache, restore_kv_cache, discard_kv_cache_backup, release_kv_cache, _release_overallocated_kv_indices.
+- mem_cache/base_prefix_cache.py: free_kv_row, evict flow, claim_kv_row, on_release; radix_cache.py: _insert_cache, checkpoint, evict, lock flows (SWA-relevant lines).
+- managers/schedule_batch.py: maybe_evict_swa, _swa_eviction_trigger, _evict_swa, swa_dead_lo/floor, evicted-seqlen cursors, reset_for_retract, release_req, offload_kv_cache, load_kv_cache, retract_all.
+- disaggregation/decode.py: _swa_tail_len, _swa_retractable_len, _prealloc_required_tokens/reclaim paths, _match_prefix_and_lock, _pre_alloc, alloc_for_decode_prealloc, resume_retracted_reqs, _swa_payload (KV transfer).
+- mem_cache/prefill_budget.py: SWAPrefillBudget + estimate_swa_kv_tokens.
+- mem_cache/allocator/unified_hybrid_swa.py: all alloc + free entries (tombstone semantics).
+- unified_cache/unified_tree_core.py + components/swa.py: FreeDeviceKVFullOnly generation sites.
+- mem_cache/allocation.py: alloc_for_decode_default, alloc_paged_token_slots_decode, alloc_for_spec_decode — caller-side page-guarantee analysis.
+- mem_cache/memory_pool.py: quantized get/load_cpu_copy (fp8 per-token scales).
+
+## Known-class <-> shipped registered tests (which pin it, what they do NOT cover)
+| Known class | Pinned by shipped? | Notes |
+|---|---|---|
+| Page 0 handed to live requests | partial (free-path debug assertions in test_swa_unittest) | no alloc-path test of the sentinel |
+| alloc_decode one-sided leak | NOW: test_swa_alloc_decode_leak.py (this work) | un-pinned before F-4 |
+| SWA evict interval cadence | test_swa_eviction_interval.py | covers _swa_eviction_trigger gating |
+| SWA ring page return over-credit | test_swa_ring_page_return.py | ring mode only in v0.5.20/HEAD |
+| SWA offload cpu-copy mask algebra | test_swa_cpu_copy_filter.py | mask-only; NO end-to-end retract cycle |
+| Retract->offload->resume conservation | NOW: test_swa_retract_offload_cycle.py (this work) | un-pinned before |
+| Unified SWA shared virtual ids | test_unified_swa_shared_virtual_ids.py | unified-side trace (pools cross-own) |
+| SWA locked-full recover (unified) | test_swa_locked_full_recover_unified.py | unified component path |
+| Paged pure-SWA release semantics | test_pure_swa_radix_cache.py | all-SWA model path |
+| Tail-only buffer admissions | test_buffer_swa_tail_only.py | buffer-mode surface |
+
+Uncovered branches: spec-decode SWA eviction under verify batches (deeper spec logic with spec-auditor); GPU-kernel-level write bounds (out of CPU scope).
+
+---
 
 Scope: `mem_cache/allocator/swa.py`, `mem_cache/swa_memory_pool.py`,
 `mem_cache/pure_swa_radix_cache.py`, `mem_cache/base_swa_memory_pool.py`,
