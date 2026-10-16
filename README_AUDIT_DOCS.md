@@ -8,10 +8,10 @@ page-64 fp8 KV, SWA/mamba/DSA/spec model features). Contents:
 - `audit/version_triage_matrix.md`, `audit/version_triage_pass1.md` — version-affected matrix for all known bug classes vs prod tags (agent/version-triage @58849479)
 - `audit/hicache_master_findings.md` (agent/hicache-lead), `audit/hicache_mooncake_findings.md` (agent/mooncake-audit), `audit/hicache_prefetch_findings.md`, `audit/cpu_test_env_recipe.md` (agent/prefetch-ctl-audit), `audit/hicache_decode_offload_findings.md` (dev/current, decode-offload team)
 - `audit/radix_findings.md` (agent/radix-lead)
-- `FEATURES_FINDINGS_lead/dsa/mamba/swa/spec.md` (features team)
-- `disagg-findings-{seams,decode,prefill}.md` (disagg team)
-- `pools_findings_{allocplan,configurator,dsv4,kvpool}.md`, `pools_coverage_report.md` (pools team)
-- `findings-emb.md` (agent/radix-emb)
+- `audit/FEATURES_FINDINGS_lead/dsa/mamba/swa/spec.md` (features team)
+- `audit/disagg-findings-{seams,decode,prefill}.md` (disagg team)
+- `audit/pools_findings_{allocplan,configurator,dsv4,kvpool}.md`, `audit/pools_coverage_report.md` (pools team)
+- `audit/findings-emb.md` (agent/radix-emb)
 
 ## Hotfix patch kit — `hotfix/`
 Per bug family × production tag (v0.5.14 / v0.5.15.post1 / v0.5.16 / v0.5.16K /
@@ -25,7 +25,7 @@ nixl,prefill}, dsa-auditor, hicache-lead, hotfix-f5, radix-{emb,lead}, swa-audit
 version-triage. See per-family README*.md files there for apply instructions.
 
 ## Coverage report
-- `AUDIT_COVERAGE_REPORT.md` — lead's final report (coverage matrix + verdicts).
+- `audit/AUDIT_COVERAGE_REPORT.md` — lead's final report (coverage matrix + verdicts).
 
 ## Exclusions
 - `test/srt/pools_fuzz/README.md` (agent/kvpool-auditor) is intentionally NOT in
