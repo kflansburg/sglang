@@ -59,3 +59,32 @@ Branch: agent/dsa-auditor (off origin/main 3420bae).
       rejected with trtllm uniform_fp8 (deepseek_v4_memory_pool.py:1461) so not prod for DSV4-trtllm.
 - [ ] hisparse_memory_pool.py (separate older MLATokenToKVPool subclass) quick pass.
 - [ ] clear_unaccepted_c128_draft_states bounds (spec overlap; coordinate with spec-auditor).
+
+## DP-attention max_running_requests sizing consistency (lead C2, msg #68)
+EVIDENCE:
+- Admission cap == pool sizing: scheduler.max_running_requests = tp_worker.get_worker_info()
+  = model_runner.max_running_requests = kv_cache_configurator.configure().max_running_requests
+  = resolve_max_num_reqs() output (scheduler.py:1187, model_runner.py:967). One source of truth.
+- resolve_max_num_reqs (kv_cache_configurator.py:2797): requested_per_worker = user // attn_dp_size (floor),
+  then min with token_capacity//2 and mamba cap. Resolved <= requested_per_worker always => any pool sized
+  by raw user//dp(+1) is >= admission; no OOB direction.
+- All // attn_dp_size consumers (2956 replayssm bytes, 2980/2988/3005/3044 mamba byte reservations,
+  pool_configurator.py:930, moe_hook.py:593, lora_manager.py:1192, pd_disaggregation_hook.py:136
+  decode extra slots) use the RAW user value divided by dp, which oversizes == safe direction.
+- user=0 edge: --max-running-requests < attn_dp_size gives requested_per_worker=0 -> boot assert
+  (tp_worker.py:413), fail-loud, not corruption.
+- --max-running-requests semantics: treated as GLOBAL across attention-DP workers (divided everywhere);
+  help text ("maximum number of running requests") is ambiguous but consistent with global reading.
+  Recommendation: doc fix only.
+- VERDICT: no memory-safety bug. C2 refuted for OOB. Adjacent byte-reservation undersizing under
+  replayssm+dp>1 is mamba budget math (OOM risk only) -> hand to mamba-auditor.
+
+## Shipped tests coverage (lead msg #89)
+- Covered: C4 lifecycle on alloc hook incl. decode prealloc pool hook (test_dsv4_c4_state_lifecycle.py),
+  compressed pools exact sizing (test_dsv4_compressed_pools.py), hisparse slot translation,
+  layer-split broadcast, qsa pool.
+- GAPS (no unittest found): DSA compress-tail ring with prealloc-sized req pool (K1 regression only
+  protects via constructor arg sites; a test would pin it), transfer-index fns boundary/cross-ring
+  (my harness logic), abort-path request-state reset (PD decode clear_request_scoped_state),
+  DP per-worker admission == pool-size invariant (single pytest asserting
+  max_running_requests == req_to_token_pool.shape[0]-1-pre_alloc sizing relations).
