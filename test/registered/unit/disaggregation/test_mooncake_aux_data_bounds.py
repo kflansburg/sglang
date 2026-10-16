@@ -81,6 +81,25 @@ class TestAuxDataCodecBounds(unittest.TestCase):
                     kv_args, 0, bad, b"\x01" * ITEM_LEN
                 )
 
+    def test_zero_geometry_raises(self):
+        # Contributed by disagg-prefill (post-#42 fold): zero item/data lens
+        # are degenerate geometry and must raise before address math.
+        _, kv_args = _buffers()
+        for zeros_at in ("item_len", "data_len", "both"):
+            item_lens = [ITEM_LEN] * N_BUFFERS
+            data_lens = [N_SLOTS * ITEM_LEN] * N_BUFFERS
+            if zeros_at != "data_len":
+                item_lens[0] = 0
+            if zeros_at != "item_len":
+                data_lens[0] = 0
+            bad_args = SimpleNamespace(
+                aux_data_ptrs=kv_args.aux_data_ptrs,
+                aux_item_lens=item_lens,
+                aux_data_lens=data_lens,
+            )
+            with self.assertRaises(ValueError, msg=zeros_at):
+                AuxDataCodec.deserialize_data_to_buffer(bad_args, 0, 0, b"\x01" * ITEM_LEN)
+
     def test_length_mismatch_raises(self):
         _, kv_args = _buffers()
         for bad_len in (ITEM_LEN - 1, ITEM_LEN + 1, 0):

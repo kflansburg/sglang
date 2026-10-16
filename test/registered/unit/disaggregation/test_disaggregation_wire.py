@@ -297,7 +297,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.is_hybrid_mla_backend = False
                 manager.pp_size = 1
                 manager.kv_args = SimpleNamespace(
-                    mla_compression_ratios=None, prefill_start_layer=0
+                    mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                 )
                 reason = manager._state_stride_mismatch(
                     src_data_ptrs=[0x1000, 0x1100],
@@ -1009,7 +1009,7 @@ class TestQwen4StateWire(unittest.TestCase):
                     manager.is_hybrid_mla_backend = False
                     manager.pp_size = 1
                     manager.kv_args = SimpleNamespace(
-                        mla_compression_ratios=None, prefill_start_layer=0
+                        mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                     )
                     reason = manager._state_stride_mismatch(
                         src_data_ptrs=[0x1000, 0x1100],
@@ -1043,7 +1043,7 @@ class TestQwen4StateWire(unittest.TestCase):
                     manager.is_hybrid_mla_backend = False
                     manager.pp_size = 1
                     manager.kv_args = SimpleNamespace(
-                        mla_compression_ratios=None, prefill_start_layer=0
+                        mla_compression_ratios=None, prefill_start_layer=0, prefill_end_layer=None
                     )
                     manager.state_strides_validated = set()
                     manager.enable_custom_mem_pool = False
@@ -1288,7 +1288,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             gpu_id=0,
             page_size=self.PAGE_SIZE,
             total_kv_head_num=total_heads,
-            prefill_start_layer=0,
+            prefill_start_layer=0, prefill_end_layer=None,
             state_types=[StateType.SWA],
             state_data_ptrs=[src_ptrs],
             state_item_lens=[[item_len] * len(src_ptrs)],
@@ -1398,13 +1398,17 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         prefill = object.__new__(CommonKVManager)
         prefill.attn_tp_size = 2
         prefill.kv_args = SimpleNamespace(
-            engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0
+            engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0, prefill_end_layer=None
         )
         for pp_size, layout, src_item_lens, dst_item_lens, message in (
             # SWA state has no layer ids, so a later PP stage would land on the
             # decode peer's first SWA layers.
             (2, "nhd", [16, 16], [8, 8], "pipeline parallelism"),
-            (1, "nhd", [64], [32], "per-layer K/V"),
+            # Note: the old "per-layer K/V" row ([64] vs [32]) is retired:
+            # the F15 main-block-aware geometry (board #30) either
+            # accepts [64, 64]/[32, 32] as sliceable or rejects odd-entry
+            # blocks with an explicit KV-geometry error first.
+            (1, "nhd", [64], [32], "Bad src KV geometry"),
             # One SWA head per rank on both sides, against 8 total KV heads.
             (1, "nhd", [8, 8], [8, 8], "do not split"),
             # Item lengths that are valid NHD, so only the layout can reject.
