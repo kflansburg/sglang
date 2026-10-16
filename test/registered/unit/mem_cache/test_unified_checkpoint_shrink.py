@@ -60,6 +60,10 @@ def make_cache():
             page_size=PAGE,
             eviction_policy="lru",
             tree_components=(ComponentType.FULL,),
+            # Deterministic across CPU sandboxes: auto-selecting "rust" would
+            # invoke a cargo build of sglang-radix-tree when the toolchain is
+            # absent, failing the merge queue on an environment detail.
+            tree_core_backend="python",
         )
     )
 
