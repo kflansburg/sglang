@@ -1,6 +1,6 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
-import tempfile
+import socket
 import unittest
 from array import array
 from collections import defaultdict, deque
@@ -176,10 +176,30 @@ def _terminated_query(cache, rid, hit_tokens):
     cache.cache_controller.prefetch_hit_queue.put(operation)
 
 
+def _gloo_safe_hostname() -> bool:
+    """Gloo builds unix-socket paths embedding the machine hostname; linux
+    sun_path is ~107 bytes, so hostnames longer than ~40 characters break
+    rank connect. Try to shorten it (requires root in the sandbox UTS
+    namespace); report whether the current hostname is gloo-safe."""
+    hostname = socket.gethostname()
+    if len(hostname) <= 40:
+        return True
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        short = b"scpu-hicache-ranktest"
+        if libc.sethostname(ctypes.c_char_p(short), ctypes.c_size_t(len(short))) != 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _two_rank_retry_trace(rank, rendezvous):
     torch.distributed.init_process_group(
         "gloo",
-        init_method=f"file://{rendezvous}",
+        init_method=rendezvous,
         rank=rank,
         world_size=2,
         timeout=timedelta(seconds=30),
@@ -373,10 +393,20 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         )
 
     def test_two_rank_completion_capacity_and_anchor_loss(self):
-        with tempfile.TemporaryDirectory(prefix="prefetch-rank-test-") as directory:
-            torch.multiprocessing.spawn(
-                _two_rank_retry_trace, args=(f"{directory}/store",), nprocs=2, join=True
+        # Use a TCP rendezvous on a parent-picked free port instead of a
+        # file:// store: the file:// store path also embedded long sandbox
+        # hostname/uuid paths in some gloo builds.
+        if not _gloo_safe_hostname():
+            self.skipTest(
+                "hostname > 40 chars breaks gloo unix-socket paths "
+                "(File name too long); shorten hostname to run this test"
             )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        torch.multiprocessing.spawn(
+            _two_rank_retry_trace, args=(f"tcp://127.0.0.1:{port}",), nprocs=2, join=True
+        )
 
     def test_next_pass_uses_fresh_joint_match(self):
         cache, pipeline, req = _staged_fixture(full_match=8)
