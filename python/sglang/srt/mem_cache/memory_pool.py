@@ -1811,14 +1811,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.kv.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        if _MAMBA_DEBUG_ASSERTS:
-            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
-            assert mamba_value_donated.item() != -1, (
-                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-                f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
-                f"next_track_idx={req.kv.mamba_next_track_idx}, "
-                f"rid={req.rid}"
-            )
+        # Always-on (restored from v0.5.14): a donated -1 would silently map
+        # the tree pointer at slot -1 -> cross-request mamba state exposure.
+        # Donations are per-checkpoint (not per-token), so the .item() sync is
+        # amortized; features-lead request to drop the debug gate.
+        assert mamba_value_donated.item() != -1, (
+            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+            f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.kv.mamba_next_track_idx}, "
+            f"rid={req.rid}"
+        )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
