@@ -1030,6 +1030,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 io_results[start:end],
                 is_set_operate=is_set,
                 key_multiplier=key_multiplier,
+                expected_sizes=None if is_set else all_sizes[start:end],
             )
         return results
 
@@ -1170,8 +1171,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
 
+    @staticmethod
+    def _expected_io_bytes(size_entry: Any) -> int:
+        """Expected transfer size for one store key entry.
+
+        Multi-buffer (MLA layer_first) entries carry per-buffer lists; the
+        engine reports the total bytes moved across all of them.
+        """
+        if isinstance(size_entry, Sequence):
+            return sum(size_entry)
+        return int(size_entry)
+
     def _batch_postprocess(
-        self, results: List[int], is_set_operate=False, key_multiplier=None
+        self,
+        results: List[int],
+        is_set_operate=False,
+        key_multiplier=None,
+        expected_sizes: Optional[List[Any]] = None,
     ):
         """
         refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
@@ -1179,6 +1195,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             where each element is the number of bytes read on success, or a negative value on error
         for batch_put_from, results is Vector of integers,
             where each element is 0 on success, or a negative value on error
+
+        A get is only successful when the engine read EXACTLY the requested
+        number of bytes: a short (partial) read leaves the rest of the host
+        buffer stale, which callers consume as valid KV. Treating it as a
+        miss lets the caller fall back to recompute instead of serving
+        corrupted KV.
         """
         if key_multiplier is None:
             if self.is_mla_backend:
@@ -1188,17 +1210,32 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
+        if not is_set_operate:
+            if expected_sizes is None:
+                raise ValueError(
+                    "expected_sizes is required for batch_get postprocessing"
+                )
+            if len(expected_sizes) != len(results):
+                raise ValueError(
+                    f"expected_sizes length {len(expected_sizes)} != "
+                    f"results length {len(results)}"
+                )
+
         result_groups = [
             results[i : i + key_multiplier]
             for i in range(0, len(results), key_multiplier)
         ]
+        if is_set_operate:
+            return [all(res == 0 for res in group) for group in result_groups]
+
+        expected_flat = [self._expected_io_bytes(size) for size in expected_sizes]
+        expected_groups = [
+            expected_flat[i : i + key_multiplier]
+            for i in range(0, len(expected_flat), key_multiplier)
+        ]
         return [
-            (
-                all(res == 0 for res in group)
-                if is_set_operate
-                else all(res > 0 for res in group)
-            )
-            for group in result_groups
+            all(res == exp for res, exp in zip(group, expected_group))
+            for group, expected_group in zip(result_groups, expected_groups)
         ]
 
     def batch_get_v1(
@@ -1228,7 +1265,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        return self._batch_postprocess(
+            get_results, is_set_operate=False, expected_sizes=buffer_sizes
+        )
 
     def batch_set_v1(
         self,
@@ -1373,7 +1412,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         get_result = self._get_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
         )
-        return get_result[0] >= 0
+        return get_result[0] == self._expected_io_bytes(target_sizes)
 
     def batch_get(
         self,
@@ -1403,7 +1442,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
 
         for i in range(len(keys)):
-            if get_result[i] < 0:
+            # Short (partial) reads leave the tail of the target buffer stale;
+            # only an exact byte count means the KV page is complete and valid.
+            if get_result[i] != self._expected_io_bytes(target_sizes[i]):
                 return i // key_multiplier
         return len(keys) // key_multiplier
 
