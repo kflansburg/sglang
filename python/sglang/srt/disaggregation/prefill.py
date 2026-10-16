@@ -311,6 +311,10 @@ class PrefillBootstrapQueue:
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        # Full-model main layer count. get_mha_kv_ptrs_with_pp anchors the
+        # peer's main V block on it: the wire carries raw pointer lists whose
+        # draft tail is otherwise indistinguishable from a PP stage window.
+        kv_args.hidden_kv_layers = self.scheduler.model_config.num_hidden_layers
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
