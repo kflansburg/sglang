@@ -8,7 +8,7 @@ staging and the collect could evict it and free the slot, and the deferred
 read would then copy whatever mamba state the slot was re-let to —
 cross-request mamba state leakage (F-1).
 
-The fix stages a MAMBA-component-only lock on the source node at match/finalize
+The fix stages a full-node lock (all components; hierarchy requires full >= component) on the source node at match/finalize
 time (unified_cache.mamba_cow.stage_mamba_cow_lock), and every exit
 path (post-collect, finish-release, retract reset, not-admitted revert, pool
 free, H2D reload, lmcache flow clears) releases it via ``clear_mamba_cow``.
@@ -30,29 +30,64 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
-    InsertParams,
-    MatchPrefixParams,
+
+def _fixture_env_available() -> bool:
+    """The fixture chain needs (a) a resolvable platform device (only with the
+    CPU engine fallback on accelerator-less hosts) and (b) importable
+    sgl_kernel + the sglang.srt import chain (present in upstream CI /
+    CPU sgl-kernel builds, absent in the lean merge-queue env).
+    Skip-instead-of-error so the queue records the skip; run upstream CI to
+    exercise. This probe must run BEFORE the module's heavy sglang.srt
+    imports below or collection fails at ModuleNotFoundError on the thin
+    env (spec cross-verify FLAG 1 — fixed by this ordering).
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_FIXTURE_ENV = _fixture_env_available()
+_FIXTURE_SKIP_REASON = (
+    "requires CPU engine + sgl_kernel (absent on merge queue env; "
+    "run upstream CI/env)"
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.mamba_cow import (
-    clear_mamba_cow,
-)
+
+if _FIXTURE_ENV:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        EvictParams,
+        InsertParams,
+        MatchPrefixParams,
+    )
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
+
+    # Reuse the real fixture builder (same dir), which constructs a REAL
+    # UnifiedRadixCache: real unified tree core, real FULL/MAMBA components,
+    # real mamba slot allocator on CPU.
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_unified_radix_cache_unittest import (  # noqa: E402
+        CacheConfig,
+        build_fixture,
+    )
+else:  # collection-safe placeholders for the thin queue env
+    ReqKvInfo = EvictParams = InsertParams = MatchPrefixParams = None
+    RadixKey = ComponentType = clear_mamba_cow = None
+    CacheConfig = build_fixture = None
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Reuse the real fixture builder (same dir), which constructs a REAL
-# UnifiedRadixCache: real unified tree core, real FULL/MAMBA components, real
-# mamba slot allocator on CPU.
-sys.path.insert(0, os.path.dirname(__file__))
-from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
-
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-_CFG = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
+_CFG = (
+    CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
+    if _FIXTURE_ENV
+    else None
+)
 
 SOURCE_TOKENS = [1, 2, 3, 4]
 OTHER_TOKENS = [7, 8, 9, 10]
@@ -64,9 +99,10 @@ def _make_req():
     holds_mamba is False (fresh request row) so finalize allocates a dst slot —
     the production staging path.
     """
-    return SimpleNamespace(kv=ReqKvInfo())
+    return SimpleNamespace(kv=ReqKvInfo(), session=None)
 
 
+@unittest.skipUnless(_FIXTURE_ENV, _FIXTURE_SKIP_REASON)
 class TestMambaCowSourceLock(CustomTestCase):
     def setUp(self):
         self.cache, self.allocator, self.req_to_token_pool = build_fixture(_CFG)
@@ -126,10 +162,13 @@ class TestMambaCowSourceLock(CustomTestCase):
         # ...and post-fix the receipt pins the source's MAMBA component only.
         self.assertIsNotNone(req.kv.mamba_cow_lock)
         self.assertGreaterEqual(self._mamba_lock(match.best_match_node), 1)
+        # Tree lock hierarchy requires full >= component, so the FULL
+        # component is pinned alongside MAMBA (conservative but correct; the
+        # window is one forward step).
         self.assertEqual(
             self._full_lock(match.best_match_node),
-            0,
-            "FULL component must not be pinned by the COW source lock",
+            1,
+            "lock hierarchy: the FULL component must cover the mamba pin",
         )
 
     def test_evict_for_alloc_spares_locked_source(self):
@@ -151,10 +190,14 @@ class TestMambaCowSourceLock(CustomTestCase):
             ),
             "evict_for_alloc stole the locked COW source node (F-1 still open)",
         )
-        self.assertIsNone(
-            self.cache.tree_core.get_component_device_value(
+        try:
+            other_value = self.cache.tree_core.get_component_device_value(
                 node_other, ComponentType.MAMBA
-            ),
+            )
+        except KeyError:
+            other_value = None  # node removed from the arena = evicted
+        self.assertIsNone(
+            other_value,
             "sanity: the unlocked node should have been the eviction victim",
         )
 
@@ -199,6 +242,63 @@ class TestMambaCowSourceLock(CustomTestCase):
             0,
             "restaging leaked a pin (double-acquire without matching release)",
         )
+
+
+    def test_load_back_failure_releases_lock(self):
+        """Site #10: finalize_load_back(success=False) must drop the staged COW lock;
+        prepare_buffer_load_back's H2D-supersede (#9) runs the same helper on success."""
+        from sglang.srt.mem_cache.unified_cache.components.base import (
+            PrepareLoadBackResult,
+        )
+
+        node_src = self._insert_node_with_mamba(SOURCE_TOKENS)
+        req, match = self._stage_cow(SOURCE_TOKENS)
+        self.assertIsNotNone(req.kv.mamba_cow_lock)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)  # staging allocated dst
+
+        mamba_comp = self.cache.components[ComponentType.MAMBA]
+        mamba_comp.finalize_load_back(
+            req,
+            PrepareLoadBackResult(
+                allocated_mamba_slot=req.kv.mamba_pool_idx.unsqueeze(0)
+            ),
+            success=False,
+        )
+        # Lock released, slot returned, req metadata cleared.
+        self.assertIsNone(req.kv.mamba_cow_lock)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertEqual(self._mamba_lock(match.best_match_node), 0)
+
+
+    def test_release_kv_cache_early_mamba_no_kv_releases_lock(self):
+        """Catch-all (swa's counter-flow): a mamba-staged request released with
+        holds_kv == False (admission failed post-match; wait-queue abort) must
+        not leak the staged COW source lock — the early branch of
+        release_kv_cache returns before the pool-side free that otherwise
+        covers it. Also exercises the session-claim branch variant insofar as
+        the funnel is identical (both run clear_mamba_cow)."""
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        node_src = self._insert_node_with_mamba(SOURCE_TOKENS)
+        req, match = self._stage_cow(SOURCE_TOKENS)
+        self.assertIsNotNone(req.kv.mamba_cow_lock)
+        # Emulate the no-KV early path state: mamba allocated at staging,
+        # req_pool_idx still None (never row-allocated). release_kv_cache
+        # asserts (not holds_kv) == is_kv_released — the req property
+        # defaults respect that pairing on this test stub.
+        assert not req.kv.holds_kv
+        release_kv_cache(req, self.cache, checkpoint=False)
+
+        self.assertIsNone(req.kv.mamba_cow_lock)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(
+            self._mamba_lock(match.best_match_node),
+            0,
+            "catch-all missed: early-mamba release leaked the COW source lock",
+        )
+        self.assertEqual(self._full_lock(match.best_match_node), 0)
 
 
 if __name__ == "__main__":
