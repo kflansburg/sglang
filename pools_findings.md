@@ -71,3 +71,12 @@ Status legend: CONFIRMED (repro or exact counterexample), CANDIDATE (code argume
 ## Harness results (pools-lead, CPU, torch 2.14.1)
 - test/srt/pools_fuzz/test_paged_allocator_fuzz.py: conservation + no-double-alloc + drain, 20 configs (need_sort x seeds), 400 mixed ops each: ALL PASS — stock allocator sound under contract-abiding callers.
 - ADVERSARIAL-1 (CONFIRMED consequence statement, production debug=off): caller double-free of one page via free() → free list holds the page twice (21 entries/20 unique) → subsequent two allocs hand page 1 to two requests → cross-request KV aliasing. No assert fires with SGLANG_DEBUG_MEMORY_POOL unset. This is the concrete production consequence motivating caller-side invariant fixes (radix-lead's abort/retract hunt) + an allocator hardening option.
+
+## VERIFIED MECHANISM (pools-lead, code-level): F0 chain fully real
+unified_sub_pool.py Float free (L2352-2395) + _free_lazy (L1339-1375) + free_unbind_inplace_kernel (virtual_slot.py:101-127):
+1. double-free virtual page v: `freed_p_pages = v2p[v] = -1` (already tombstoned).
+2. Float free: `physical_to_virtual.index_fill_(0, [-1], -1)` — VERIFIED torch index_fill_ wraps → tombstones the LAST physical page's p2v (a LIVE page owned by another request).
+3. `-1` appended to `_free_phys_pages` → `take_physical_pages` hands physical -1 out → `bind` writes v2p[v]=-1, p2v[-1]=v (wrapped) → KV store follows physical -1 → torch eager wraps to last KV row = cross-request KV corruption; C/Triton kernels with no mask (copy_all_layer_kv_cache_tiled, store_cache) = raw OOB byte write; free_unbind_inplace_kernel tl.store(p2v_ptr-8) = raw OOB write below the table.
+4. EAGER MultiEnded free HAS always-on stale-slot assert; LAZY path + Float have NONE (not even debug-gated). free_unbind_inplace also races if a single call carries duplicate v ids (callers must unique at ps==1; contract-only).
+Consequence classes: cross-request KV aliasing/corruption or 8-byte GPU OOB write — both match the audit's target classes. Open gate: caller reachability (radix-lead hunt).
+Fix skeleton (pending reachability): mask `freed_p_pages >= 0` before index_fill_/cat in Float.free + the unique-dedup exists; add debug-mode stale assert to _free_lazy + Float (mirroring EAGER's), production filter (mask-and-count) + counter surfaced in debug_print/verify_byte_accounting. Consistent with the SWA composite's existing `swa_v2p > 0` filter pattern.
