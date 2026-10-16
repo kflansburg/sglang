@@ -35,7 +35,16 @@ Production lens: disaggregated prefill/decode everywhere, page-size 64, fp8 e4m3
 ## CONFIRMED + FIXED (cont. / challenge-round update)
 
 9. **Unified checkpoint_into_tree multi-page shrink on trimmed finish** (#59, agent/radix-lead fcdd7d5,
-   in review w/ unified-auditor). The "assert tolerates <1-page shrink" presumption breaks on
+   APPROVED by unified-auditor: fail-pre identified at exact upstream assert site; guard mirrors the
+   two existing 'no insert happened' exits; monotonicity holds; <1-page assert retained fail-stop).
+   Component-cleanup equivalence verified by radix-sched: skip shape (a)=cleanup(insert_result=None,
+   insert_params) is argument-identical to the existing effective_cache_len<=0 exit; mamba int8-pool
+   branch frees the unused committed value + req slots; extra_buffer frees both ping-pong slots;
+   finished-req cleanup keeps ping-pong only when an insert actually donated it. Divergences vs the
+   normal-insert shape are exactly the deliberate no-insert difference. CAVEAT (behavioral, not
+   memory-safety): unfinished unified-SWA checkpoints at cadence < page_size now defer their
+   tree-branch tombstone and SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS frees to the next
+   page-crossing checkpoint; bounded deferral, slots freed at release_kv_cache regardless — accepted. The "assert tolerates <1-page shrink" presumption breaks on
    strip_thinking_cache held-reasoning models: owned_kv_len == prompt while decode-time checkpoints
    already pushed protection into generation → assert crashes scheduler; under python -O it silently
    shrinks + frees tree-owned rows (exact #38 mechanism, unified flavor). Fixed: skip insert when
