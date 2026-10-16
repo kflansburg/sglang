@@ -45,6 +45,7 @@ DCP-widened pools; QSA/PLE state pools; disaggregated PD runtimes.
 1. **radix-sched: double-free/duplicate-page caller reachability at HEAD** (abort, retract, disagg admission abort, grammar) — gates grading F0/F1 as prod-bug vs pure contract-defense. Shipped hardening is zero-risk either way (no hot-path change in default mode).
 2. **hisparse Q1/F-5 PD severity** (dsa + disagg) — decides cross-request severity in PD deployments; fix lands regardless.
 3. **#47** DSA tail-buffer budget bias (GBs, OOM-direction) — unified board item.
+3b. **Q3 (pools derivation; routed to dsa as policy, msg #931):** alloc_device_buffer else-branch pad-with-fabricated-arange can spill into a foreign page under non-dense mapping — a second sibling of the Q2 density assumption NOT covered by #56's guard. Pools hosts mechanics when a policy (assert vs page-level accounting vs page-only alloc) is chosen.
 4. GPU-side test for the Triton kernel store guards (CPU reference paths pinned; defer to full-CI).
 5. Env queue rebatch after GO: MR#20 (my 5-fix bundle), MR#17 (unified F0), plus F-5 when landed.
 
