@@ -260,3 +260,26 @@ chunk_idx indexes `chunk_staging_infos` lists. disagg-prefill-common's #54
 bypass, watermark monotone). Byte-range sanity in send_kvcache_staged
 (`dst_staging_size < total_staging_needed`) already blocks out-of-ring writes;
 remaining surface was overlap/aliasing INSIDE the ring -> #54 covers it.
+
+## Version-matrix extension: V7 (transfer-worker fault isolation)
+Same class on all production versions — `transfer_worker` has a single top-level
+`except Exception as e:` that raises "Transfer thread failed because of {e}.
+Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+Any per-chunk error (state drift, staging misfit, dst/prefill KV count mismatch,
+AUX bounds violation) silently kills the transfer worker; the whole prefill
+instance's shard goes down — no new KV transfer can be initiated for that
+instance. Kills decode-side completions indefinitely.
+
+Exact lines:
+- v0.5.14       : python/sglang/srt/disaggregation/mooncake/conn.py:1387-1390
+- v0.5.15.post1 : python/sglang/srt/disaggregation/mooncake/conn.py:1441-1444
+- v0.5.17       : python/sglang/srt/disaggregation/mooncake/conn.py:1830-1833
+- HEAD          : python/sglang/srt/disaggregation/mooncake/conn.py:3098-3107
+  (my F4 commit 115e62c fixed it here)
+
+Backport shape: per-chunk `try/except Exception` that (a) poisons the deferred
+abort ack for that room (so pending decode-side abort ACKs are never claimed),
+(b) balances `_staging_outstanding[room]` if this chunk was the
+staging-accounted one, then (c) concludes the room Failed. Worker thread
+itself continues (serves other rooms). add_transfer_request must also refuse
+new chunks on a shard whose worker is dead (F4 part 2).
