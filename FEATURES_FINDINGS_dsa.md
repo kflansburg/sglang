@@ -88,3 +88,29 @@ EVIDENCE:
   (my harness logic), abort-path request-state reset (PD decode clear_request_scoped_state),
   DP per-worker admission == pool-size invariant (single pytest asserting
   max_running_requests == req_to_token_pool.shape[0]-1-pre_alloc sizing relations).
+
+## Production-version check (upstream tags fetched from github.com/sgl-project/sglang)
+- K1 DSA tail req_pool OOB:
+  - v0.5.14/v0.5.15.post1: NO kpool-compress tail feature at all (no _compress_tail_k/kpool_use_compress in mem_cache).
+  - Feature introduced sized via req_to_token.shape[0]; v0.5.17 memory_pool.py:1241 uses self.req_to_token.shape[0].
+  - v0.5.20 memory_pool.py:4901 _init_kpool_compress_tail_buffers takes max_running_requests+1 BUT the only caller
+    (_build_dsa_kv_pool chain) is fed req_to_token.req_to_token.shape[0] at kv_cache_configurator.py:1263 and :1873. OK.
+  - HEAD: same as v0.5.20. VERDICT: all prod versions safe.
+- K2 DSV4 request-scoped ring sizing (num_req_slots):
+  - v0.5.14: model_runner_kv_cache_mixin.py:488 passes shape[0]. OK.
+  - v0.5.15.post1: same at :694. OK.
+  - v0.5.17: kv_cache_configurator.py:1010 shape[0]. OK.
+  - v0.5.20/HEAD: :1354 shape[0]. OK.
+  - Kimi K3 branch base commits 87dd4596/bd4828e2 not present on public upstream; base ~v0.5.16 sits
+    between fixed tags; high confidence OK, flag for internal-repo double check.
+- QSA pending ring: QSATokenToKVPool not in v0.5.14/15.post1/17; at HEAD sized to shape[0] (configurator:2369). OK.
+
+## Transfer-index boundary harness (CPU, numpy)
+- c4_state_transfer_indices + request_scoped_state_transfer_indices: all invariants PASS
+  (bounds vs num_req_slots*ring/pages_per_req; boundary seq=0 / seq%ratio==0 empties; cross-ring 8<->16
+  positional consistency; bad ring rejected). Verdict: correct at HEAD.
+
+## FINAL VERDICT for assigned scope
+- No new memory-safety bug confirmed in my scope at HEAD. Both known classes (K1, K2) are fixed upstream
+  and fixed in every reachable production tag. Two unconfirmed hardening candidates (c128 cleanup kernel
+  row-mask; hisparse -1 divergence) + 4 test gaps forwarded to features-lead.
