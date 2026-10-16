@@ -55,6 +55,12 @@ Swept decode.py + common/conn.py for other "free on timeout" decode-side frees: 
 ## Admission arithmetic verdict (decode.py:1962-2156)
 _allocatable_token_budgets + SWA variants: reservation-based admission; a mis-estimate shows up as the hard assert in _pre_alloc (scheduler crash), NOT silent corruption — the allocator itself enforces capacity. Budget arithmetic errors are thus availability bugs; flagged but not chased further (radix-sched owns the sibling capacity-check class on the running-batch side, board #16).
 
+## Pass 5 — small-region sweep + reviews performed
+- _resolve_pending_reqs / DP-rank prefetch: infrastructure only, no KV ownership. [CLEAN]
+- _transfer_page_indices, host-receive payload slicing, _send_kv_metadata suffix-relative invariant (assists F13): cache_protected_len set to total_prefix_len (:1604) BEFORE send ⇒ staging scatter token_start matches the dst span written by _pre_alloc. [CLEAN]
+- hisparse direct-to-host decode-side: alloc_for_decode_prealloc_hisparse + host slot registration + admit_request_direct seam covered-clean; remaining index math belongs to hisparse_coordinator/pools (dsa/pools teams). Verdict relayed to lead.
+- Reviewed disagg-lead's V8 fix (board #21, APPROVED): drain_before_retraction bounded-wait; all_reduce uniformity verified; tests 3 passed in shared venv.
+
 ## Not deeply covered (handoff notes)
 - HiSparse direct-to-host path (decode.py:2260-2278 alloc_for_decode_prealloc_hisparse, host pool rows): production runs DSA trtllm on DeepSeek V4, hisparse coordinator is adjacent; only lightly checked.
 - _pre_alloc_host sidecar_pool_specs indices (extra pools from tree_cache.sidecar_pool_specs) reuse the same host_indices — assumed by construction.
