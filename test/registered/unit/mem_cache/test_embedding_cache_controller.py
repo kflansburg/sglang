@@ -1,6 +1,7 @@
 """Unit tests for EmbeddingCacheController paged host pool behavior."""
 
 import threading
+import time
 import unittest
 from queue import Queue
 from unittest.mock import MagicMock
@@ -75,6 +76,8 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.insert_queue = Queue()
     ctrl.lock = threading.Lock()
     ctrl.stop_event = threading.Event()
+    ctrl.store_op_deadline_s = 120.0
+    ctrl._late_ops = []
     ctrl.io_thread = MagicMock()
     ctrl.prefetch_tp_group = None
     ctrl._copy_streams = {}
@@ -647,6 +650,112 @@ class TestStoreLaunchFailureCleanup(unittest.TestCase):
         self.assertEqual(ctrl.vision_pool.allocator.free_pages, 8)
         # The issued copy for "first" was awaited before freeing its pages.
         issued[0][1].wait.assert_called_once_with()
+
+
+class TestWedgedStoreDoesNotBlockIoLoop(unittest.TestCase):
+    """Regression (spec-auditor C1): a hung batch_get must not wedge the
+    io thread; later ops keep flowing, and the late op's pages are reclaimed
+    only after its store call actually returns (never while in flight).
+    """
+
+    def test_wedged_get_marks_late_and_recovers_on_return(self):
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+        calls = []
+
+        def store_get(keys, ptrs, sizes):
+            calls.append(list(keys))
+            if keys == ["h1"]:
+                gate.wait(timeout=10)  # simulate wedged backend
+                return [True]
+            return [True] * len(keys)
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        ctrl.embedding_store.batch_put_from_multi_buffers = MagicMock(
+            return_value=[True]
+        )
+
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            free_after_req1 = ctrl.vision_pool.allocator.free_pages
+            self.assertLess(free_after_req1, 8)
+
+            # Wait past the deadline: the op must be marked late, its pages
+            # NOT freed (transfer may be in flight), and the loop still alive.
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertEqual(
+                ctrl.vision_pool.allocator.free_pages, free_after_req1
+            )
+            self.assertEqual(ctrl.entries["h1"].state, EntryState.FILLING)
+
+            # A later op on another key still completes while the first is wedged.
+            ctrl.prefetch("req2", ["h2"], [2], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    h2 = ctrl.entries.get("h2")
+                    done = h2 is not None and h2.state == EntryState.READY
+                if done:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(ctrl.entries["h2"].state, EntryState.READY)
+            self.assertTrue(ctrl.check_prefetch_progress("req2"))
+
+            # Un-wedge: when the store call finally returns, the late op's
+            # entries resolve (READY here since the fake returns success).
+            gate.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(ctrl._late_ops, [])
+            self.assertEqual(ctrl.entries["h1"].state, EntryState.READY)
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
+
+    def test_wedged_get_failure_frees_pages_on_late_return(self):
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        ctrl.store_op_deadline_s = 0.2
+        gate = threading.Event()
+
+        def store_get(keys, ptrs, sizes):
+            gate.wait(timeout=10)
+            return [False]
+
+        ctrl.embedding_store.batch_get_into_multi_buffers = store_get
+        io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        io_thread.start()
+
+        try:
+            ctrl.prefetch("req1", ["h1"], [3], Modality.IMAGE)
+            deadline = time.time() + 5
+            while time.time() < deadline and not ctrl._late_ops:
+                time.sleep(0.01)
+            self.assertEqual(len(ctrl._late_ops), 1)
+            self.assertLess(ctrl.vision_pool.allocator.free_pages, 8)
+
+            gate.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with ctrl.lock:
+                    gone = "h1" not in ctrl.entries
+                if gone and not ctrl._late_ops:
+                    break
+                time.sleep(0.01)
+            self.assertNotIn("h1", ctrl.entries)
+            self.assertEqual(ctrl.vision_pool.allocator.free_pages, 8)
+        finally:
+            gate.set()
+            ctrl.stop_event.set()
+            io_thread.join(timeout=5)
 
 
 class TestPoolViewPinPairing(unittest.TestCase):

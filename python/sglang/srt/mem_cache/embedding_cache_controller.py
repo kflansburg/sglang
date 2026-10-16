@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -342,6 +343,36 @@ class EmbeddingInsertOperation:
         self.sizes = sizes
 
 
+#: How long the io thread waits for one Mooncake store call before declaring
+#: the op "late" and moving on. The late op is resolved (and its pages freed)
+#: only when the underlying call actually returns, so pages are never freed
+#: while a store-side transfer into them may still be in flight.
+DEFAULT_STORE_OP_DEADLINE_S = 120.0
+
+
+class _LateOp:
+    """A store op whose backend call outlived the deadline.
+
+    The io thread moves past it; the worker thread keeps the only reference
+    that resolves the op, so its entry pages are freed (via _finish_get) or
+    unpinned (via _finish_put) strictly after the in-flight transfer ended.
+    """
+
+    __slots__ = ("op", "worker", "is_get", "results_box")
+
+    def __init__(
+        self,
+        op,
+        worker: threading.Thread,
+        is_get: bool,
+        results_box: List[Optional[List[bool]]],
+    ):
+        self.op = op
+        self.worker = worker
+        self.is_get = is_get
+        self.results_box = results_box
+
+
 class EmbeddingCacheController:
     def __init__(
         self,
@@ -398,6 +429,12 @@ class EmbeddingCacheController:
 
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.store_op_deadline_s = float(
+            os.environ.get(
+                "SGLANG_MM_STORE_OP_DEADLINE_S", DEFAULT_STORE_OP_DEADLINE_S
+            )
+        )
+        self._late_ops: List[_LateOp] = []
         self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
         self.io_thread.start()
 
@@ -705,26 +742,100 @@ class EmbeddingCacheController:
                     )
                 self._unpin_read(entry)
 
+    @staticmethod
+    def _run_store_call(
+        fn, keys, ptrs, sizes, results_box: List[Optional[List[bool]]]
+    ):
+        """Worker-thread body: run one store call and capture its results."""
+        try:
+            results_box[0] = fn(keys, ptrs, sizes)
+        except Exception:
+            logger.exception("Mooncake store call failed")
+            results_box[0] = None
+
+    def _resolve_get(self, op: EmbeddingPrefetchOperation, results):
+        if results is None:
+            results = [False] * len(op.keys)
+        success_count = sum(results)
+        logger.info(
+            f"Mooncake GET Finished: Req {op.req_id}, "
+            f"Successfully fetched {success_count}/{len(op.keys)} embeddings."
+        )
+        self._finish_get(op, results)
+
+    def _resolve_put(self, op: EmbeddingInsertOperation, results):
+        if results is None:
+            results = [False] * len(op.keys)
+        self._finish_put(op, results)
+        logger.info(
+            f"Mooncake PUT Finished: Stored {sum(results)}/{len(op.keys)} "
+            f"embeddings in cluster."
+        )
+
+    def _drain_late_ops(self):
+        """Resolve late ops whose worker thread has finally returned."""
+        remaining = []
+        for late in self._late_ops:
+            if late.worker.is_alive():
+                remaining.append(late)
+                continue
+            if late.is_get:
+                logger.warning(
+                    f"Late Mooncake GET for req {late.op.req_id} finally returned; "
+                    f"resolving {len(late.op.keys)} entries."
+                )
+                self._resolve_get(late.op, late.results_box[0])
+            else:
+                logger.warning(
+                    f"Late Mooncake PUT finally returned; "
+                    f"resolving {len(late.op.keys)} entries."
+                )
+                self._resolve_put(late.op, late.results_box[0])
+        self._late_ops = remaining
+
     def _io_loop(self):
-        """Asynchronous worker handling both Batch GET and Batch PUT."""
+        """Asynchronous worker handling both Batch GET and Batch PUT.
+
+        Each store call runs in its own daemon worker thread guarded by
+        self.store_op_deadline_s: a wedged backend call must not block the
+        loop forever (which would deadlock the whole global cache and leak
+        every later FILLING entry's pages). Timed-out ops become "late":
+        their entries are NOT freed at timeout (the backend transfer may
+        still be in flight); they are resolved only when the worker actually
+        returns.
+        """
         while not self.stop_event.is_set():
             processed_any = False
 
             try:
                 op = self.prefetch_queue.get_nowait()
-                try:
-                    results = self.embedding_store.batch_get_into_multi_buffers(
-                        op.keys, op.ptrs, op.sizes
-                    )
-                except Exception:
-                    logger.exception("Mooncake multi-buffer GET failed")
-                    results = [False] * len(op.keys)
-                success_count = sum(results)
-                logger.info(
-                    f"Mooncake GET Finished: Req {op.req_id}, "
-                    f"Successfully fetched {success_count}/{len(op.keys)} embeddings."
+                results_box: List[Optional[List[bool]]] = [None]
+                worker = threading.Thread(
+                    target=self._run_store_call,
+                    args=(
+                        self.embedding_store.batch_get_into_multi_buffers,
+                        op.keys,
+                        op.ptrs,
+                        op.sizes,
+                        results_box,
+                    ),
+                    daemon=True,
                 )
-                self._finish_get(op, results)
+                worker.start()
+                worker.join(timeout=self.store_op_deadline_s)
+                if worker.is_alive():
+                    logger.error(
+                        f"Mooncake GET for req {op.req_id} exceeded "
+                        f"{self.store_op_deadline_s}s deadline; marking late "
+                        f"({len(op.keys)} keys stay FILLING until the call "
+                        f"returns; pool pages are NOT freed while the transfer "
+                        f"may be in flight)."
+                    )
+                    self._late_ops.append(
+                        _LateOp(op, worker, is_get=True, results_box=results_box)
+                    )
+                else:
+                    self._resolve_get(op, results_box[0])
                 self.prefetch_queue.task_done()
                 processed_any = True
             except Empty:
@@ -732,22 +843,37 @@ class EmbeddingCacheController:
 
             try:
                 op = self.insert_queue.get_nowait()
-                try:
-                    results = self.embedding_store.batch_put_from_multi_buffers(
-                        op.keys, op.ptrs, op.sizes
-                    )
-                except Exception:
-                    logger.exception("Mooncake multi-buffer PUT failed")
-                    results = [False] * len(op.keys)
-                self._finish_put(op, results)
-                logger.info(
-                    f"Mooncake PUT Finished: Stored {sum(results)}/{len(op.keys)} "
-                    f"embeddings in cluster."
+                results_box = [None]
+                worker = threading.Thread(
+                    target=self._run_store_call,
+                    args=(
+                        self.embedding_store.batch_put_from_multi_buffers,
+                        op.keys,
+                        op.ptrs,
+                        op.sizes,
+                        results_box,
+                    ),
+                    daemon=True,
                 )
+                worker.start()
+                worker.join(timeout=self.store_op_deadline_s)
+                if worker.is_alive():
+                    logger.error(
+                        f"Mooncake PUT exceeded {self.store_op_deadline_s}s "
+                        f"deadline; marking late ({len(op.keys)} keys stay "
+                        f"pinned until the call returns)."
+                    )
+                    self._late_ops.append(
+                        _LateOp(op, worker, is_get=False, results_box=results_box)
+                    )
+                else:
+                    self._resolve_put(op, results_box[0])
                 self.insert_queue.task_done()
                 processed_any = True
             except Empty:
                 pass
+
+            self._drain_late_ops()
 
             if not processed_any:
                 time.sleep(0.001)
