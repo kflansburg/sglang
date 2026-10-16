@@ -45,9 +45,10 @@ test_unified_radix_cache_unittest.py), and pins the post-fix contract:
     mamba slot MUST NOT be evicted, MUST NOT be re-let to another owner,
     and its state content MUST NOT change until the staged copy runs.
 
-Fix: stage-time MAMBA-only component lock on the source node
-(unified_cache.mamba_cow.stage_mamba_cow_lock), released via
-clear_mamba_cow on every exit path.
+Fix: a stage-time lock on the source node taken by
+unified_cache.mamba_cow.stage_mamba_cow_lock (all components, to keep the
+full_lock >= ct_lock tree hierarchy at unified_tree_core.py:3006),
+released via clear_mamba_cow on every exit path.
 
 Pre-fix the starred assertions FAIL (source evicted / slot re-let / content
 rewritten while staged); post-fix the whole suite passes. The pre-fix
@@ -188,8 +189,8 @@ class TestMambaCowEvictWindowPoC(CustomTestCase):
     def test_staging_pins_the_source_node(self):
         """The window at its purest: a staged deferred COW leaves the
         source node's mamba component unlocked and therefore evictable
-        pre-fix. Post-fix, staging itself pins the source (MAMBA-only
-        component lock) for the whole deferred window. Production never
+        pre-fix. Post-fix, staging itself pins the source (stage-time lock)
+        for the whole deferred window. Production never
         covers this source with the admission lock: the admission lock
         anchors at MatchResult.last_device_node, which HiCache matches can
         leave at a proper ancestor of the mamba hit (FULL evicted-to-host
