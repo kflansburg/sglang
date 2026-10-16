@@ -1157,6 +1157,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+
+        # cache_protected_len must be monotone: publishing a shorter key than
+        # the tree already owns for this request would shrink the protected
+        # watermark and let release_kv_cache free rows the tree still
+        # references. A shorter key happens when a finished request is
+        # trimmed below its previous checkpoint (e.g. strip_thinking_cache
+        # reports owned_kv_len == prompt while decode-time checkpoints
+        # already published generation): the insert would be a pure
+        # no-op/re-trim, so skip it and let components treat it as
+        # "no insert happened" (mirrors the effective_cache_len <= 0 path).
+        if page_aligned_len <= req.kv.cache_protected_len:
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=is_finished, insert_params=insert_params
+                )
+            return
+
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
