@@ -313,3 +313,109 @@ matches the class prefetch-ctl-audit found .14-.17. This is a production-relevan
 mamba/hybrid host-pool bug in every deployed TP>1 mamba line except v0.5.20/HEAD,
 where the class persists in the new form hicache-lead is fixing (C4).
 Reported to disagg-lead + features-lead + version-triage.
+
+---
+
+## Item 3 (replayssm ring accounting) + retract/resume mamba-state paths — VERDICTS
+
+### 3a. Spec rings (`--enable-linear-replayssm-spec`, prod K3 ON): CLEAN (traced)
+- Spec rings (`replayssm_spec_write_pos/cache_base/is_flush`, memory_pool.py:1037-1050)
+  are req_pool-KEYED (`replay_indices = batch.req_pool_indices`, spec_utils.py:1037).
+- Reset at alloc for FRESH rows only (memory_pool.py:1588-1600,
+  `fresh_req_rows = [req.kv.req_pool_idx is None ...]`). All row-reuse paths set
+  req.kv.req_pool_idx=None before realloc (free() decode.py:251-254,
+  reset_for_retract already re-allocs fresh) → rings zeroed on every reuse. The
+  retracted req's own row reuse is also "fresh" (row returned to free_slots).
+  No stale-cursor carryover found.
+- Commit path (spec_utils.py:1024-1085) advances cursors by accepted length;
+  masked by accept correctness machinery (draft accept_index). Not traced deeper
+  than index arithmetic; test_replayssm_ring_accounting.py exists — coverage gap
+  vs prod config noted below.
+
+### 3b. Retract/resume with cpu_tensor backup (decode disagg default alternative): CLEAN-by-design for rings, ONE LATENT correctness note
+- backup_kv_cache cpu_tensor → Req.offload_kv_cache → mamba get_cpu_copy
+  (conv + temporal + slot siblings; "request-keyed replay scratch is NOT
+  restored", memory_pool.py:1244-1249 comment). Resume: load_cpu_copy into the
+  NEW slot; write_pos=0 (memory_pool.py:1618-1619).
+- The un-flushed-ring staleness I hypothesized is gated OFF in prod: decode
+  ReplaySSM ring (`replayssm_write_pos`) exists only under
+  `--enable-linear-replayssm`, which requires
+  `--mamba-radix-cache-strategy no_buffer` (exec_.py:517-525) while prod K3 runs
+  `extra_buffer`. Prod enables only `--enable-linear-replayssm-spec`, whose
+  commit keeps `temporal` current at each verify commit; backup between commits
+  captures a state current as of the last commit — resume re-verifies from
+  there. Consistent. VERDICT: not a bug in the prod config. (If someone enables
+  BOTH replayssm decode + cpu_tensor retraction backup, backup-with-write_pos>0
+  drops up to L−1=15 tokens of state with no flush/guard — flaggable latent for
+  that combination; out of prod config.)
+- Fresh-slot clear: resumed req gets mamba_needs_clear=True; the deferred clear
+  is collected ONLY on the next EXTEND forward (schedule_batch.py:3037-3038 +
+  model_runner.py:1906 is_extend gate). Disagg-decode resumed reqs rejoin the
+  decode batch directly... but cpu_tensor restore overwrites the slot anyway
+  (load_cpu_copy), so the stale-bytes window between alloc and restore is
+  invisible. The needs_clear flag staying set is harmless (clear consumed at
+  next extend of this req, which a resumed decode req never runs... the flag is
+  per req, dropped on free_mamba_cache :1885).
+
+### 3c. Retract with host_pool backup + mamba: BOOT-GATED, FAIL-LOUD — CLEAN
+- `_retraction_device_transfers` (unified_radix_cache.py:1422-1468) backs up KV +
+  SWA + sidecars, NOT mamba. Hypothesis: resumed req decodes from a stale/zero
+  mamba slot → REFUTED for prod: supports_retraction_backup() returns False for
+  mamba caches (:1367-1372), kv_cache_builder.py:398-404 raises ValueError at
+  boot for host_pool + mamba. Also `_pre_alloc` TODO note at decode.py:2210-2213
+  (re-admitted retracted reqs do not re-match radix in disagg decode) is what
+  the boot gate protects. No silent path.
+
+### 3d. ping-pong/extra_buffer availability note from board #8 item 2: each retracted
+req can hold 1-2 extra slots (non-freed across retraction? NO — traced again:
+release_kv_cache(checkpoint=False) → cleanup_after_caching_req(is_finished=True)
+→ free_mamba_cache frees ALL mamba slots incl. ping-pong before
+reset_for_retract → retracted reqs hold NO mamba slots. Capacity note corrected:
+retracted reqs hold zero mamba slots; resume re-allocs. Earlier batch-1 note
+superseded.)
+
+## Item 1+2 closure: ownership-oracle harness
+audit_mamba2/harness_slot_lifecycle.py (pure python, no torch): models
+MambaSlotAllocator free-list semantics + the exact lazy/non-lazy boundary,
+donate, donate-fail, finish(+overshoot), abort transitions transcribed from the
+line sites above. 180,000 randomized transitions (150 seeds × lazy & non-lazy),
+invariant: no live slot owned twice, no -1/dup/OOR in free list, no req∩tree∩free
+aliasing — HELD on all transitions. Combined with the line-level trace, items 1
+(ping-pong donate double-ownership) and 2 (extra_buffer accounting vs
+retract/abort) are CLOSED as clean at HEAD.
+
+## Item 5 final: `_alloc_int8_ckpt_slot` evict asymmetry
+- components/mamba.py:518-522 uses `self.cache.evict(EvictParams(num_tokens=0,
+  mamba_num=1))` vs `_alloc_mamba_slot`'s `evict_for_alloc`. verificatoin:
+  unified_radix_cache.evict → _evict handles mamba_num → evicts MAMBA tree
+  nodes → frees int8 slots (mamba nodes hold int8 slots under
+  enable_int8_mamba_checkpoint). evict_for_alloc adds byte-coordinated
+  available_size_targets + mamba_full_donor handling — only relevant under the
+  unified pool where FULL/MAMBA share a byte budget. When the int8 pool exists,
+  is HybridReqToTokenPool (non-unified) the only host? server_args.py:5225-5234
+  (v0.5.16) shows int8+HiCache rejected; at HEAD check
+  maybe_init_int8_mamba_checkpoint_pool gating — int8 ckpt pool attaches to
+  HybridReqToTokenPool whose mamba_allocator is a plain MambaSlotAllocator
+  (separate sizing from KV) — byte co-tenancy does not apply. The plain `evict`
+  is therefore sufficient; asymmetry is deliberate/correct. VERDICT: clean.
+
+## Remaining loose ends handed to lead
+1. Defense-in-depth MRs worth queuing (not bugs):
+   a. memory_pool.py:1815-1821 donate(-1) check is _MAMBA_DEBUG_ASSERTS-gated;
+      in prod a corrupted buf would silently donate -1 → but buf[keep] is
+      invariantly real (proved lazy: last points at real slot, prev=None blocks
+      overshoot fallback; non-lazy: both slots live until free; buf==1 in spec).
+      Cheap always-on guard is still 1 line. Suggest folding into pools' #32
+      (mamba hardening) batch.
+   b. allocator/mamba.py:82-86 free(-1)/OOB: pools-lead's 1a92c7b adds overflow
+      assert + debug dup sweep — SUPPORT merging #32 as-is; my caller trace
+      found all free sites mask -1 already.
+   c. UnifiedMambaSlotAllocator.translate contract (-1 preserved ONLY because
+      MultiEndedAllocator sizes v2p N+1 with trailing -1): suggest assert/comment.
+2. Test coverage gap: test_replayssm_ring_accounting.py — verify it covers
+   extra_buffer ON + linear spec ON + retract/resume (item 3 prod config). If it
+   only covers no_buffer, add a matrix row. (Not a bug; coverage.)
+3. Reported separately: K3-line hi_mamba TP-sync (live .14-.17, presumed K3) is
+   the one production-impact mamba finding from this audit; fix for HEAD =
+   hicache-lead C4 MIN-reduce; prod .14-.17/K3 need the local patch carried
+   (version-triage has the row).
