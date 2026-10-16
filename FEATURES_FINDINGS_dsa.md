@@ -299,3 +299,11 @@ BACKPORT PATCH SHAPE per branch:
 NOTE: carry alongside the same release_kv_cache early-no-KV branch shape check per branch
   (v0.5.14's common.py likely needs the catch-all too — first clear sites already cover pools;
   verify during backport whether release_kv_cache has the early mamba_alloc branch on that tag).
+
+## F-1 #60 PoC (swa): verbatim pre-fix repro + post-fix green witness
+- pre-fix repro on origin/main: staged source unlocked; arena eviction; slot re-let; new-owner
+  content rewrite = cross-request mamba leak WITNESS (the F-1 class is empirically confirmed).
+- post-fix green vs @3832b59 (covers c9b4d15 hierarchy + c33f4e3 catch-all, no regressions);
+  clear-balance cycles pin the OVER-PIN class (re-stage/clear -> lock_ref==0).
+- queue-side env note: skip-wrapper stays as primary queue form (lead #1364); swa's get_device mock
+  option recorded as PoC-only path (could silently green a wrong-shaped chain on regression catches).
