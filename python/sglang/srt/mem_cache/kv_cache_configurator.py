@@ -530,17 +530,12 @@ class KVCacheConfigurator:
         if swa_max_total_num_tokens is not None:
             swa_max_total_num_tokens *= loc_scale
 
-        # DCP-WIDENED virtual ids must fit the int32 req_to_token / read-index
-        # buffers (see _assert_dcp_widened_ids_fit_int32). `max_total_num_tokens`
-        # here already carries loc_scale (draft replicated; target 1), so the
-        # write-side widened space is * dcp / loc_scale -- the mirror of
-        # logical_token_capacity's derivation.
-        _assert_dcp_widened_ids_fit_int32(
-            max_total_num_tokens=max_total_num_tokens + self.page_size,
-            attn_dcp_size=get_parallel().attn_dcp_size,
-            page_size=self.page_size,
-            loc_space_scale=self.loc_space_scale,
-        )
+        # DCP-WIDENED virtual id-space bound: ENFORCED at
+        # `logical_token_capacity` (assert widened < 2**31) and at
+        # DSATokenToKVPool's index_buf_size (pools-lead, board #32). The pure
+        # threshold math they assert is pinned in `_assert_dcp_widened_ids_fit_int32`
+        # (below) and test/srt/pools_fuzz/test_dcp_int32_bound.py.
+
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on

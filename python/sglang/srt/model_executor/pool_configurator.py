@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -248,10 +249,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
-        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        # The DSA kpool-compress request-tail buffers are likewise a fixed
+        # per-(request, layer) cost with no expressible per-token cell size
+        # (GBs at V4-class dims), so they ride the same fixed-overhead bias.
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc) + (
+            self._dsa_compress_tail_overhead_bytes(kvc)
+        )
 
-        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
-        # which holds for EAGLE/MTP drafts that reuse the target's attention config.
+        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV
+        # size, which holds for EAGLE/MTP drafts that reuse the target's
+        # attention config.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -609,6 +616,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        )
+
+    @staticmethod
+    def _dsa_compress_tail_overhead_bytes(kvc: KVCacheConfigurator) -> int:
+        """Exact fixed bytes of the DSA kpool-compress request-tail buffers.
+
+        Charged against the KV budget before token sizing: these are a fixed
+        per-(request, layer) cost with no per-token cell size that can express
+        them (GBs at V4-class dims -- see boards #47). Layer-count mirrors the
+        pool's allocate-if-not-skip-topk rule; the draft's index-K is elided
+        (skip_topk everywhere), so a draft worker charges 0.
+        """
+        hf = kvc.model_config.hf_config
+        if not is_deepseek_dsa(hf):
+            return 0
+        num_alloc_index_layers = sum(
+            not dsa_layer_skips_topk(hf, layer_id)
+            for layer_id in _get_dsa_cache_layer_ids(
+                kvc, kvc.layer_info.num_effective_layers
+            )
+        )
+        return DSATokenToKVPool.estimate_compress_tail_bytes(
+            index_kpool=get_dsa_index_kpool(hf),
+            index_kpool_compress=get_dsa_index_kpool_compress(hf),
+            tail_extra_slots=max_speculative_num_draft_tokens() or 0,
+            index_head_dim=get_dsa_index_head_dim(hf),
+            num_alloc_index_layers=num_alloc_index_layers,
+            max_running_requests=get_schedule().max_running_requests,
         )
 
     def calculate_pool_sizes(
