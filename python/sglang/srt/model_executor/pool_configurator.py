@@ -645,7 +645,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         user_max = get_schedule().max_running_requests
         if user_max is not None:
-            # Resolved is min(user/dp, token_cap//2, mamba_cap) <= user/dp.
+            # charge >= resolved: the post-sizing resolve only ever shrinks
+            # (min(user/dp, token_cap//2, mamba_cap) <= user/dp), so this
+            # bound can only over-count; slack comes back as headroom.
             max_reqs_bound = user_max // kvc.attn_dp_size
         else:
             # resolve_max_num_reqs auto route, mirrored against the upper-bound
