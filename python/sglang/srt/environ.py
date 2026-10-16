@@ -871,6 +871,11 @@ class Envs:
     # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    # How long MooncakeKVManager.teardown waits for worker threads to exit
+    # before skipping memory deregistration (the transfer engine's batch
+    # wall-clock timeout is ~30s; must exceed it so a wedged batch returns
+    # first).
+    SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S = EnvFloat(45.0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
     # true forces EPv2; false forces EPv1.

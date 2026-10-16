@@ -468,10 +468,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.executors = []
 
         # Join workers before touching their sockets: ZMQ sockets aren't
-        # thread-safe, so don't close server_socket while a worker may poll it.
+        # thread-safe, so don't close server_socket while a worker may poll
+        # it. A single shared deadline: the threads exit concurrently (stop
+        # flag + None sentinels), so the budget must only cover the slowest
+        # one -- a deeper bound would turn PD role switching into a stall.
+        # The budget (default 45s) must exceed the transfer engine's batch
+        # wall-clock timeout (~30s) so a wedged batch_transfer_sync returns
+        # first; only a genuinely stuck engine leaves a live thread.
+        deadline = time.monotonic() + envs.SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S.get()
         for t in self._worker_threads:
-            t.join(timeout=3.0)
-        self._worker_threads = []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+        stuck_threads = [t for t in self._worker_threads if t.is_alive()]
+        if stuck_threads:
+            logger.error(
+                "%d mooncake worker thread(s) did not exit within %.1fs; "
+                "skipping transfer-engine deregistration (the engine may "
+                "still be inside a transfer on the registered regions). "
+                "The regions stay registered -- the engine wrapper dedups "
+                "re-registration by the next KVManager instance.",
+                len(stuck_threads),
+                envs.SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S.get(),
+            )
+        # Retain only threads that never exited (for observability); a fully
+        # joined teardown leaves this empty as before.
+        self._worker_threads = stuck_threads
 
         # Drop the queues so their buffered tasks/senders are released too.
         self.transfer_queues = []
@@ -503,11 +526,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
 
-        # Deregister memory from the transfer engine.
-        try:
-            self.deregister_buffer_to_engine()
-        except Exception:
-            logger.exception("Failed to deregister buffers during teardown")
+        # Deregister memory from the transfer engine -- only once every
+        # worker that could be using it exited; otherwise the regions stay
+        # registered (leak beats use-after-free of an in-flight transfer),
+        # and the engine wrapper's idempotent register handles the next
+        # manager re-registering them.
+        if not stuck_threads:
+            try:
+                self.deregister_buffer_to_engine()
+            except Exception:
+                logger.exception("Failed to deregister buffers during teardown")
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
