@@ -199,6 +199,12 @@ class WorkerFailureAbortScenarios:
     decode_ip: str
     decode_port: int
 
+    # Outstanding staging count left on the faulted chunk by the backend's
+    # worker-failure handling: mooncake's F4 fault handler balances the
+    # dequeue-time increment (0); nixl's worker leaves the chunk counted
+    # because its in-flight handle may still be writing (1).
+    expected_staging_outstanding = 1
+
     def _provoke_worker_failure(self, manager) -> None:
         raise NotImplementedError
 
@@ -213,7 +219,13 @@ class WorkerFailureAbortScenarios:
 
         self._provoke_worker_failure(manager)
 
-        self.assertEqual(manager._staging_outstanding[self.room], 1)
+        # The ack must be poisoned regardless of whether the backend's
+        # fault handling left the chunk counted (status unknown => never
+        # claim a drain for it).
+        self.assertEqual(
+            manager._staging_outstanding[self.room],
+            self.expected_staging_outstanding,
+        )
         self.assertNotIn(self.room, manager._deferred_ack_targets)
 
         self._dispatch_abort(manager)

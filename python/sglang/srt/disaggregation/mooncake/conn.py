@@ -269,6 +269,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        # Transfer workers only, parallel to transfer_queues (PREFILL role):
+        # add_transfer_request refuses to enqueue onto a dead shard.
+        self._transfer_worker_threads: List[threading.Thread] = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -329,6 +332,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 t.start()
                 self._worker_threads.append(t)
+                self._transfer_worker_threads.append(t)
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -389,13 +393,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            ret = self.engine.batch_register(list(ptrs), list(lens))
+            if ret != 0:
+                # Running with unregistered buffers does not fail at startup:
+                # every transfer errors later (sessions churn through 300s
+                # waiting timeouts) and, worse, a partially-registered batch
+                # leaves batch_deregister below unregistering regions that may
+                # not all be registered. Fail fast instead.
+                raise RuntimeError(
+                    f"Mooncake failed to register {len(regions)} KV/aux/state "
+                    f"memory region(s) with the transfer engine (ret={ret}); "
+                    "check RDMA device health (--disaggregation-ib-device)."
+                )
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
-            self.engine.batch_deregister(list(ptrs))
+            ret = self.engine.batch_deregister(list(ptrs))
+            if ret != 0:
+                # Teardown stays best-effort (role switch must not crash the
+                # process), but silence here leaves regions pinned in the
+                # engine after the manager is gone.
+                logger.error(
+                    "Mooncake failed to deregister %d memory region(s) "
+                    "(ret=%d); the transfer engine may still pin them.",
+                    len(regions),
+                    ret,
+                )
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -443,10 +468,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.executors = []
 
         # Join workers before touching their sockets: ZMQ sockets aren't
-        # thread-safe, so don't close server_socket while a worker may poll it.
+        # thread-safe, so don't close server_socket while a worker may poll
+        # it. A single shared deadline: the threads exit concurrently (stop
+        # flag + None sentinels), so the budget must only cover the slowest
+        # one -- a deeper bound would turn PD role switching into a stall.
+        # The budget (default 45s) must exceed the transfer engine's batch
+        # wall-clock timeout (~30s) so a wedged batch_transfer_sync returns
+        # first; only a genuinely stuck engine leaves a live thread.
+        deadline = time.monotonic() + envs.SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S.get()
         for t in self._worker_threads:
-            t.join(timeout=3.0)
-        self._worker_threads = []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+        stuck_threads = [t for t in self._worker_threads if t.is_alive()]
+        if stuck_threads:
+            logger.error(
+                "%d mooncake worker thread(s) did not exit within %.1fs; "
+                "skipping transfer-engine deregistration (the engine may "
+                "still be inside a transfer on the registered regions). "
+                "The regions stay registered -- the engine wrapper dedups "
+                "re-registration by the next KVManager instance.",
+                len(stuck_threads),
+                envs.SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S.get(),
+            )
+        # Retain only threads that never exited (for observability); a fully
+        # joined teardown leaves this empty as before.
+        self._worker_threads = stuck_threads
 
         # Drop the queues so their buffered tasks/senders are released too.
         self.transfer_queues = []
@@ -478,11 +526,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
 
-        # Deregister memory from the transfer engine.
-        try:
-            self.deregister_buffer_to_engine()
-        except Exception:
-            logger.exception("Failed to deregister buffers during teardown")
+        # Deregister memory from the transfer engine -- only once every
+        # worker that could be using it exited; otherwise the regions stay
+        # registered (leak beats use-after-free of an in-flight transfer),
+        # and the engine wrapper's idempotent register handles the next
+        # manager re-registering them.
+        if not stuck_threads:
+            try:
+                self.deregister_buffer_to_engine()
+            except Exception:
+                logger.exception("Failed to deregister buffers during teardown")
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
@@ -514,7 +567,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        ret = self.engine.batch_register([ptr], [size])
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake failed to register the staging buffer "
+                f"(ptr=0x{ptr:x}, size={size}) with the transfer engine "
+                f"(ret={ret}); check RDMA device health."
+            )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1827,7 +1886,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if len(data) != data_length:
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
-
         # Unknown or already-concluded room: writing its claimed aux slot
         # would land on metadata that may have been re-issued to another
         # request. Late/dup delivery is benign; log and drop.
@@ -2125,12 +2183,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
-                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
-                    # lenient truncation below.
+                    # Paged SWA/DSA tolerate at most a 1-page drift (the
+                    # documented accounting window for the block being
+                    # filled); a larger drift means a bookkeeping bug -- in
+                    # that case truncating would skip or alias whole pages of
+                    # state and conclude Success over stale/never-written
+                    # rows, so fail the room instead.
                     if self._requires_exact_state_index_match(st):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                    if abs(len(src_indices) - len(dst_indices_local)) > 1:
+                        raise RuntimeError(
+                            f"{st.upper()} state index drift exceeds the 1-page "
+                            f"accounting window: prefill={len(src_indices)}, "
+                            f"dst={len(dst_indices_local)}"
                         )
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
@@ -2600,25 +2668,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
-                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                            if len(chunked_dst_kv_indice) < len(
-                                kv_chunk.prefill_kv_indices
+                            # The decode destination page list must cover this
+                            # chunk exactly. A short list used to be silently
+                            # truncated: the tail pages were never written yet
+                            # the room could still conclude Success, so decode
+                            # read stale KV left by previous owners of those
+                            # pages. The chunk object must also never be mutated
+                            # here: sibling reqs of a multi-destination room
+                            # iterate over the same kv_chunk, and an in-place
+                            # truncation poisons the next req's length pairing.
+                            chunk_prefill_kv_indices = kv_chunk.prefill_kv_indices
+                            if len(chunked_dst_kv_indice) != len(
+                                chunk_prefill_kv_indices
                             ):
-                                logger.warning(
-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "Destination KV index count mismatch for "
+                                        f"room {kv_chunk.room}: "
+                                        f"dst={len(chunked_dst_kv_indice)} vs "
+                                        f"prefill={len(chunk_prefill_kv_indices)}; "
+                                        "refusing to transfer (some pages would "
+                                        "be left unwritten or misaligned)"
+                                    ),
                                 )
-                                kv_chunk.prefill_kv_indices = (
-                                    kv_chunk.prefill_kv_indices[
-                                        : len(chunked_dst_kv_indice)
-                                    ]
+                                break
+                            if chunked_dst_device_kv_indice is not None and len(
+                                chunked_dst_device_kv_indice
+                            ) != len(chunk_prefill_kv_indices):
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "Destination device KV index count mismatch "
+                                        f"for room {kv_chunk.room}: dst_device="
+                                        f"{len(chunked_dst_device_kv_indice)} vs "
+                                        f"prefill={len(chunk_prefill_kv_indices)}; "
+                                        "refusing to transfer"
+                                    ),
                                 )
-                            if chunked_dst_device_kv_indice is not None:
-                                chunked_dst_device_kv_indice = (
-                                    chunked_dst_device_kv_indice[
-                                        : len(kv_chunk.prefill_kv_indices)
-                                    ]
-                                )
+                                break
 
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
@@ -2641,7 +2729,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 dcp_token_item_lens=dcp_token_item_lens,
@@ -2667,7 +2755,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
@@ -2701,7 +2789,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
@@ -2849,12 +2937,50 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                if kv_chunk is not None:
-                    self.poison_deferred_ack_room(kv_chunk.room)
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # Fault isolation: a buggy chunk used to kill this daemon
+                # thread. Nothing restarted it, its queue kept growing, and
+                # every room hashing to this shard then hung until the 300s
+                # waiting timeout. Fail the chunk's room loudly and keep the
+                # worker alive so other rooms still progress.
+                logger.exception(
+                    "Mooncake transfer worker %d hit an error processing room "
+                    "%s; failing that room and continuing",
+                    worker_index,
+                    getattr(kv_chunk, "room", None),
                 )
+                if kv_chunk is None:
+                    # Failed before/while dequeuing (queue-level fault): the
+                    # outstanding accounting below cannot be repaired, so keep
+                    # the process loud rather than limp along.
+                    raise RuntimeError(
+                        f"Transfer queue failed: {e}. Prefill instance with "
+                        f"bootstrap_port={self.bootstrap_port} is dead."
+                    )
+                room = kv_chunk.room
+                # The transfer may be partially in flight; the drain ack must
+                # not fire for it.
+                self.poison_deferred_ack_room(room)
+                # Balance the dequeue-time increment so _staging_outstanding
+                # does not leak this room and block every later drain ack. The
+                # >0 guard skips the decrement when the exception fired AFTER
+                # the normal-path decrement (one chunk per room per worker).
+                if kv_chunk.staging_counted and self._staging_outstanding.get(room, 0) > 0:
+                    self._staging_outstanding[room] -= 1
+                    if self._staging_outstanding[room] <= 0:
+                        self._staging_outstanding.pop(room, None)
+                try:
+                    self.conclude_failure(
+                        bootstrap_room=room,
+                        failure_reason=(
+                            f"Mooncake transfer worker hit an unexpected error: {e}"
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to conclude room %s after transfer error", room
+                    )
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3103,6 +3229,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+
+        worker_threads = getattr(self, "_transfer_worker_threads", None) or []
+        if (
+            shard_idx < len(worker_threads)
+            and not worker_threads[shard_idx].is_alive()
+        ):
+            # A dead worker means enqueueing here waits the full 300s waiting
+            # timeout while the queue grows unboundedly. Fail immediately and
+            # loudly instead (the per-chunk fault isolation in transfer_worker
+            # should make this unreachable).
+            self.conclude_failure(
+                bootstrap_room=bootstrap_room,
+                failure_reason=(
+                    f"Mooncake transfer worker for shard {shard_idx} is dead; "
+                    "refusing to enqueue"
+                ),
+            )
+            return
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
