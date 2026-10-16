@@ -258,3 +258,58 @@ Not a live bug.
    pools with the TARGET batch's indices — if the draft pools are sized
    differently (draft models have smaller pools!), indices valid for the target
    pool could exceed the draft pool size → OOB. ALSO no translate call. TRACING.
+
+---
+
+## K3/hi_mamba TP-sync question (asked by disagg-lead #826) — CONFIRMED LIVE ON v0.5.16-LINE
+
+Question: does K3 base (~0.5.16, 87dd4596/bd4828e2) route mamba host prefetch via
+hi_mamba_radix_cache.py without per-pool pool_hits TP-sync (asymmetric mamba host
+slot attach/free across TP ranks)?
+
+FACTS (git):
+- K3 SHAs 87dd4596/bd4828e2 NOT on public github.com/sgl-project/sglang (vendor
+  branch; not fetchable). Tag v0.5.16 = fdebc938 (fetched, inspected in full).
+- v0.5.16 tag HAS python/sglang/srt/mem_cache/hi_mamba_radix_cache.py and mamba
+  models + --enable-hierarchical-cache route through HiMambaRadixCache
+  (server_args.py:5225 int8-checkpoint guard names it; hybrid_pool_assembler.py:1667
+  attaches HostPoolGroup+HybridCacheController for it).
+- In v0.5.16 check_prefetch_progress (hi_mamba_radix_cache.py:1844-1918):
+    * only KV completed_tokens is MIN-reduced across TP (all_reduce MIN, :1871-1877);
+    * mamba_loaded = operation.pool_storage_result.extra_pool_hit_pages.get(
+      PoolName.MAMBA, 0) >= 1 (:1878-1890) — per-rank result, NEVER cross-rank
+      reduced. extra_pool_hit_pages is written per-rank in
+      hybrid_cache_controller._page_transfer (:661-664) from
+      storage_backend.batch_get_v2 results.
+    * Asymmetric consequence (:1911-1915): `if not inserted_new or not
+      mamba_loaded: self.mamba_pool_host.free(mamba_host_indices)` — a rank that
+      saw a mamba MISS frees the host slot; a rank that saw a HIT keeps/attaches
+      it to a tree node. The mamba_pool_host free lists then DIVERGE across ranks;
+      every later mamba_prefetch_alloc/mamba_restore_transfers
+      (:2103-2168) builds transfers from now-divergent per-rank host indices while
+      device-side slots are symmetric → cross-rank host-page confusion →
+      H→D restore loads another request's mamba state → garbled output /
+      cross-request context leakage. With mooncake store shared across replicas
+      (enable_group_semantics=true, prod), storage-hit races across ranks are
+      expected, not exotic.
+- Version matrix (tag trees + grep for HEAD-style reduce):
+    * v0.5.14 (49e384ce): hi_mamba present, no pool_hits MIN-reduce → LIVE
+    * v0.5.15.post1 (0b3bb0cb): same → LIVE
+    * v0.5.16 (fdebc938): same (traced in detail above) → LIVE
+    * v0.5.17 (29481685): hi_mamba present, no HEAD-style reduce → LIVE
+    * K3 branch: exact SHAs unfetchable; charter says base ≈ v0.5.16; the
+      K3 prod config (mamba + hicache + TP>1) is exactly the trigger surface →
+      PRESUMED LIVE unless Moonshot patched their branch (cannot verify here).
+    * v0.5.20 (94602c9c): hi_mamba REMOVED; count_pool_hits/_reduce site present
+      (4 hits) → different code (HEAD unified path).
+    * HEAD: unified path has count_pool_hits + _reduce_prefetch_ack, but
+      hicache-lead C4 says the per-pool MIN-reduce is still missing at HEAD —
+      same class, being fixed there.
+- Impact qualifier: TP=1 ranks unaffected (tp_world_size==1 skips reduces but
+  also has no peer to diverge from). Prod K3 TP 1-8: TP>1 deployments LIVE.
+
+VERDICT: CONFIRMED for v0.5.16-tag and PRESUMED for the K3 vendor branch;
+matches the class prefetch-ctl-audit found .14-.17. This is a production-relevant
+mamba/hybrid host-pool bug in every deployed TP>1 mamba line except v0.5.20/HEAD,
+where the class persists in the new form hicache-lead is fixing (C4).
+Reported to disagg-lead + features-lead + version-triage.
