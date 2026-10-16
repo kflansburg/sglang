@@ -98,6 +98,43 @@ class TestStaleFreeHardening(unittest.TestCase):
         viol = full._byte_accounting_violations()
         assert any("out-of-range hole" in v for v in viol), viol
 
+    def test_pre_radix38_checkpoint_shrink_shape_is_contained(self):
+        """Historical caller class for F0: the pre-#38 RadixCache.checkpoint
+        shrink made release_kv_cache free rows the TREE still owned, and the
+        tree's later eviction freed the same pages again. Allocator-level
+        shape: free(v) -> page reallocated to a new request -> stale free(v)
+        arrives again. In default mode the second free must not write OOB,
+        must not evict the NEW owner's binding, and the idle verifier must
+        flag the residual stale hole."""
+        assert not os.getenv("SGLANG_DEBUG_MEMORY_POOL")
+        assert not os.getenv("SGLANG_ENABLE_ASYNC_ASSERT")
+        alloc = build_swa_pool(page_size=4)
+        full = alloc.full_attn_allocator
+        v_page_full = alloc.full_attn_allocator.virtual_to_physical
+
+        tok = alloc.alloc(16)
+        v_page = int(tok[0]) // 4
+        p_after_first_alloc = v_page_full[v_page].item()
+        alloc.free(tok.clone())
+        # Tree still believes it owns the page; the page goes to a new request.
+        tok2 = alloc.alloc(16)
+        assert tok2 is not None
+        # Stale second free from the new-request's perspective-old request:
+        alloc.free(tok)  # duplicate free of the ORIGINAL ids
+        # The new owner's binding for the same PHYSICAL page is intact: the
+        # stale free could only tombstone pages the ORIGINAL virtuals map,
+        # which are already -1, so no live binding is touched.
+        v2 = full.virtual_to_physical[int(tok2[0]) // 4].item()
+        assert v2 >= 0, "new owner's binding must survive the stale free"
+        # p_after_first_alloc came back exactly once through alloc2 or is in
+        # holes; either the verifier or the new binding accounts for it.
+        viol = full._byte_accounting_violations()
+        assert any("out-of-range hole" in v for v in viol), viol
+        holes = full._free_phys_pages.tolist()
+        assert holes.count(p_after_first_alloc) <= 1, (
+            "same physical page must not be double-recycled"
+        )
+
     def test_idle_verifier_reports_injected_stale(self):
         # Simulate pre-patch state to prove the new value checks are not blind
         # where the old count identity was.
