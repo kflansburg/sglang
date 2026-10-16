@@ -220,3 +220,19 @@ Regression tests (test/registered/unit/managers/test_scheduler_pause_generation.
   only with copy.done True.
 Results: 28 passed + 8 subtests (pause suite); drain V8 tests 6/6;
 test_decode_hicache_tree_core 3/3. CPU venv, torch 2.14.1+cpu.
+
+## B1 fix — disagg-lead review items closed
+- logger.critical "PAUSE REFUSED: D2H wedge" + pending counts (commit 4ec9e7d7).
+- Sweep re-verified: drain_before_retraction callers = scheduler.py x2 only;
+  Scheduler subclasses inherit both patched methods (no variant overrides).
+- PRE-EXISTING GAP surfaced (beyond B1 scope, flagged not fixed): tokenizer
+  manager sets is_pause=True BEFORE fire-and-forget dispatch to the scheduler
+  (tokenizer_manager.py:2282-2286); no ack. If the scheduler refuses the pause
+  (B1 wedge path), the tokenizer still reports paused, and the weight-update
+  contract gates on tokenizer-side is_pause (tokenizer_control_mixin.py:471,
+  513-519, 576, 608) — so a weight update CAN proceed thinking the engine is
+  retracted while the scheduler kept the running batch. Same hazard shape V8's
+  option-(a) critique targeted, one layer up. Operators: a refused pause now
+  logs PAUSE REFUSED critically; do not proceed to weight update without a
+  fresh successful pause (no programmatic ack exists today). Follow-up fix
+  needs a pause ack/negative-ack channel — out of B1 scope.
