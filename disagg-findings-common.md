@@ -101,3 +101,12 @@ Key choice points: (1) minter: decode receiver, when it first registers to a roo
 | ABORT_ACK | room/rank/generation | CHECKED: generation must match armed generation; ranks in set | common/conn.py note_abort_ack |
 | DeferredBootstrap register frame (decode->prefill BOOTSTRAP endpoint) | room/endpoint | CHECKED: register() rejects second endpoint for a room (no replace) | common/bootstrap.py |
 Remaining OPEN-low items (documented, not gated): huge chunk_idx list growth on decode chunk_staging_infos; unbounded watermark session keys; CHUNK_READY duplicate frames can accelerate fan-in (scatter of partially-written staging region — integrity nit, trust-boundary).
+
+## Fresh-eyes challenge: decode_kvcache_offload_manager.py (lead item 3) — CLEAN with 2 nits, assumptions listed & broken-or-held:
+- A1 req identity: weak refs claimed; ongoing_offload/ongoing_backup tuples hold Req/rid strongly until ack — WeakKeyDict never silently disappears mid-flight. HOLDS.
+- A2 retract arithmetic: after retraction, incremental_new can go negative; floor-alignment yields negative aligned_len != 0, causing empty-slice writes (start>end) — HARMLESS but should have been blocked by an explicit <=0 guard. NIT-1 (perf/noise).
+- A3 retract state reset: OffloadedState.inc_len is never reset on retraction; after retract-into-offloaded-zone + regrowth, the regrown region's KV is never offloaded (coverage HOLES) and old host/storage entries linger under old hashes. Content-addressed hashing keeps correctness (new continuation has different token hashes; identical regrowth yields byte-identical KV). VERDICT: no corruption path found — covered content addressing is the safety net; still a coverage nit. NIT-2.
+- A4 write_storage exception path (host pin leak / scheduler crash): cache_controller.write_storage is an unbounded queue put + id return — cannot raise. HOLDS (leak only if the storage background thread dies — hicache keep-alive class, their scope).
+- A5 MIN all_reduce queue drain: MIN bounds pops to the slowest rank's queue len; no over-pop possible. HOLDS.
+- A6 drain_before_retraction MAX all_reduce uniformity: covered by V8 review (disagg-lead/disagg-decode). Not re-challenged here.
+Verdict assumptions to challenge later by someone else: content-addressed hashing covers misfires (A3); unbounded ZMQ in-memory backup queue never back-pressures (A4).
