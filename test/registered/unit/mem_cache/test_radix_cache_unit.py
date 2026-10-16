@@ -1339,3 +1339,15 @@ class TestRadixCache(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvictionPolicyGuard(unittest.TestCase):
+    def test_tlru_rejected_on_legacy_cache(self):
+        """TLRU needs _tlru_* stats only unified-tree nodes carry; the legacy
+        TreeNode would AttributeError inside the eviction loop under memory
+        pressure. Reject at startup."""
+        with self.assertRaises(ValueError):
+            RadixCache.create_simulated(eviction_policy="tlru")
+
+    def test_lru_default_ok(self):
+        RadixCache.create_simulated(eviction_policy="lru")

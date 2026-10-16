@@ -308,6 +308,15 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        if self.eviction_policy == "tlru":
+            # TLRU needs _tlru_history_len / _tlru_cached_prefix_len, which
+            # only unified_tree_core nodes carry; on the legacy TreeNode the
+            # first eviction under memory pressure would raise AttributeError
+            # and kill the eviction loop. Fail at startup instead.
+            raise ValueError(
+                "eviction policy 'tlru' is only supported by the unified radix"
+                " cache (its TreeNode lacks T-LRU stats)"
+            )
         self.eviction_strategy = get_eviction_strategy(
             "lru" if self.disable else self.eviction_policy,
             None if self.disable else params.eviction_policy_config,
@@ -325,6 +334,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         dynamo_kv_event_format: bool = False,
         kv_event_lora_names: Optional[LoRANameTable] = None,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -335,6 +345,7 @@ class RadixCache(BasePrefixCache):
             enable_kv_cache_events=enable_kv_cache_events,
             dynamo_kv_event_format=dynamo_kv_event_format,
             kv_event_lora_names=kv_event_lora_names,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
