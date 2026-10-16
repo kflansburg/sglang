@@ -8,7 +8,7 @@ staging and the collect could evict it and free the slot, and the deferred
 read would then copy whatever mamba state the slot was re-let to —
 cross-request mamba state leakage (F-1).
 
-The fix stages a MAMBA-component-only lock on the source node at match/finalize
+The fix stages a full-node lock (all components; hierarchy requires full >= component) on the source node at match/finalize
 time (unified_cache.mamba_cow.stage_mamba_cow_lock), and every exit
 path (post-collect, finish-release, retract reset, not-admitted revert, pool
 free, H2D reload, lmcache flow clears) releases it via ``clear_mamba_cow``.
@@ -126,10 +126,13 @@ class TestMambaCowSourceLock(CustomTestCase):
         # ...and post-fix the receipt pins the source's MAMBA component only.
         self.assertIsNotNone(req.kv.mamba_cow_lock)
         self.assertGreaterEqual(self._mamba_lock(match.best_match_node), 1)
+        # Tree lock hierarchy requires full >= component, so the FULL
+        # component is pinned alongside MAMBA (conservative but correct; the
+        # window is one forward step).
         self.assertEqual(
             self._full_lock(match.best_match_node),
-            0,
-            "FULL component must not be pinned by the COW source lock",
+            1,
+            "lock hierarchy: the FULL component must cover the mamba pin",
         )
 
     def test_evict_for_alloc_spares_locked_source(self):

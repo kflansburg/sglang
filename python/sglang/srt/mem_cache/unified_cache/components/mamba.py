@@ -208,12 +208,13 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
-        # Pin the COW source node's MAMBA component for the whole deferred
-        # window: from here until _collect_deferred_mamba_cow_and_clear hands
-        # the source index to the forward-stream copy. Without this lock the
-        # node may be evicted while the copy is still pending, freeing (or
-        # re-letting) the source slot — the deferred read would then leak
-        # another request's mamba state into this one (F-1).
+        # Pin the COW source node (all components; the tree's lock hierarchy
+        # requires full >= per-component) for the whole deferred window: from
+        # here until _collect_deferred_mamba_cow_and_clear hands the source
+        # index to the forward-stream copy. Without this lock the node may be
+        # evicted while the copy is still pending, freeing (or re-letting) the
+        # source slot — the deferred read would then leak another request's
+        # mamba state into this one (F-1).
         stage_mamba_cow_lock(self.cache, result.best_match_node, req)
         if not req.kv.holds_mamba:
             dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
