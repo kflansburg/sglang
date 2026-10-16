@@ -437,10 +437,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Both pools must serve the same page crossings. Pre-flight the exact
         # count, as alloc_extend does: the pair below is not transactional -
-        # if the SWA side fails after the full side popped pages, the freed
-        # full pages would be gone for good (rollback-by-free() would be
-        # wrong: a non-boundary request's returned index points into its
-        # still-live page).
+        # if the SWA side fails after the full side popped pages, those full
+        # pages leave the free list with neither mapping nor owner (F-4).
+        # Rollback-by-free() would be WRONG: a non-boundary request's
+        # alloc_decode result is last_loc+1 inside a page it still holds, and
+        # paged free() is page-granular, so freeing the result set releases
+        # live pages (verified on CPU; cross-request page aliasing). Declare
+        # OOM before consuming from either pool instead. The mapping needs no
+        # cleanup: it is written only after both allocations succeed.
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
         )

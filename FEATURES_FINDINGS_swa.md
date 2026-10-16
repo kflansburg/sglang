@@ -24,10 +24,26 @@ imports base/token/paged/swa from their repo paths).
 Fix: joint pre-flight of the exact decode page count before touching
 either sub-pool (mirrors alloc_extend / UnifiedSWAAllocator.alloc_decode
 which already do this; unified_hybrid_swa.py uses ensure_capacity).
-Rollback-via-free was considered and REJECTED: a non-boundary request's
-alloc_decode output is `last_loc+1`, which points into a page the request
-still holds live; free() releases whole pages -> would corrupt liveness
-(siblings confirmed by reading alloc_decode_naive and a CPU run).
+Rollback-via-free was considered and REJECTED with a runnable counter-
+example (page=4, real allocators): a decode batch [boundary req A,
+non-boundary req B] makes full alloc_decode return [12, 6]; 6 = B's
+last_loc+1 inside page 1 which request R STILL HOLDS. paged free() is
+page-granular, so rollback free([12,6]) returns page 1 to the free list
+next_alloc then hands page 1 to a third request -> two live requests share
+one KV page (cross-request aliasing). alloc_decode outputs alias live
+pages and cannot be identified from the output, so the failure path must
+be declared before consumption. Pre-flight has identical external OOM
+semantics; mapping untouched (written only after both allocations
+succeed, per features-lead msg #256).
+
+Pattern sweep (board #22): the 'alloc A; alloc B; if None or None: return'
+non-rollback shape exists only in swa.py::alloc_decode (HEAD; also at
+v0.5.14:294-297). alloc_extend and alloc_extend_swa_tail pre-check via
+new_pages_available; unified_hybrid_swa.py joint-checks ensure_capacity in
+alloc / alloc_extend / alloc_extend_swa_tail / alloc_decode, and asserts
+post-check sub-alloc success. hisparse.py / unified_mamba.py: no pair
+allocations. allocation.py is_dsv4 branch is NPU-only
+(hasattr(allocator, 'c128_attn_capacity')); unreachable in our fleet.
 
 Affected: v0.5.14, v0.5.15.post1, v0.5.17, v0.5.20 (Kimi K3 branch-era),
 HEAD. All heap alloc/free bookkeeping is logical; the leak is a slow
