@@ -10,6 +10,19 @@ SWA + hybrid mamba (Kimi K3: --mamba-radix-cache-strategy extra_buffer), disaggr
 
 ## Findings (incremental)
 
+## F0 postmortem (for the merge narrative)
+Root cause: caller hands the same kv slot to the free path twice (mechanism proven by
+injecting a double free at MultiEndedAllocator level; caller reachability into this
+situation is radix-lead's hunt, still open). First-attempt fix placed an unconditional
+`.any().item()` sync in `free()`: it caught the bug but broke
+test_unified_free_no_host_sync.py (3 failures) — the free hot paths are a host-sync-free
+zone by design (each sync = a ~16 ms scheduler stall). Final design: kernel store guards
+(prod-safe, zero sync), default-mode async tripwire, debug-mode sync+raise, idle
+byte-accounting value checks, plus a default-mode tolerance pin so a future rewrite can't
+silently restore the sync. Note discovered while pinning: token-id `_free_lazy`
+legitimately calls `torch.unique` (page-rep dedup, unified_sub_pool.py:1377); the
+sync-free contract applies specifically to the page-reps/`free_*_segment` hot paths.
+
 ## Coverage status (2026-10-16)
 - unified_sub_pool.py: READ END-TO-END (2680 lines). Verdict: engineered sound by construction;
   defense gaps F0 (hardened) + F1 (contract, unenforced).
