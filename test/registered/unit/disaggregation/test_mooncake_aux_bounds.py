@@ -134,6 +134,32 @@ class TestAuxDataBounds(CustomTestCase):
             bytes(16),
         )
 
+    # Contributed by disagg-prefill (#42 review): codec-level edge cases.
+    def test_zero_geometry_raises(self):
+        from sglang.srt.disaggregation.common.utils import AuxDataCodec
+
+        kv_args = SimpleNamespace(
+            aux_data_ptrs=[0], aux_data_lens=[0], aux_item_lens=[0]
+        )
+        with self.assertRaises(ValueError):
+            AuxDataCodec.deserialize_data_to_buffer(kv_args, 0, 0, b"xx")
+
+    def test_in_range_write_lands_in_the_right_row(self):
+        from ctypes import c_byte, addressof
+
+        from sglang.srt.disaggregation.common.utils import AuxDataCodec
+
+        buf = (c_byte * 32)()  # 4 rows x 8 bytes
+        kv_args = SimpleNamespace(
+            aux_data_ptrs=[addressof(buf)],
+            aux_data_lens=[32],
+            aux_item_lens=[8],
+        )
+        AuxDataCodec.deserialize_data_to_buffer(kv_args, 0, 2, b"ABCDEFGH")
+        self.assertEqual(bytes(buf[16:24]), b"ABCDEFGH")
+        self.assertEqual(bytes(buf[:16]), bytes(16))
+        self.assertEqual(bytes(buf[24:]), bytes(8))
+
 
 if __name__ == "__main__":
     unittest.main()
