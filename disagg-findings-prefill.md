@@ -176,3 +176,15 @@ slightly wronger finish message. Not memory-unsafe; recommend later dedup via
 Shared env picked up via sandbox_reset. test_utils import breaks collection
 (datasets missing; lead adding). My three new test files avoid test_utils;
 all pass locally: mha 7, abort-retry 4, aux-codec 5.
+
+### checksum deep-check (continuation of C5) — VERIFIED consistent
+- SWA state: checksum's translate_loc_from_full_to_swa == payload's
+  translate_swa_indices_for_transfer (allocator/swa.py:260 delegates) — same mapping.
+- Range symmetry: decode verifier (decode.py:3198) calls the SAME
+  page/state_indices_for_request helpers with seq_len = full input len; prefill
+  computes with end_idx = min(extend_end, len) == len at last_chunk. Symmetric. OK.
+- Strengths/coverage: catches transport corruption + prefix-cache-content drift;
+  health-check reqs tagged 0 and skipped both sides; expected==0 also skips
+  (non-checksum backends/health checks indistinguishable — acceptable).
+- F18 verdict: LOW/by-design (see #disagg post) — tombstone-before-open is
+  intentional; wire-generation token is the real fix; deferred to hardening list.
