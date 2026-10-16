@@ -167,6 +167,12 @@ Upstream fixed-in version for short-read: NONE (still live upstream HEAD; our fi
 - common.py register/unregister ranges + destroy ordering: clean.
 - mla_host_dedup: inert in production (dedup compat excludes mooncake store).
 - lmcache_unified min-clamp: historical invariant violator, out of prod scope.
+- buffer_mode/pipeline.py staged-hold paths (out of prod surface, thin area):
+  CLEAN (prefetch-ctl-audit; staged→abort sync-free one-shot; staged→admission
+  verbatim ownership transfer w/ fail-stop canonical-span guard; load-back ack
+  frees bounce only after finish_event.synchronize() — no H2D-after-free;
+  aux double-free guard via indices_from_pool; reset() same no-in-flight
+  precondition as cache mode). Assumptions in their findings file.tail
 - unified checkpoint cache_protected_len shrink: fail-stop assert protocol
   (decoded-offload-audit trace; closes earlier-audit "unified checkpoint" item).
 
