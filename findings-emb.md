@@ -85,6 +85,31 @@ for the same req_id silently overwrites the older op.
 - EMB-C6 insert_batch PUT never races D2H: mark READY is gated on the entry's own
   copy event (wait_store_to_pool), and PUT only pins READY entries.
 
+## COVERAGE (surface => verdict)
+- embedding_cache_controller.py: full read. Pin/unpin invariants, eviction,
+  prefetch/insert io loop, async copy handles, LRU transitions audited.
+  Fixed: EMB-1/2/4/5. Clean: double-free (single-finisher per entry), queue
+  ordering, duplicate-hash pin multiplicity, FILLING-entry pinning impossible,
+  insert PUT vs D2H gating, evict-vs-pinned exclusion.
+- embedding_store.py: factory/ABC only, no state. Clean.
+- mooncake_embedding_store.py: fixed EMB-3 (short read). PUT dedup-exists
+  pattern audited (skip existing -> success_map True; fine).
+- multimodal_cache.py (MultiModalStaticCache): LRU + size accounting audited;
+  admission-time clone defends shared storage; free/evict accounting
+  consistent. Clean (needs challenger).
+- index_key_cache.py + LayerSplitIndexKeyCache: audited; page-stride offload
+  assumption noted for DSA owner; no memory-safety bug found in file itself.
+- managers/mm_schedule.py (scheduler embedding cache paths): audited;
+  token-count validation defends hash collisions; local refs prevent LRU
+  eviction during assembly; per-item storage ownership avoids batch-retention
+  views. Clean (needs challenger).
+- managers/mm_utils.py (hash_feature, ShmPointerMMData): content-sha256 8B +
+  namespace scoping (multimodal/cache/identity.py); shm lifecycle has
+  discard_shm_features wired into receiver abort paths + COW materialize +
+  unlink-on-materialize. Clean (needs challenger).
+- disaggregation/encoder/server.py global-cache paths: release/abandon state
+  machine race-guarded; all post-staging raises now cancel handles (fixed).
+
 ## index_key_cache.py (DSA) - notes
 - cpu_copy/load_cpu_copy: `indices[::page_size] // page_size` -> page indices for
   arbitrary token location arrays; assumes locations are page-aligned-ordered
