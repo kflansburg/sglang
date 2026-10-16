@@ -41,6 +41,15 @@ def _free_surplus_device_pages(
     radix-hit prefix whose compressed pages are tree/creator-owned); their
     pages must never be released by this call even when all kept-window
     membership misses them.
+
+    Pages are released by handing page START tokens to ``free`` (whole pages
+    via ``unique(//page)``), not through ``free_hisparse_indices``'s
+    ``>= page_size`` sink filter. That is safe here because page 0 can never
+    reach production calls of this helper: the mapping stores 0 for "unset"
+    (filtered to zeros before harvest) and pool pages run 1..num_pages, so an
+    owned page start is >= page_size by construction. If a caller ever feeds
+    this helper tokens outside that owning-mapping invariant, page 0
+    (the padding sink) would be released with the surplus — keep the invariant.
     """
     if surplus.numel() == 0:
         return

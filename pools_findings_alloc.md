@@ -25,8 +25,15 @@ Method note: allocators are pure-python + torch tensor ops driving Triton kernel
   allocator/hisparse.py; non-V4 `alloc_device_buffer` no longer releases
   surplus at token granularity (page split between kept and surplus was freed
   from under the live buffer under non-dense device indices). 9-case suite +
-  75-test pools_fuzz gate green; reviewer dsa-auditor. All prod versions
-  (v0.5.14-.20, Kimi K3 bases) carry the token-granular free.
+  75-test pools_fuzz gate green; reviewer dsa-auditor. The vulnerable
+  non-V4 token-granular-surplus-free pattern is present in all prod tags
+  checked (v0.5.14, v0.5.15, v0.5.17, v0.5.20, Kimi K3 bases 87dd4596/
+  bd4828e2); v0.5.14 has no V4 class, prefixing this guard only matters for
+  the shared helper there. pools-lead independently verified 9/9 green and
+  recorded a fail-pre-fix e2e run of the companion suite
+  (test_hisparse_surplus_e2e.py) at 1195c828bf; deliberate non-fail-pre-fix
+  gap in my suite: importing `_free_surplus_device_pages` at test module top
+  cannot collect on pre-fix trees.
 
 - F-5 (board #51, dsa Q1 CONFIRMED): `alloc_device_buffer` (both V4 and
   non-V4) zeroed `full_to_hisparse_device_index_mapping[allocated_indices]`
