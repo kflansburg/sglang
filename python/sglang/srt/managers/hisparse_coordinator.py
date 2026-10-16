@@ -715,6 +715,12 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+        # Per-request set of read-only SHARED device ids that its device buffer
+        # addresses (radix-hit prefix pages owned by the tree/creator). Recorded
+        # at alloc_device_buffer; excluded again at request_finished so the
+        # request never frees tree-owned device pages and never zeroes the
+        # tree's compressed mapping (F-5, board #51/#62).
+        self._shared_prefix_locs: dict[int, torch.Tensor] = {}
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -971,6 +977,21 @@ class HiSparseCoordinator:
                 alloc_size,
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
+
+        if prefix_compressed_len > 0:
+            # The allocator harvest does not touch the prefix region's mapping,
+            # so the shared ids are still readable here exactly as the buffer
+            # addressed them.
+            shared = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_logical_indices[:prefix_compressed_len]
+            ]
+            shared = shared[shared > 0]
+            if shared.numel() > 0:
+                self._shared_prefix_locs[req.kv.req_pool_idx] = shared
+            else:
+                self._shared_prefix_locs.pop(req.kv.req_pool_idx, None)
+        else:
+            self._shared_prefix_locs.pop(req.kv.req_pool_idx, None)
 
         buffer_indices = buffer_indices.to(torch.int32)
         self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
@@ -1422,12 +1443,25 @@ class HiSparseCoordinator:
             ].reshape(-1)
             owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
             all_hi = torch.unique(owned_locs[owned_locs > 0])
+            # Exclude read-only shared prefix ids (tree/creator-owned): freeing
+            # them here would release device pages under the live tree reference
+            # (F-5 free-side; Q3 invariant (ii)).
+            shared = self._shared_prefix_locs.pop(req_pool_idx, None)
+            if shared is not None and all_hi.numel() > 0:
+                all_hi = all_hi[~torch.isin(all_hi, shared.to(all_hi.device))]
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
+            # Zero only the fresh region: clobbering the tree-owned prefix
+            # mapping would orphan the tree's device pages (leak until evict,
+            # then silently dropped by the >0 filter).
+            prefix_token_len = min(getattr(req, "prefix_len", 0), allocated_len)
+            fresh_locs = (
+                allocated_locs[prefix_token_len:] if prefix_token_len > 0 else allocated_locs
+            )
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    allocated_locs
+                    fresh_locs
                 )
             )
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
