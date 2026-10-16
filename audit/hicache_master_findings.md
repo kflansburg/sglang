@@ -123,11 +123,13 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   65-char sandbox hostname breaks gloo unix-socket paths ("File name too
   long"). `hostname scpu` before multirank CPU-gloo tests; suite passes 10/10
   after. Also explains test_prefill_result_polling, test_specv2_kvcache_offloading.
-- C5 (NEW, pre-existing HEAD): test_pp_prefetch_ticket::test_allocation_error
-  _preserves_ack_sequence_and_next_ticket fails — sidecar host-pool alloc error
-  (KeyError PoolName.SWA) on a PP-broadcast ticket leaves the op NOT terminated
-  and KV staging UNFREED. Genuine leak-path candidate (PP>1 + SWA + hicache
-  config). Assigned: prefetch-ctl-audit.
+- C5 RETRACTED — env artifact (prefetch-ctl-audit): ninja missing in thin
+  sandbox → hicache_hash_cpp JIT build fails → hash raises BEFORE the alloc
+  attempt → except-early-return skips mark_terminate → the failing assert
+  reads 'not terminated' but that IS the correct pre-alloc behavior. With
+  toolchain (ninja+libssl-dev+python3-dev): suite 11/11. Intended alloc-error
+  discipline verified independently by two-rank sim (KV rollback free +
+  op terminated + next ticket proceeds). NO BUG.
 - T3 (low, LOGGED, not fixing): graceful shutdown doesn't drain ongoing_offload
   before host-pool destroy; teardown order issue only (process exiting;
   worst case = crashed-on-exit noise, not served corruption). Recommend
