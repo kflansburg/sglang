@@ -251,3 +251,12 @@ Reference commit: 3420bae (origin/main at audit time).
 - v0.5.14 has no MINIMAX branch.
 - All versions: kv_chunk truncation site (F2) at .14:1244 / .15p1:1298 / .17:1621
   / HEAD:2558 -> my V5 fix cherry-picks (the surrounding loop is identical).
+
+## Update 4 (staging peer-trust surface — superseded by #54)
+While spot-checking mooncake staging paths I noted wire values from the peer's
+STAGING_RSP (offset/round/end) are trusted by prefill workers; and the wire
+chunk_idx indexes `chunk_staging_infos` lists. disagg-prefill-common's #54
+(F20/F21) now guards these paths (negative chunk_idx aliasing, assign(<=0)
+bypass, watermark monotone). Byte-range sanity in send_kvcache_staged
+(`dst_staging_size < total_staging_needed`) already blocks out-of-ring writes;
+remaining surface was overlap/aliasing INSIDE the ring -> #54 covers it.
