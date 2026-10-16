@@ -5341,6 +5341,39 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 for i in range(layer_num)
             ]
 
+    @staticmethod
+    def estimate_compress_tail_bytes(
+        *,
+        index_kpool: int,
+        index_kpool_compress: bool,
+        tail_extra_slots: int,
+        index_head_dim: int,
+        num_alloc_index_layers: int,
+        max_running_requests: Optional[int],
+    ) -> int:
+        """Exact byte cost of the kpool-compress tail buffers, for budget time.
+
+        These are a FIXED per-(request,layer) cost no per-token cell size can
+        express: (max_running_requests+1) rows x (index_kpool+tail_extra_slots)
+        x index_head_dim x bf16 x 2 tensors x the number of layers that
+        allocate. At V4-class dims (kpool 4 + 512 extra slots, head 128,
+        61 layers, 512 reqs) this is ~8.3 GB the budget previously did not
+        charge -- enough to OOM a margin-tight deployment.
+        KEEP IN SYNC with the allocation above.
+        """
+        if not (index_kpool > 1 and index_kpool_compress):
+            return 0
+        if num_alloc_index_layers <= 0 or max_running_requests is None:
+            return 0  # pool asserts on None at build time; nothing chargeable yet
+        req_pool_size = max_running_requests + 1  # pool's sentinel slot rule
+        tail_width = index_kpool + tail_extra_slots
+        bf16_size = torch._utils._element_size(torch.bfloat16)
+        return (
+            req_pool_size * tail_width * index_head_dim * bf16_size
+            * 2  # _compress_tail_k and _compress_tail_score
+            * num_alloc_index_layers
+        )
+
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:

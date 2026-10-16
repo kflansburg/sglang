@@ -123,7 +123,9 @@ def free_unbind_inplace_kernel(
 
     tl.store(out_phys_ptr + offs, p, mask=mask)
     tl.store(v2p_ptr + v, -1, mask=mask)
-    tl.store(p2v_ptr + p, -1, mask=mask)
+    # A stale free (double-free / never-allocated v) reads p == -1; without the
+    # guard the p2v store lands one int64 BEFORE the table (raw OOB write).
+    tl.store(p2v_ptr + p, -1, mask=mask & (p >= 0))
 
 
 @triton.jit
@@ -147,8 +149,12 @@ def bind_inplace_kernel(
     v = tl.load(v_pages_ptr + offs, mask=mask, other=0).to(tl.int64)
     p = tl.load(p_pages_ptr + offs, mask=mask, other=0).to(tl.int64)
 
-    tl.store(v2p_ptr + v, p, mask=mask)
-    tl.store(p2v_ptr + p, v, mask=mask)
+    # p == -1 arises only after an upstream stale-free bug: guard the stores so
+    # the corruption becomes a dropped bind (v2p stays -1 -> reads hit the sink)
+    # instead of a raw OOB write below the table.
+    good = mask & (p >= 0)
+    tl.store(v2p_ptr + v, p, mask=good)
+    tl.store(p2v_ptr + p, v, mask=good)
 
 
 def free_unbind_inplace(
@@ -165,7 +171,9 @@ def free_unbind_inplace(
         # Pure-torch CPU reference for the CUDA-only kernel.
         phys_pages = v2p[v].clone()
         v2p.index_fill_(0, v, -1)
-        p2v.index_fill_(0, phys_pages, -1)
+        # Guard like the Triton path: index_fill_ would WRAP a -1 to the last
+        # slot, tombstoning an unrelated live page on a stale free.
+        p2v.index_fill_(0, phys_pages[phys_pages >= 0], -1)
         return phys_pages
     phys_pages = torch.empty(N, dtype=torch.int64, device=v_pages.device)
     grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
@@ -186,8 +194,10 @@ def bind_inplace(
     v = v_pages.to(torch.int64)
     p = p_pages.to(torch.int64)
     if not v_pages.is_cuda:
-        v2p[v] = p
-        p2v[p] = v
+        # Guard like the kernel: p == -1 must not wrap to the last table slot.
+        good = p >= 0
+        v2p[v[good]] = p[good]
+        p2v[p[good]] = v[good]
         return
     grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
     bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)
