@@ -91,6 +91,8 @@ def _make_manager():
     mgr._deferred_abort_ack_tracker = {}
     mgr._deferred_abort_generation = 0
     mgr.enable_deferred_decode_kv_release = True
+    # The prefill instance is alive: delayed drain acks must hold the pages.
+    mgr.prefill_info_table = {_TEST_BOOTSTRAP_ADDR: object()}
     return mgr
 
 
@@ -677,9 +679,13 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     return q
 
 
+_TEST_BOOTSTRAP_ADDR = "10.0.0.9:8999"
+
+
 def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
+        bootstrap_addr=_TEST_BOOTSTRAP_ADDR,
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
@@ -777,16 +783,57 @@ class TestResolveDeferredReleases(CustomTestCase):
             outcome="drained",
         )
 
-    def test_releases_on_timeout_without_ack(self):
+    def test_holds_past_timeout_while_prefill_alive(self):
+        # V4 regression: the device path must NOT free pages at the deadline
+        # while the drain ack is missing -- a still-writing prefill would then
+        # land RDMA writes into pages reissued to a new request. The deadline
+        # only rate-limits the re-log.
         mgr = _make_manager()
         room, idx = 300, 3
         q = _make_queue(timeout=30.0, enable_metrics=True)
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
-        # Force an already-expired deadline (no ack will ever arrive).
+        # Force an already-expired deadline (no ack has arrived).
         q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
+            patch.object(decode_mod, "release_kv_cache") as rel,
+        ):
+            q.resolve_deferred_releases()
+            rel.assert_not_called()
+            # Still held, with a re-armed re-log deadline; no metric recorded.
+            self.assertEqual(len(q._deferred_releases), 1)
+            _, _, deadline, _, _ = q._deferred_releases[0]
+            self.assertEqual(deadline, 42.0 + 30.0)
+            q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
+
+            # The drain ack eventually arrives -> released exactly once.
+            generation = mgr.register_deferred_abort_room(room)
+            mgr.note_abort_ack(room, 0, generation)
+            q.resolve_deferred_releases()
+            rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
+
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
+        self.assertIsNone(dreq.kv_receiver)
+        q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
+            duration_seconds=32.0,
+            outcome="drained",
+        )
+
+    def test_releases_without_ack_when_prefill_instance_down(self):
+        # A dead prefill engine owns no RDMA transfers, so its late writes
+        # cannot exist: undrained pages can be freed once the instance is
+        # popped from prefill_info_table (common/conn.py _handle_node_failure).
+        mgr = _make_manager()
+        room, idx = 302, 5
+        q = _make_queue(timeout=30.0, enable_metrics=True)
+        dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
+        q._deferred_releases.append((dreq, 10.0, 11.0, idx, 1))
+        mgr.prefill_info_table.clear()
+
+        with (
+            patch.object(decode_mod.time, "monotonic", return_value=12.0),
             patch.object(decode_mod, "release_kv_cache") as rel,
         ):
             q.resolve_deferred_releases()
@@ -796,8 +843,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertIsNone(dreq.kv_receiver)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
-            duration_seconds=32.0,
-            outcome="timeout",
+            duration_seconds=2.0,
+            outcome="peer_dead",
         )
 
     def test_metrics_disabled_does_not_observe_release(self):
@@ -806,6 +853,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(enable_metrics=False)
         dreq = _make_decode_req(room, idx, mgr)
         q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
+        # Prefill declared down -> release proceeds without metrics.
+        mgr.prefill_info_table.clear()
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=20.0),
@@ -824,9 +873,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(enable_metrics=True)
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
-        # Both already past deadline -> both selected for release.
+        # Both released without drain because the prefill is declared down
+        # (a past deadline alone must NOT select entries anymore).
         q._deferred_releases.append((bad, 10.0, float("-inf"), 2, 1))
         q._deferred_releases.append((good, 10.0, float("-inf"), 1, 1))
+        mgr.prefill_info_table.clear()
 
         calls = []
 
@@ -848,7 +899,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
                 call(duration_seconds=30.0, outcome="error"),
-                call(duration_seconds=30.0, outcome="timeout"),
+                call(duration_seconds=30.0, outcome="peer_dead"),
             ]
         )
 

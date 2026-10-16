@@ -1,0 +1,191 @@
+# Allocator audit findings (alloc-auditor)
+
+Scope: `python/sglang/srt/mem_cache/allocator/{base,paged,token,swa,page_interleave,hisparse}.py` + `python/sglang/kernels/ops/memory/allocator.py` (Triton alloc kernels).
+Production config: page_size 64, kv fp8_e4m3/bf16, chunked prefill 12288-32768, TP 1-8, PD disaggregated (need_sort=True in ALL disagg modes — see kv_cache_configurator.py:887/999/1348/2485: `need_sort = get_disagg().disaggregation_mode in ("decode","prefill")`).
+
+Method note: allocators are pure-python + torch tensor ops driving Triton kernels; the naive CPU equivalents (`alloc_extend_naive`, `alloc_decode_naive`) are bit-equivalent reference implementations included in paged.py, so the allocator logic + kernels' index math can be CPU-tested via the naive path (Triton path is GPU-only; its index math was separately audit-read).
+
+---
+
+## POST-REVIEW UPDATES (2026-10-16)
+- **BUG-ALLOC-1/2: NOT BUGS — retracted** (proved with real allocator objects on CPU: `HiSparseTokenToKVPoolAllocator` + `SWATokenToKVPoolAllocator.alloc_extend_swa_tail` under need_sort=True staged fragmentation). The `available_size()//ps` guards over staged pages look looser than the inner `len(free_pages)` check but the inner paged `alloc_extend` merges-and-sorts when its fast bound would fail, so staged pages are always recoverable exactly when the guard admitted them. Guard fires strictly later than the inner capacity. No spurious None reachable; near-OOB concern refuted by the same merge. Pester-risk note: none.
+- **BUG-ALLOC-6 claim chain: retracted as stated**; the "fabricated slots" in my first mental model were from my own harness calling `free_page_ids` with SLOT values — that made 0-page entries and out-of-range page ids, an invalid call. With valid whole-page ownership, `alloc()`'s contiguous branch only ever materializes full blocks of pages ON the free list, which by the whole-page tree contract are genuinely free: no fabrication, no cross-request overlap. **The whole-page free-contract IS enforced only by caller discipline; the allocator never checks that a freed page's slots are all caller-owned.** See PSA section.
+- **BUG-ALLOC-7 (confirmed, real code, LOW severity at HEAD)**: `free_page_ids` / `_release_page_ids` (paged.py) trust ids fully: `free_page_ids([num_pages+K])` inserts the out-of-range page into free/staged and a later `alloc()` materializes KV indices `num_pages*ps .. +ps-1` → OOB KV access. No production caller found at HEAD that can pass OOB ids (all derive from in-range token indices); defense-in-depth assert recommended.
+- **BUG-ALLOC-8 (confirmed, real code, LOW severity at HEAD)**: `free_page_ids([p, p])` inserts duplicate page ids; alloc() hands the page to two owners → double-alloc (putid3 case: count(3)=3 at need_sort=False). Same internal-seam status as 7; debug_mode catch exists only in debug.
+- **BUG-ALLOC-3/4/5** unchanged (see below). Bug-ALLOC-5 (ps=1 alloc_decode mismatch) verified numerically equivalent kernels at ps=64 only — latent ps=1 issue stands.
+- PSA (production-relevant audit note): token-indexed `free()` trusts that freed vec's whole pages are caller-owned (paged free → `unique(vec // ps)` whole-page release). A partial-coverage bug upstream (freeing a vector that touches a page whose other slots are still live) silently releases the whole page → cross-request KV corruption one level up. The only guard is `free_segment`'s debug reference check + `_page_disjoint` assert for segment frees; plain `free()` has no runtime guard in production (debug_mode only). Given abort paths are the known leak/corruption cluster (`disaggregation retract with SWA offload guard` etc.), this is worth an invariant: track per-page refcounts in the tree and verify `free()` never drops a page with live external refs (kvpool-auditor's bounds-clamp class is the index-side sibling).
+
+## mamba.py verdict (allocator/mamba.py, read this pass)
+- CLEAN: one-slot-per-request free list, no page math; group pre-alloc amortization (`alloc_group_begin/_end`) is structurally single-threaded (one scheduler call site, scheduler.py:4118/4220) and `_do_alloc` pops disjoint ranges.
+- Minor notes (not bugs in the crash-on-error scheduler model): if the scheduler ever survives an exception between alloc_group_begin and alloc_group_end, the unconsumed pre-allocated slots are silently dropped on the next alloc_group_begin (`self._alloc_iter = None`) = slot leak; and begin-during-open-group discards the previous group's remainder. Both are defense-in-depth items only — today a scheduler exception is fatal anyway, so nothing leaks at runtime. Double free of a slot is caller discipline (no dedup anywhere), consistent with the rest of the allocator layer.
+
+## TRANCHE 3 UPDATE (F-5 hisparse prefix-clobber fix + dsa Q2 port landed)
+
+- dsa Q2 port (board #56): unified `_free_surplus_device_pages` in
+  allocator/hisparse.py; non-V4 `alloc_device_buffer` no longer releases
+  surplus at token granularity (page split between kept and surplus was freed
+  from under the live buffer under non-dense device indices). 9-case suite +
+  75-test pools_fuzz gate green; reviewer dsa-auditor. The vulnerable
+  non-V4 token-granular-surplus-free pattern is present in all prod tags
+  checked (v0.5.14, v0.5.15, v0.5.17, v0.5.20, Kimi K3 bases 87dd4596/
+  bd4828e2); v0.5.14 has no V4 class, prefixing this guard only matters for
+  the shared helper there. pools-lead independently verified 9/9 green and
+  recorded a fail-pre-fix e2e run of the companion suite
+  (test_hisparse_surplus_e2e.py) at 1195c828bf; deliberate non-fail-pre-fix
+  gap in my suite: importing `_free_surplus_device_pages` at test module top
+  cannot collect on pre-fix trees.
+
+- F-5 (board #51, dsa Q1 CONFIRMED): `alloc_device_buffer` (both V4 and
+  non-V4) zeroed `full_to_hisparse_device_index_mapping[allocated_indices]`
+  and harvested/surplus-freed over the FULL requested range, INCLUDING a
+  radix-hit prefix whose compressed slots were NONZERO-live tree/creator
+  values → clobbered the shared prefix's C4 translation (next radix reuse +
+  creator request read freed, re-allocatable device pages = UAF / context
+  leak).
+  FIX (agent/alloc-auditor): new `prefix_len` arg on both alloc_device_buffer
+  variants; `_harvest_device_indices` reads prefix values but zeroes only the
+  fresh tail; buffer seeds include the read-only prefix values;
+  `_free_surplus_device_pages` got `protected_indices` (prefix pages can
+  never be released by this call — survives the V4 device_buffer_size swap).
+  Guarded the pad branch against an empty seed (new edge when the whole range
+  is an unmapped prefix). hisparse_coordinator.alloc_device_buffer computes
+  the compressed prefix length from req.prefix_len and passes it in.
+  Tests: test_hisparse_prefix_guard.py — 5 cases incl. PRE-FIX-shape
+  verification that legacy calls zeroed the prefix mapping (the bug shape),
+  post-fix: prefix mapping untouched, prefix pages never freed, fresh tail
+  harvested + surplus freed exactly once, accounting sane. Full pools_fuzz
+  suite 80/80 green (passthrough prefix_len=0 keeps legacy callers identical).
+
+## TRANCHE 2 UPDATE (fuzz completion + mamba probe + adversarial group probes)
+
+Fuzz totals at HEAD: `test_paged_allocator_fuzz.py` (lead's base, 20 configs) +
+`test_paged_allocator_adversarial.py` (my extension: free_segment/free_segments,
+adversarial free_group double-release, boundary prefix-multiple extends,
+decode-to-exactly-full-page) + `test_alloc_kernels_equiv.py` +
+`test_paged_invariants.py` + `test_mamba_allocator_probe.py`: **66 tests passing**
+(PYTHONPATH=python/, CPU venv). Plus fuzz_allocators.py standalone:
+60 seeds x 20k steps WIDE: ALL OK.
+
+### MAMBA-1 (real-code probe; caller-contract violation required — severity set by callers)
+`MambaSlotAllocator.free()` has no dedup and no debug sweep: freeing the same slot
+twice inserts the slot twice; two later `alloc(1)` calls return the SAME slot id for
+TWO live requests → mamba state shared across requests. Sibling of the paged
+free-list double-free but with NO SGLANG_DEBUG_MEMORY_POOL equivalent at all.
+In-tree callers at HEAD do not double-free (scheduler frees once via holds_mamba /
+notadded guards in scheduler.py:4205-4217).
+Repro: test/srt/pools_fuzz/test_mamba_allocator_probe.py::test_double_free_hands_slot_to_two_requests.
+
+### MAMBA-2 (defense-in-depth; no runtime exposure today)
+`MambaSlotAllocator.alloc_group_begin()` while a group is open drops the previous
+group's unconsumed pre-allocated slots silently (available_size never recovers them
+short of clear()). Only caller (scheduler.get_new_batch_prefill) pairs begin/end on
+one path and scheduler exceptions are fatal, so no exposure at HEAD.
+Repro: test_mamba_allocator_probe.py::test_group_begin_during_open_group_leaks.
+
+### Free-group adversarial results (pools-lead's probe list, all real-code on HEAD):
+- double release of the same pages via token-vector free() inside ONE group:
+  SAFE — group_end's `torch.unique(free_index // ps)` dedups across the deferred
+  piles. Regression-pinned in test_paged_allocator_adversarial.py.
+- double release via free_page_ids in ONE group: CORRUPT (duplicates enter the
+  free list; later allocs hand the page to two owners). Caller contract 'no page
+  twice' violated; internal seam only: NO in-tree production caller of
+  free_page_ids outside allocator/ at HEAD; SGLANG_DEBUG_MEMORY_POOL catches it.
+- mixed free()+free_page_ids of same pages in ONE group: CORRUPT (dedup is
+  per-path; the page-id pile and the token pile are released separately).
+  Same internal-seam status.
+- valid free_segment/free_segments + grouped segment frees: CLEAN (conservation
+  fuzz 16 configs green).
+- harness lesson recorded: on alloc failure the caller must NOT advance its own
+  seq model: alloc_extend/alloc_decode's `(last_loc + 1) % ps == prefix % ps`
+  debug invariant exists exactly to catch that caller desync class.
+
+## CONFIRMED / HIGH-CONFIDENCE BUGS
+
+### BUG-ALLOC-1. HiSparse capacity check measures unmerged free tokens as new pages → spurious allocation failure (liveness; can wedge cache), and near-miss vs a real over-allocation (page OOB / -1-slot write)
+- File: `python/sglang/srt/mem_cache/allocator/hisparse.py:220-229` (`HiSparseTokenToKVPoolAllocator.alloc_extend`) and `:573-584` (`DeepSeekV4HiSparseTokenToKVPoolAllocator.alloc_extend`).
+- Code:
+  ```
+  if num_new_pages > self.logical_attn_allocator.available_size() // self.page_size:
+      return None
+  ```
+- Problem: `available_size()` is a **token** count. Every other allocator that compares an exact new-page count (`num_new_pages`) either uses the exact free-page array length (`PagedTokenToKVPoolAllocator.alloc_extend` uses `len(self.free_pages)` directly) or merges first. Here `available_size()` includes free_pages+release_pages+staged_pages **without merging**. Under `need_sort=True` (production disaggregated mode) freed pages sit in `staged_pages`/`release_pages` until a merge is triggered; this check then:
+  1. Still passes the guard (available_size counts the staged tokens), then calls the inner paged `alloc_extend` which DOES merge internally — so the tokens are recovered and alloc succeeds *by luck of the inner path*.
+  2. Net effect direction: the guard is checking a token-equivalent but page-rounded number. With fragmentation across release/staged lists, the guard count (`available_size() // ps`) can be an under- or over-estimate of the pages `alloc_extend` can actually hand out. Where it differs materially:
+     - guard under-counts vs inner path → returns None spuriously (retry storm / scheduler stall — cache appears full when it is not).
+     - If `num_new_pages` (exact-token basis) would pass but the inner paged allocator, for a different page_size sized pool, cannot deliver, the inner `alloc_extend` returns None and the code hits `assert ... is not None` → harder crash, not a clean -1 write. The HiSparse SECONDARY pool (`hisparse_attn_allocator`) is smaller (size/ratio); the guard against it uses the same available_size vs num_new_pages logic.
+- Repro sketch (CPU, naive kernels): build `HiSparseTokenToKVPoolAllocator(size=..., page_size=64)` with need_sort=True; free pages so they scatter between free_pages and staged_pages; craft seq_lens so `num_new_pages == available_size() // ps` (edge). Compare guard decision vs what inner alloc_extend would do.
+- Production relevance: DeepSeek V4 Pro (v0.5.15.post1) and DeepSeek V4 Flash (v0.5.17) run DSA/HiSparse — matches "DSA tail req_pool index" known-bug family. Severity: Medium-High (availability; the OOB/-1 slot write concern mostly resolves into an assert crash in current code, but the check is structurally wrong and inconsistent with every sibling allocator).
+- Class: "paged allocator capacity check (alloc beyond capacity / boundary condition)" sibling.
+
+### BUG-ALLOC-2. SWA `alloc_extend_swa_tail` over-reserves SWA pages when the tail shares the partial prefix page (page_size > 1) → spurious None (admission failure) on the disaggregation decode prealloc path
+- File: `python/sglang/srt/mem_cache/allocator/swa.py:417-427` (`SWATokenToKVPoolAllocator.alloc_extend_swa_tail`); caller `python/sglang/srt/disaggregation/decode.py:2353,2419`.
+- Code:
+  ```
+  num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size   # ceil
+  if not self.new_pages_available(num_full_pages, num_swa_pages):
+      return None
+  ```
+- Problem: the fresh SWA allocation for the tail is built with `swa_prefix_lens=0, swa_seq_lens=swa_tail_len, swa_last_loc=-1`, so the inner alloc_extend computes its own `get_num_new_pages(swa_seq, prefix=0) = ceil(swa_tail_len/ps)` — matching this guard, so there is NO over-allocation here. BUT `new_pages_available` uses `available_size() // ps` which, like BUG-ALLOC-1, does not merge staged/release pages, so the guard can be over-strict vs what the inner paged SWA alloc_extend would actually deliver, returning None spuriously. Also note `assert len(seq_lens_cpu) == 1` — this is invoked for a single request during decode prealloc; any caller change to batched use would assert-crash (fragility, and `0 <= swa_tail_len <= extend_num_tokens` is the only bound on tail vs the SWA window — no check the tail fits the window/page count of the actual SWA pool).
+- Production relevance: disaggregated DECODE (--disaggregation-decode-enable-offload-kvcache / SWA) — direct match to production surface. Severity: Medium (spurious admission failure under fragmentation ⇒ prealloc retry/abort churn).
+- TODO: reproduce with need_sort=True + fragmented SWA free list; exact failing case.
+
+### BUG-ALLOC-3. DeepSeekV4HiSparse `alloc_device_buffer` frees whole pages for indices that may be shared with the retained buffer → page double-free / free of live pages
+- File: `python/sglang/srt/mem_cache/allocator/hisparse.py:505-525`
+- Code:
+  ```
+  buffer_indices = hisparse_indices[:need_size]
+  surplus = hisparse_indices[need_size:]
+  if surplus.numel() > 0:
+      buffer_pages = torch.unique(buffer_indices // self.hisparse_page_size)
+      surplus_pages = torch.unique(surplus // self.hisparse_page_size)
+      pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
+      if pure_surplus.numel() > 0:
+          self.hisparse_attn_allocator.free(pure_surplus * self.hisparse_page_size)
+  ```
+- Problem: it keeps indices whose pages straddle the buffer/surplus boundary (those are safe — `pure_surplus` excludes pages shared with buffer), but `free(pure_surplus * hisparse_page_size)` frees a page by its FIRST token index. `hisparse_attn_allocator.free()` does `torch.unique(idx // ps)` — fine. The risk: `hisparse_indices` comes from `full_to_hisparse_device_index_mapping[allocated_indices]` filtered to `>0`. If the SAME hisparse device token appears under multiple logical slots (mapping shared — e.g. two logical tokens mapping into one compressed C4 slot pair across compress_ratio=4), then `buffer_indices` and `surplus` pages can both contain tokens legitimately still referenced, and the per-page split is only correct if hisparse_indices is a strictly-sorted contiguous run of one request's private compressed tokens. Whether mapping can alias across requests is the open question; worth a concrete trace with compress_ratio=4. Note also the older non-V4 `alloc_device_buffer` (`hisparse.py:160-196`) frees `hisparse_indices[need_size:]` **directly as token indices** (`self.free_hisparse_indices`) — token-level free into a paged allocator, WITHOUT the pure_surplus page-sharing guard the V4 version has. If the buffer/surplus boundary splits a page, that frees the whole page via unique(idx//ps) while the buffer still holds tokens in it → live page handed back out = UAF/cross-request corruption. The two variants diverging is itself a smell.
+- Production relevance: DeepSeek V4 DSA (hisparse/DSA prefill backends, production). Severity: High if aliasing/boundary holds; needs trace.
+- Class: "DSA tail req_pool index" family / page-sharing double free.
+
+### BUG-ALLOC-5. `alloc_decode_kernel` page-count formula disagrees with host `get_num_new_pages(decode=True)` at page_size==1 → latent free-list desync (kernel hands out a slot the host never pops → eventual double-alloc)
+- File: `python/sglang/srt/utils/common.py:4929` (`(seq_lens % page_size == 1)`) vs `python/sglang/kernels/ops/memory/allocator.py` `alloc_decode_kernel` (`ceil(seq/ps) - ceil((seq-1)/ps)`), used from `python/sglang/srt/mem_cache/allocator/paged.py:alloc_decode`.
+- At page_size == 1: host formula `(seq % 1 == 1)` is false for every seq → `num_new_pages = 0` and `free_pages` is never popped; kernel formula gives 1 for every seq → the kernel writes `free_pages[new_page_start] * 1` (the free-list head) into out_indices. Net: the head slot is handed out yet stays in the free list → it is allocated again later: double-alloc / cross-request slot sharing → KV corruption.
+- Verified numerically (CPU transcription of both formulas, test/srt/pools_fuzz/test_alloc_kernels_equiv.py): ps=1 seq=1 → kernel emits free_pages[0], naive-with-host-count emits last_loc+1 and pops nothing.
+- Exposure audit: TokenToKVPoolAllocator (the only pool constructed with page_size==1 in production) does NOT have alloc_decode and its callers use alloc(1). SWATokenToKVPoolAllocator.alloc_decode asserts page_size > 1. HiSparse/Paged allocators are used at page_size 64 in production. So TODAY no production path launches alloc_decode at ps==1; the bug is latent and fires the first time someone runs a paged pool at ps=1 through the decode path (e.g. a new hybrid config). Severity: Low (latent), but it is exactly the "free-list desync ⇒ double-alloc" class; fix is one-line either in get_num_new_pages or an assert page_size > 1 in PagedTokenToKVPoolAllocator.alloc_decode.
+
+### BUG-ALLOC-4. Triton `alloc_extend_kernel` reads `free_page_ptr[new_page_start_loc + num_new_pages - 1]` even for requests with `num_new_pages == 0` → OOB read of the free-page list (UB; can pick up a non-owned page id for a dead lane, though the store is masked off)
+- File: `python/sglang/kernels/ops/memory/allocator.py` (`alloc_extend_kernel`, Part 3, ~line 180):
+  ```
+  num_part3 = seq_len - seq_len // page_size * page_size
+  start_loc = tl.load(free_page_ptr + new_page_start_loc + num_page_start_loc_self - 1)
+  tl.store(out_indices + output_start_loc + num_part1 + num_part2 + offset_one_page,
+           start_loc * page_size + offset_one_page, mask=offset_one_page < num_part3)
+  ```
+- Problem: `num_part3` computation does NOT account for the token's own `pre_len` contribution. When a request's seq ends exactly on a page boundary (e.g. seq_len = 64*k with page_size 64), for a request that needed 0 new pages (`num_page_start_loc_self == 0`):
+  - `new_page_start_loc` = global pages allocated before this request = the COUNT used so far.
+  - load index = `count - 1` → reads the last-allocated page id of a DIFFERENT request (or free_pages[-1] when count=0 → reads element before the list = OOB at the head when `count==0` and `free_page_ptr` is the base pointer).
+  - num_part3 = seq_len % ps; for seq_len = exact multiple, num_part3 = 0 → the store mask is all-false, so the load result is DISCARDED. The load itself is unmasked → Triton masked-load is absent: `tl.load(ptr + idx)` with no mask loads garbage/OOB memory (within the tensor for interior indices; at index -1 it reads `free_page_ptr[-1]` = the high end of the buffer = a real page id, not a crash). No memory corruption of OUTPUT because the store is masked, but: it reads `free_pages` beyond the committed `num_new_pages` — i.e., reads pages that remain "free" — and could in principle be combined with a later miscomputation; more importantly it's an outright OOB read at the head of the buffer (idx -1) for the all-empty-prefix + exact-boundary batch, which Triton does not protect against.
+  - ALSO the naive reference `alloc_extend_naive` guards this exact case (it computes `page_idx3 = clamp(end_new_pages_g - 1, ...)` and uses the SAME num_part3-deficient value but clamps), which is why the naive path "passes"; the Triton kernel's raw load has no clamp → the two diverge on boundary reads.
+- Another Part-3 boundary case: request i where `num_page_start_loc_self >= 1`, `pre_len % ps == 0` (empty partial part1), seq_len % ps == 0 (num_part3 = 0): store masked off again → benign read. The genuinely dangerous variant would need num_part3 > 0 while the batch's global num_new_pages undercounts — cannot happen because num_new_pages accounts for the final partial page exactly via ceil.
+- Severity: Low-Medium. No live corruption observed from the masked-off store, but it's an OOB read on the free list (head-of-buffer -1 index) on a production shape (page_multiple lengths are common at page_size=64 chunked prefill). Triton OOB loads are UB and can fault under guard pages. The divergence from the naive reference is the bug-in-principle.
+- Verify: cannot Triton-test on CPU; transcribed instruction-for-instruction in test/srt/pools_fuzz/test_alloc_kernels_equiv.py — output slots equal the naive reference across the whole page_size-64 boundary grid (245 cases), so the OOB read never escapes into outputs. Flag as GPU-kernel-only UB (worth fixing with a masked `tl.load(..., mask=n3 > 0, other=0)`).
+
+---
+
+## AREAS CHECKED, VERDICT CLEAN (with reasoning)
+
+- Paged allocator capacity check (the production-surface class): `paged.py:alloc_extend` first merges when the strict upper bound `extend_num_tokens//ps + bs + 1` exceeds len(free_pages), then falls through ONLY when `num_new_pages > len(free_pages)` → returns None. The exact-count path is correct; the upper-bound is conservative SAFE (it is `>=` the true new-page count; proven per-request: new_pages_i = ceil(seq_i/ps) - ceil(pre_i/ps) <= (extend_i + ps - 1)/ps; summing gives <= extend//ps + bs). No over-allocation possible. `alloc_decode` similarly uses exact `get_num_new_pages(decode=True)` and returns None when short. VERDICT: capacity/boundary check is correct in paged.py.
+- Token allocator (token.py): trivial free-list; alloc returns None short; free just concatenates; page_size==1 free_page_ids==free. No boundary issue. CLEAN.
+- available_size() accounting on alloc_partial-abort: alloc_extend/alloc_decode do not commit `self.free_pages = self.free_pages[num_new_pages:]` until AFTER a successful kernel run; on early None returns nothing is deducted → no drift on the alloc side. The committed num_new_pages equals exactly the pages the kernel consumed (same formula `sum(ceil(seq) - ceil(prefix))` in host and kernel). CLEAN on the stock path.
+- free-list double free (paged.py free): dedup via `torch.unique(free_index // page_size)`; free_segment asserts disjointness via base._page_disjoint; debug_mode has `_debug_check_no_duplicate_pages`. A double free of the same index is still possible ONLY if the CALLER frees the same indices twice (unique dedups WITHIN one call, not ACROSS calls) — that is a caller bug surfaced via the release/staged lists when need_sort reduces dedup timing; not an allocator defect per se, but note ACROSS-call double free is NOT guarded (fits "abort leaking pins" known class — the allocator does not own this).
+- token_to_kv_pool indices at page_size=64 boundary: `max_new_tokens_for_memory` (base.py:96-100) subtracts paged_input + page_size + 1; the +1 keeps one token slack beyond a full page — checked for off-by-one; it reserves a whole page plus a token, conservative (loses up to 65 tokens of capacity, wasteful not unsafe). Note it can return min(0,...) -> 0 (not None) for exact-fit case; callers must treat 0 as "cannot fit". OK.
+- -1 index writes: full_to_swa_index_mapping has a deliberate trailing -1 sink (size+page_size+1 long); last_loc=-1 maps there. `_free_swa_pages_none_cuda` asserts swa_tokens>0 (expect SWA_PEER_MAPPED) so freeing via last_loc=-1 is guarded; the CUDA kernel reads `mapping[full_reps]` where full_reps are page representatives (>=0). The only way to write to slot 0 (padding sink) is a full index of 0 being alloc'd out with an SWA mapping — SWA full pools start free lists at page 1 (clear() arange(1, num_pages+1)) so slot 0 is never handed out. CLEAN for the stock path; the custom unified path is a different agent's file.
+
+## TEST RESULTS
+- `test/srt/pools_fuzz/fuzz_allocators.py`: randomized alloc_extend/alloc_decode/free/free_group/merge, ps∈{1,64}, need_sort∈{0,1}, real req_to_token ownership oracle. 18 seeds x 3k steps: ALL OK after harness fixes; wide run (60 seeds x 20k) in progress. Invariants: page conservation (free|staged|owned), no slot collision among live tokens, available_size exact, free touches only owned pages.
+- `test/srt/pools_fuzz/test_alloc_kernels_equiv.py`: Triton alloc_extend/alloc_decode transcribed per-instruction == naive reference on the ps=64 boundary grid (0,1,63,64,65,127,128,129,192,263,319-ish lens; batches 1..3): 245 cases OK.
+
+## TODO / in progress
+- Confirm BUG-ALLOC-1/2 divergent guard vs inner path with a CPU build; get exact failing seq.
+- Confirm whether full_to_hisparse_device mapping aliases across requests (needed for BUG-ALLOC-3 severity).
+- hisparse `alloc` and V4 partial-pool asserts (`Hisparse allocation failed in alloc_extend`) leave the LOGICAL allocation committed while crashing — verify whether the assert-crash leaks the logical pages (they were popped from free_pages) — yes: on assert, logical pages popped but exception propagates; nothing rolls them back. Under a non-assert build / future refactor this is a leak-on-error. Worth a note even though asserts mean "debug/production crash-first".
+- free_segment / free_segments page-disjointness assertions (`base.py:_page_disjoint`) — appears sound: asserts `start_pos // ps > (prev_end - 1) // ps`, i.e. segments may not share a page; then free_segment's stride `free_index[::ps]` hits each page once. Fuzz coverage: add segment-free ops to the harness.

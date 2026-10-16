@@ -716,6 +716,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    # Bound (seconds) a prefill transfer worker waits on a NIXL handle batch in
+    # which no handle has failed; a permanently-PROC handle would otherwise
+    # wedge the worker and starve every room sharded to its queue.
+    SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S = EnvFloat(300.0)
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
@@ -727,6 +731,11 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+
+    # Max seconds drain_before_retraction waits for pending decode KV offload
+    # (device->host) copies before refusing retraction. Copies normally land in
+    # milliseconds; retraction while a copy reads device KV corrupts it.
+    SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S = EnvFloat(30.0)
 
     # ===================================================================
     # Distributed and model-parallel runtime

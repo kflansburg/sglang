@@ -1812,14 +1812,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.kv.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        if _MAMBA_DEBUG_ASSERTS:
-            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
-            assert mamba_value_donated.item() != -1, (
-                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-                f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
-                f"next_track_idx={req.kv.mamba_next_track_idx}, "
-                f"rid={req.rid}"
-            )
+        # Always-on (restored from v0.5.14): a donated -1 would silently map
+        # the tree pointer at slot -1 -> cross-request mamba state exposure.
+        # Donations are per-checkpoint (not per-token), so the .item() sync is
+        # amortized; features-lead request to drop the debug gate.
+        assert mamba_value_donated.item() != -1, (
+            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+            f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.kv.mamba_next_track_idx}, "
+            f"rid={req.rid}"
+        )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
@@ -5215,6 +5217,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 if dcp_replicated
                 else (size + self.page_size) * dcp_size - self.page_size
             )
+        # The index buffer (and req_to_token, int32) address these ids: beyond
+        # 2^31 they wrap negative and alias with no loud error.
+        assert index_buf_size < 2**31, (
+            f"DSA index buffer id space {index_buf_size} exceeds the int32 bound "
+            f"(2^31): size={size}, page_size={self.page_size}, "
+            f"dcp_replicated={dcp_replicated}. Reduce token capacity or DCP size."
+        )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
@@ -5331,6 +5340,39 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for i in range(layer_num)
             ]
+
+    @staticmethod
+    def estimate_compress_tail_bytes(
+        *,
+        index_kpool: int,
+        index_kpool_compress: bool,
+        tail_extra_slots: int,
+        index_head_dim: int,
+        num_alloc_index_layers: int,
+        max_running_requests: Optional[int],
+    ) -> int:
+        """Exact byte cost of the kpool-compress tail buffers, for budget time.
+
+        These are a FIXED per-(request,layer) cost no per-token cell size can
+        express: (max_running_requests+1) rows x (index_kpool+tail_extra_slots)
+        x index_head_dim x bf16 x 2 tensors x the number of layers that
+        allocate. At V4-class dims (kpool 4 + 512 extra slots, head 128,
+        61 layers, 512 reqs) this is ~8.3 GB the budget previously did not
+        charge -- enough to OOM a margin-tight deployment.
+        KEEP IN SYNC with the allocation above.
+        """
+        if not (index_kpool > 1 and index_kpool_compress):
+            return 0
+        if num_alloc_index_layers <= 0 or max_running_requests is None:
+            return 0  # pool asserts on None at build time; nothing chargeable yet
+        req_pool_size = max_running_requests + 1  # pool's sentinel slot rule
+        tail_width = index_kpool + tail_extra_slots
+        bf16_size = torch._utils._element_size(torch.bfloat16)
+        return (
+            req_pool_size * tail_width * index_head_dim * bf16_size
+            * 2  # _compress_tail_k and _compress_tail_score
+            * num_alloc_index_layers
+        )
 
     def get_compress_tail_buffers(
         self, layer_id: int

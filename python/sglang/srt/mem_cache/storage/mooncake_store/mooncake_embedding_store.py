@@ -55,7 +55,11 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
         results = self.store.batch_get_into(keys, ptrs, sizes)
-        return [res > 0 for res in results]
+        # Mooncake returns the number of bytes read per key (negative on
+        # error). A short read (0 < bytes < requested) must NOT be treated as
+        # success: partially filled buffers would poison the cache entry and
+        # every request hitting this hash afterwards.
+        return [res == size for res, size in zip(results, sizes)]
 
     def batch_put(
         self, hashes: List[str], ptrs: List[int], sizes: List[int]
@@ -92,7 +96,8 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
         results = self.store.batch_get_into_multi_buffers(keys, ptrs, sizes)
-        return [res > 0 for res in results]
+        # Require an exact byte count per key; see batch_get().
+        return [res == sum(buf_sizes) for res, buf_sizes in zip(results, sizes)]
 
     def batch_put_from_multi_buffers(
         self,

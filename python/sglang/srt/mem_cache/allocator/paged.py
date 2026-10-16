@@ -287,6 +287,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
+        assert self.page_size > 1, (
+            "paged alloc_decode assumes page_size > 1: at page_size 1 the host "
+            "get_num_new_pages formula (seq % 1 == 1 -> never) disagrees with the "
+            "kernel's ceil(seq) - ceil(seq-1), desyncing the free list. Use "
+            "TokenToKVPoolAllocator at page_size 1."
+        )
+
         bs = len(seq_lens)
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
