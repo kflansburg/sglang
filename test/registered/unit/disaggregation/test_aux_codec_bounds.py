@@ -78,5 +78,81 @@ class TestWatermarkSubscriberPruning(unittest.TestCase):
         self.assertEqual(len(handler._wm_subscribers), 0)
 
 
+class TestStagingWireFieldGuards(unittest.TestCase):
+    """F20/F21: staging wire-decoded fields must not alias or regress the ring."""
+
+    def test_set_chunk_negative_index_raises(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            StagingTransferInfo,
+        )
+
+        t = StagingTransferInfo()
+        t.set_chunk(0, 100, 1, 200)
+        t.set_chunk(1, 300, 1, 400)
+        with self.assertRaises(ValueError):
+            t.set_chunk(-1, 999, 9, 9999)
+        # The legitimate entries are untouched.
+        self.assertEqual(t.offsets, [100, 300])
+        self.assertEqual(t.rounds, [1, 1])
+        self.assertEqual(t.ends, [200, 400])
+
+    def test_handle_staging_rsp_drops_negative_chunk(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.common.staging_handler import (
+            StagingTransferInfo,
+            handle_staging_rsp,
+        )
+
+        tinfo = SimpleNamespace(staging=StagingTransferInfo())
+        transfer_infos = {5: {"sess": tinfo}}
+        msg = [b"STAGING_RSP", b"5", b"-1", b"100", b"1", b"200", b"sess"]
+        handle_staging_rsp(msg, transfer_infos)
+        # Nothing overwritten through the negative-index alias.
+        self.assertEqual(tinfo.staging.offsets, [-1])
+
+    def test_handle_staging_rsp_positive_still_applies(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.common.staging_handler import (
+            StagingTransferInfo,
+            handle_staging_rsp,
+        )
+
+        tinfo = SimpleNamespace(staging=StagingTransferInfo())
+        transfer_infos = {5: {"sess": tinfo}}
+        msg = [b"STAGING_RSP", b"5", b"1", b"100", b"1", b"200", b"sess"]
+        handle_staging_rsp(msg, transfer_infos)
+        self.assertEqual(tinfo.staging.offsets, [-1, 100])
+
+    def test_allocator_rejects_nonpositive_size(self):
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            StagingAllocator,
+        )
+
+        for bad in (0, -1, -4096):
+            with self.assertRaises(ValueError):
+                StagingAllocator.assign(
+                    # Bypass __init__ (touches CUDA); only the guarded branch
+                    # runs before any CUDA or buffer state is used.
+                    SimpleNamespace(),
+                    bad,
+                )
+
+    def test_watermark_drops_out_of_range(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            handle_watermark_msg,
+        )
+
+        ctx = SimpleNamespace(
+            remote_watermarks={}, watermark_cv=__import__("threading").Condition()
+        )
+        handle_watermark_msg(ctx, [b"WATERMARK", b"-3", b"10", b"s"])
+        handle_watermark_msg(ctx, [b"WATERMARK", b"3", b"-10", b"s"])
+        self.assertEqual(ctx.remote_watermarks, {})
+        handle_watermark_msg(ctx, [b"WATERMARK", b"3", b"10", b"s"])
+        self.assertEqual(ctx.remote_watermarks["s"], (3, 10))
+
+
 if __name__ == "__main__":
     unittest.main()

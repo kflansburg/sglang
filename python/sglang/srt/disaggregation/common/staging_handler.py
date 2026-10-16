@@ -513,6 +513,14 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
     wm_round = int(msg_parts[1].decode("ascii"))
     wm_tail = int(msg_parts[2].decode("ascii"))
     wm_session = msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
+    if wm_round < 0 or wm_tail < 0:
+        logger.warning(
+            "WATERMARK dropped: out-of-range (round=%s, tail=%s) session=%s",
+            wm_round,
+            wm_tail,
+            wm_session,
+        )
+        return
     with staging_ctx.watermark_cv:
         prev = staging_ctx.remote_watermarks.get(wm_session, (0, 0))
         if (wm_round, wm_tail) > prev:
@@ -531,6 +539,14 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_round = int(msg_parts[4].decode("ascii"))
     stg_end = int(msg_parts[5].decode("ascii"))
     stg_session = msg_parts[6].decode("ascii")
+    if stg_chunk_idx < 0:
+        logger.warning(
+            "STAGING_RSP dropped: negative chunk_idx=%s room=%s session=%s",
+            stg_chunk_idx,
+            stg_room,
+            stg_session,
+        )
+        return
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
     if tinfo is not None:
@@ -560,6 +576,12 @@ class StagingTransferInfo:
     ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
+        # The index ultimately decodes from a wire frame: never allow Python
+        # negative-index aliasing, which would silently overwrite another
+        # chunk's (offset, round, end) and redirect this transfer into a
+        # staging region owned by a different allocation.
+        if idx < 0:
+            raise ValueError(f"staging chunk index must be non-negative, got {idx}")
         while len(self.offsets) <= idx:
             self.offsets.append(-1)
             self.rounds.append(0)
@@ -802,6 +824,22 @@ def handle_staging_req(
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
     requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
+
+    if room < 0 or chunk_idx < 0 or chunk_num_pages <= 0:
+        # Wire-decoded fields: a negative chunk_idx would alias another
+        # chunk's bookkeeping entry via Python negative indexing;
+        # chunk_num_pages <= 0 would either regress the ring head (negative)
+        # or record a zero-byte allocation (zero), both breaking the
+        # no-overlap invariant the watermark protocol rests on.
+        logger.warning(
+            "STAGING_REQ dropped: out-of-range fields room=%s chunk_idx=%s "
+            "chunk_num_pages=%s session=%s",
+            room,
+            chunk_idx,
+            chunk_num_pages,
+            session_id,
+        )
+        return
 
     if staging_allocator is None:
         logger.warning(
