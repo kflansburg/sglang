@@ -200,3 +200,43 @@ deployments). Confirm via git tag diff before filing.
   at kernel level: spec_tree.verify_tree_greedy_kernel_triton writes accept_index successive-ordered
   (num_accept_tokens+1 slots) over a -1-initialized buffer (eagle_utils.py:853), so mid-gap -1
   structurally impossible; consumers mask valid j or use last-accepted select_index. CLAIM HARDENED.
+
+## F-1 (board #17) VERIFIER ATTACK PLAN (written pre-patch; execute when dsa-auditor pushes)
+Fix contract: lock the MAMBA COW source node at finalize_match_result_in_cache staging; release
+strictly after _collect_deferred_mamba_cow_and_clear hands the src to the batch.
+COW lifecycle sites (HEAD line @3420baea):
+  staging: components/mamba.py:192-222 finalize_match_result_in_cache (req.kv.mamba_cow_src_index=)
+  collect:  schedule_batch.py:3154-3176 _collect_deferred_mamba_cow_and_clear (clears req fields:3163)
+  execute:  model_runner.py:1920+ _execute_mamba_deferred_ops
+  clear sites that DROP the staged COW without collecting:
+    A. schedule_batch.py:2023 (retract reset / reset_for_retract: kv.mamba_cow_src_index=None)
+    B. scheduler.py:4210 (admission rejected after init_next_round_input staged; also frees mamba_pool_idx)
+    C. memory_pool.py:1884 (lazy free_mamba_state on release_req)
+  not de-coupled from collecting: lmcache_unified_radix_cache (4 sites, OUT OF PROD SCOPE - lmcache storage)
+ATTACK LIST (each: does the fix leak a lock (permanent un-evictable tree node) or double-dec (underflow)?)
+  1. RETRACT-BEFORE-EXTEND: req staged (lock held), retracted in the same get_new_batch_prefill round
+     BEFORE prepare_for_extend collects -> reset clears cow_src without dec. Lock must be dec'd at
+     reset_for_retract/retract point. If fix only decs at collect: residual +1 lock on src forever.
+  2. ADMISSION REJECT AFTER STAGING: init_next_round_input stages; add_one_req declines (sched mem
+     pressure / can_run_list empty). scheduler.py:4210 clears req fields + frees pool slot. Lock leak
+     unless the reject branch also decs. NB: fix must not double-free dst pool slot here (existing free).
+  3. WAITING-QUEUE ABORT: staged req sits in waiting queue; client aborts before admission second pass;
+     release_req -> memory_pool:1884 clear. Lock leak unless dec at release_req/abort path.
+  4. EXCEPTION MID-ROUND: exception after staging (tokenizer/alloc assert) aborts the loop iteration;
+     try/finally anywhere? Probably none - lock + staged slot both leak; level with pre-patch behavior?
+     (pre-patch leaked the staged dst slot too? - check finalize's alloc path on raise: no alloc-before-
+     raise in the cow branch; dst alloc'd before staging so raise between -> slot leak pre-existing).
+  5. ALLOC-RETRY INTERACTION: finalize's own inc/dec_lock_ref around evict_for_alloc (components/
+     mamba.py:210-217) PLUS the fix's COW lock on the same best_match_node - two independent receipts;
+     ensure dec pairing uses to_dec_params() correctly (delta vs absolute) so the evict-window dec
+     can't cancel the COW lock. inc/dec must be REFCOUNTED (check unified_tree_core inc_lock_ref
+     returns counts not booleans).
+  6. DECODE-PHASE REUSE: after collection, req fields cleared; decode loops reuse req.kv.mamba_pool_idx
+     as ACTIVE slot (holds_mamba). Path must NOT dec again at collect-2 (there is none; only 1 collect/req).
+  7. MIXED/mtp adaptive swap req indices: swap_full_runtime_state_on_finished swaps per-req state hooks;
+     verify the swapped state hooks don't carry cow src metadata (cow only at extend admission - no).
+  8. Repro replay: their repro harness must FAIL on HEAD baseline (evict X between staging and forward).
+     After fix: X survives (lock), COW copies correct state; and node returns to evictable after collect.
+Method: reproduce via their test; for attacks 1-3/5 drive a CPU harness of unified tree + allocator with
+locks counted per node (fake of inc/dec_lock_ref + evict_for_alloc), simulate admission/reject/retract/
+abort interleavings, assert net lock delta == 0 for the src node on every terminal path.
