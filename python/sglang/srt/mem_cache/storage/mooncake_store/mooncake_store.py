@@ -1377,18 +1377,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_target_locations.append(target_locations[i])
                 set_target_sizes.append(target_sizes[i])
                 set_indices.append(i)
-        # Only set non-existing keys to storage
-        start_time = time.perf_counter()
-        put_result = self._put_batch_zero_copy_impl(
-            set_keys, set_target_locations, set_target_sizes
-        )
-        end_time = time.perf_counter()
-
-        if self.enable_storage_metrics:
-            self.backup_pgs.append(len(set_keys))
-            self.backup_bandwidth.append(
-                len(set_keys) / (end_time - start_time) * self.gb_per_page
+        # Only set non-existing keys to storage. When every key already
+        # exists there is nothing to put: skip the RPC (an empty batch_put_from
+        # is a wasted round trip and can upset the native client).
+        put_result = []
+        if set_keys:
+            start_time = time.perf_counter()
+            put_result = self._put_batch_zero_copy_impl(
+                set_keys, set_target_locations, set_target_sizes
             )
+            end_time = time.perf_counter()
+
+            if self.enable_storage_metrics:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                )
 
         for i in range(len(set_indices)):
             if put_result[i] == 0:
