@@ -46,7 +46,7 @@ slice-dst dlists per head_group). Siblings / residual gaps below.
 - Related: `room_transfer_infos`/`request_status` for those rooms never progresses; decode side
   relies on its own timeout.
 
-### F4. Cross-thread dict mutation without lock: `transfer_infos`, `request_status`,
+### F4b. Cross-thread dict mutation without lock: `transfer_infos`, `request_status`,
   `decode_kv_args_table`, `_staging_outstanding` accessed from bootstrap thread, scheduler thread
   (`add_transfer_request`/`_prefetch_staging_reqs`), N worker threads, decode listener thread and
   heartbeat thread. CPython dict ops are atomic individually, but read-modify-check sequences are
