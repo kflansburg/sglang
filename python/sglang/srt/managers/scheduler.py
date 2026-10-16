@@ -5744,9 +5744,12 @@ class Scheduler(
                 self.decode_offload_manager.drain_before_retraction()
             except RuntimeError as e:
                 self._engine_paused = False
-                logger.error(
-                    "Refusing retract-mode pause: decode offload copies still "
-                    f"pending after the drain timeout: {e}"
+                logger.critical(
+                    "PAUSE REFUSED: D2H wedge — decode offload copies never drained "
+                    f"within the timeout; engine keeps serving, retry PauseGeneration. "
+                    f"Detail: {e} (pending offloads: "
+                    f"{len(self.decode_offload_manager.ongoing_offload)} copies, "
+                    f"{len(self.decode_offload_manager.offload_inflight)} requests)"
                 )
                 return
         if retract_reqs:
