@@ -19,6 +19,36 @@ Method note: allocators are pure-python + torch tensor ops driving Triton kernel
 - CLEAN: one-slot-per-request free list, no page math; group pre-alloc amortization (`alloc_group_begin/_end`) is structurally single-threaded (one scheduler call site, scheduler.py:4118/4220) and `_do_alloc` pops disjoint ranges.
 - Minor notes (not bugs in the crash-on-error scheduler model): if the scheduler ever survives an exception between alloc_group_begin and alloc_group_end, the unconsumed pre-allocated slots are silently dropped on the next alloc_group_begin (`self._alloc_iter = None`) = slot leak; and begin-during-open-group discards the previous group's remainder. Both are defense-in-depth items only — today a scheduler exception is fatal anyway, so nothing leaks at runtime. Double free of a slot is caller discipline (no dedup anywhere), consistent with the rest of the allocator layer.
 
+## TRANCHE 3 UPDATE (F-5 hisparse prefix-clobber fix + dsa Q2 port landed)
+
+- dsa Q2 port (board #56): unified `_free_surplus_device_pages` in
+  allocator/hisparse.py; non-V4 `alloc_device_buffer` no longer releases
+  surplus at token granularity (page split between kept and surplus was freed
+  from under the live buffer under non-dense device indices). 9-case suite +
+  75-test pools_fuzz gate green; reviewer dsa-auditor. All prod versions
+  (v0.5.14-.20, Kimi K3 bases) carry the token-granular free.
+
+- F-5 (board #51, dsa Q1 CONFIRMED): `alloc_device_buffer` (both V4 and
+  non-V4) zeroed `full_to_hisparse_device_index_mapping[allocated_indices]`
+  and harvested/surplus-freed over the FULL requested range, INCLUDING a
+  radix-hit prefix whose compressed slots were NONZERO-live tree/creator
+  values → clobbered the shared prefix's C4 translation (next radix reuse +
+  creator request read freed, re-allocatable device pages = UAF / context
+  leak).
+  FIX (agent/alloc-auditor): new `prefix_len` arg on both alloc_device_buffer
+  variants; `_harvest_device_indices` reads prefix values but zeroes only the
+  fresh tail; buffer seeds include the read-only prefix values;
+  `_free_surplus_device_pages` got `protected_indices` (prefix pages can
+  never be released by this call — survives the V4 device_buffer_size swap).
+  Guarded the pad branch against an empty seed (new edge when the whole range
+  is an unmapped prefix). hisparse_coordinator.alloc_device_buffer computes
+  the compressed prefix length from req.prefix_len and passes it in.
+  Tests: test_hisparse_prefix_guard.py — 5 cases incl. PRE-FIX-shape
+  verification that legacy calls zeroed the prefix mapping (the bug shape),
+  post-fix: prefix mapping untouched, prefix pages never freed, fresh tail
+  harvested + surplus freed exactly once, accounting sane. Full pools_fuzz
+  suite 80/80 green (passthrough prefix_len=0 keeps legacy callers identical).
+
 ## TRANCHE 2 UPDATE (fuzz completion + mamba probe + adversarial group probes)
 
 Fuzz totals at HEAD: `test_paged_allocator_fuzz.py` (lead's base, 20 configs) +
