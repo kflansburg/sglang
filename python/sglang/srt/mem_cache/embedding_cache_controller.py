@@ -419,6 +419,7 @@ class EmbeddingCacheController:
             "total_evicted": 0,
             "eviction_count": 0,
             "allocation_failures": 0,
+            "late_store_ops": 0,
         }
 
         self._copy_streams = {}
@@ -824,12 +825,14 @@ class EmbeddingCacheController:
                 worker.start()
                 worker.join(timeout=self.store_op_deadline_s)
                 if worker.is_alive():
+                    self.stats["late_store_ops"] += 1
                     logger.error(
                         f"Mooncake GET for req {op.req_id} exceeded "
                         f"{self.store_op_deadline_s}s deadline; marking late "
                         f"({len(op.keys)} keys stay FILLING until the call "
                         f"returns; pool pages are NOT freed while the transfer "
-                        f"may be in flight)."
+                        f"may be in flight). Late ops now: "
+                        f"{len(self._late_ops) + 1}."
                     )
                     self._late_ops.append(
                         _LateOp(op, worker, is_get=True, results_box=results_box)
@@ -858,10 +861,12 @@ class EmbeddingCacheController:
                 worker.start()
                 worker.join(timeout=self.store_op_deadline_s)
                 if worker.is_alive():
+                    self.stats["late_store_ops"] += 1
                     logger.error(
                         f"Mooncake PUT exceeded {self.store_op_deadline_s}s "
                         f"deadline; marking late ({len(op.keys)} keys stay "
-                        f"pinned until the call returns)."
+                        f"pinned until the call returns). Late ops now: "
+                        f"{len(self._late_ops) + 1}."
                     )
                     self._late_ops.append(
                         _LateOp(op, worker, is_get=False, results_box=results_box)
@@ -1240,6 +1245,7 @@ class EmbeddingCacheController:
             )
             return {
                 **self.stats,
+                "late_ops_outstanding": len(self._late_ops),
                 "num_cached": len(self.entries),
                 "num_pinned": sum(
                     1 for entry in self.entries.values() if entry.ref_count > 0

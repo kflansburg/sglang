@@ -70,6 +70,7 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
         "total_evicted": 0,
         "eviction_count": 0,
         "allocation_failures": 0,
+        "late_store_ops": 0,
     }
     ctrl.ongoing_prefetch = {}
     ctrl.prefetch_queue = Queue()
