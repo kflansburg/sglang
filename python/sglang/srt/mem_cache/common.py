@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -395,10 +396,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    # A mamba-capable cache may alloc mamba state before alloc KV cache
+    # A mamba-capable cache may alloc mamba state (and stage a deferred COW
+    # with its source lock) before alloc KV cache; the lock must be released
+    # at EVERY exit, including this early-mamba-no-KV branch and the
+    # session-claim branch (F-1 catch-all).
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (
-            "Only a mamba-capable tree cache allows freeing before alloc"
+            "Only a mamba-capable tree cache allows releasing before alloc"
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
@@ -406,10 +410,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
+        clear_mamba_cow(req)
         return
     if tree_cache.claim_kv_row(req):
         # A streaming session detached the kv record to keep the row.
         assert not req.kv.holds_kv
+        clear_mamba_cow(req)
         return
 
     owned_kv_len = req.owned_kv_len()

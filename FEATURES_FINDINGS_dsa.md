@@ -207,3 +207,103 @@ Decisive code evidence (2026-10-16):
 - Consumers (:2330/:2379, forward_mha fp8 dequant) all read the same metadata field. Consistent.
 - aiter filter/translate is ROCm raw-layout compensation (576B vs 656B comment forward_mha.py:664-685).
 - Reported to unified-auditor (#756).
+
+## CANDIDATE R-1 (swa challenge, msg #768/#773): COMPACT ragged-verify cap=None last-row inflation
+- deepseek_v4_backend.py:1279 calls layout.padded_to_bucket(padded_bs=bs) with NO cap (COMPACT mode only),
+  feeding graph capture tiers; trtllm_mha:1149, trtllm_mla:1559, flashattention:3122 same.
+- PaddedToBucket (ragged_verify_kernels.py): leftover = graph_num_tokens - sum(verify_lens); when
+  num_pad_reqs == 0 (batch exactly fills the tier), leftover folds into the LAST REAL ROW.
+- Trigger: padded_bs == bs AND sum(ragged verify lens) < graph_num_tokens — happens with variable
+  draft acceptance in EAGLE/DSPARK where real per-req verify lens < num_draft.
+- Effect: last real request's verify window widened beyond num_draft into committed/future positions
+  → attention reads past drafted width (garbled verify for that request; committed-region reads,
+  NO cross-request page reads expected since same req's row).
+- NOT closed: swa's suspicion stands; the only-closed case is num_pad_reqs > 0 (phantom rows absorb).
+- Needed: downstream consumer check (verify mask/positions used by trtllm/dsv4 kernels for the last
+  row) + PoC: craft lens with sum < tier total, padded_bs == bs, watch last-row positions overstep.
+- Filed after re-verifying consumer paths; candidate, not confirmed (needs kernel-side check).
+
+## F-5 residual sub-verdict (#913): uninitialized host C4 read of radix-hit prefix — UNREACHABLE-by-construction
+- hisparse_coordinator.request_finished (:1417) zeroes full_to_hisparse_device_index_mapping over the
+  request's compressed allocated_locs at finish (kv_allocated_len basis, pre-release).
+- Consequently a decode-worker radix-hit prefix row's C4 mapping reads mapping==0 → host fallback via
+  the 0 sentinel (disagg-decode's PD note) rather than uninitialized host C4 rows.
+- Top-k/swap-in kernel inputs come from the device buffer built by alloc_device_buffer; unmapped
+  (0) prefix rows take the host path. No route reads uninitialized host C4 for the prefix.
+- Caveat (efficiency, not safety): finish-time zeroing destroys shared-prefix compression reuse
+  (later radix-hit requests re-derive/restore from host); note for coverage rollup only.
+- F-5 main: fixed by alloc-auditor #56 (approved by me), board #51 closed.
+
+## Q3 policy verdict (#931/#937): alloc_device_buffer else-branch fabricated continuation ids — keeps residual channel POST-F-5
+Mechanics (pools-lead proven): fabricate arange(hisparse[-1]+1 .. page end) claiming residual of the
+last kept page. Post-F-5: hisparse_indices = [prefix_vals(shared)..., fresh...]. If the request's
+fresh tail is empty (pure radix-prefix reuse), hisparse[-1] sits in a TREE-OWNED shared prefix page
+→ fabricated filler claims slots in a page the tree owns; buffer ownership bookkeeping
+(req_device_buffer ownership at request_finished) can then free that shared page's slots
+(all_hi path) = sibling of F-5 under the else branch.
+POLICY CALL (dsa): guard the fabrication on "last kept index belongs to a FRESH (non-prefix) page":
+if the kept run's tail derives from prefix_vals only, either skip fabrication (pad with the alloc'
+d device's real next page) or assert denseness. Cheapest implementation: keep prefix/fresh segments
+separate through the else branch (post-F-5 they are distinct) and only fabricate from fresh tail
+indices; falls back to whole-page alloc otherwise (rare: pure-prefix requests).
+pools hosts the mechanics change; assigned via message. Severity: same class as F-5 (cross-owner
+page release), but only when a request has ZERO fresh compressed slots at alloc_device_buffer time
+(full radix prefix hit + complete page alignment) — narrow but real on hi-share workloads.
+
+## F-5b (board #71): finish-side sibling — request_finished frees shared prefix C4 pages
+- request_finished (hisparse_coordinator.py:1395-1407) frees all_hi ⊇ shared prefix buffer ids
+  (post-F-5 the buffer includes prefix_vals via cat) via free_hisparse_indices (whole pages) with no
+  owner protection; tree still references those prefix C4 slots → release-under-tree at FINISH.
+- Found during #68 invariant-(ii) verification (request_finished never frees another owner's pages).
+- Fix shape: protected_pages filter applied to the finish free (same _free_surplus_device_pages
+  semantics), or prefix buffer slots kept out of ownership bookkeeping.
+- Confidence: high on the mechanism (read-side verified); extent (finish path actually taken with
+  live shared prefix) mirrors F-5 reachability. Candidate → mechanics by pools/alloc.
+
+## #68 Q3 pad fix reviewed+approved: fabricate only from fresh tail, else whole-page alloc pad; 4/4
+Q3 suite green in my sandbox (test_hisparse_q3_pad_guard.py).
+
+## F-1 VERSION TRIAGE — wider than unified: flat mamba caches affected at ALL prod tags
+- Staging without source lock exists at:
+  v0.5.14/.15.post1: hi_mamba_radix_cache.py:1060-1070 (cow_mamba, req.mamba_cow_src_index, no lock)
+  v0.5.17:          hi_mamba_radix_cache.py:1073-1083 (same)
+  v0.5.20:          mamba_radix_cache.py:1200-1210 (_match_post_processor, same window)
+  HEAD:             mamba_radix_cache.py (flat) + hi_mamba_radix_cache.py (hi) +
+                    unified_cache/components/mamba.py:217 (FIXED on agent/dsa-auditor c33f4e3)
+- Flat mamba caches are the PRODUCTION carriers for Kimi K3 (--mamba-radix-cache-strategy extra_buffer
+  drives flat MambaRadixCache family on older tags; unified arrives with the newer class).
+- severity: cross-request mamba state corruption window = staging → next forward collect; reachable
+  under any concurrent admission/retraction (mamba evict pressure) — live in K3 prod shapes.
+
+## F-1 vendor-branch backport README (flat caches; product hotfix channel)
+HEAD/main: NO flat mamba caches (removed; unified is the only staging site; fixed in c33f4e3).
+Prod carrier branches, staging site (all equivalent):
+- v0.5.14/.15.post1/.17: hi_mamba_radix_cache.py :1013-1070 (v0.5.14+15) / :1026-1083 (.17)
+- v0.5.20: mamba_radix_cache.py :1200-1210 (_match_post_processor); hi_mamba_radix_cache.py
+  also present with 1 cow site (v0.5.20 count above is for mamba_radix alone = 0 on hi_)
+BACKPORT PATCH SHAPE per branch:
+  (1) STAGING: at `<cache>._match_post_processor`, BEFORE the `if cow_mamba and ...` staging block,
+      take inc_lock_ref(last_node); store the IncLockRefResult receipt on req.kv.mamba_cow_lock
+      (new field on ReqKvInfo, field-named per branch). Flat tree's inc_lock_ref/dec_lock_ref(node)
+      semantics are per-node (no hierarchy; the retry branch's existing inc/dec pair stays).
+  (2) CLEAR ALL SITES (branch-specific counts from grep):
+      v0.5.14:   schedule_batch.py:1916 (reset_for_retract), schedule_batch.py:2998 (collect)
+                 (pool free no clear site at all today — ADD one at the pool free sibling)
+      v0.5.15p1/.17: + scheduler.py:1 (not-admitted revert variant)
+      v0.5.20:  both schedbatch sites (:1916/:2998), scheduler.py:1, memory_pool.py:1709
+  (3) SEMANTICS at each site: if req.kv.mamba_cow_lock is not None:
+      tree_cache.dec_lock_ref(<node>, receipt.to_dec_params()); receipt=None; THEN clear
+      mamba_cow_src_index/needs_clear exactly as today.
+  (4) TEST port: mini sim per branch of the 2-request interleaving (stage cow on node; evict;
+      source slot must survive while receipt held). Local pytest per vendor branch.
+NOTE: carry alongside the same release_kv_cache early-no-KV branch shape check per branch
+  (v0.5.14's common.py likely needs the catch-all too — first clear sites already cover pools;
+  verify during backport whether release_kv_cache has the early mamba_alloc branch on that tag).
+
+## F-1 #60 PoC (swa): verbatim pre-fix repro + post-fix green witness
+- pre-fix repro on origin/main: staged source unlocked; arena eviction; slot re-let; new-owner
+  content rewrite = cross-request mamba leak WITNESS (the F-1 class is empirically confirmed).
+- post-fix green vs @3832b59 (covers c9b4d15 hierarchy + c33f4e3 catch-all, no regressions);
+  clear-balance cycles pin the OVER-PIN class (re-stage/clear -> lock_ref==0).
+- queue-side env note: skip-wrapper stays as primary queue form (lead #1364); swa's get_device mock
+  option recorded as PoC-only path (could silently green a wrong-shaped chain on regression catches).

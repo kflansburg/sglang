@@ -208,12 +208,13 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
-        # Pin the COW source node's MAMBA component for the whole deferred
-        # window: from here until _collect_deferred_mamba_cow_and_clear hands
-        # the source index to the forward-stream copy. Without this lock the
-        # node may be evicted while the copy is still pending, freeing (or
-        # re-letting) the source slot — the deferred read would then leak
-        # another request's mamba state into this one (F-1).
+        # Pin the COW source node (all components; the tree's lock hierarchy
+        # requires full >= per-component) for the whole deferred window: from
+        # here until _collect_deferred_mamba_cow_and_clear hands the source
+        # index to the forward-stream copy. Without this lock the node may be
+        # evicted while the copy is still pending, freeing (or re-letting) the
+        # source slot — the deferred read would then leak another request's
+        # mamba state into this one (F-1).
         stage_mamba_cow_lock(self.cache, result.best_match_node, req)
         if not req.kv.holds_mamba:
             dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
@@ -744,9 +745,16 @@ class MambaComponent(TreeComponent):
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
-            req.kv.mamba_pool_idx = None
+        if not success:
+            if prep.allocated_mamba_slot is not None:
+                self.cache.req_to_token_pool.mamba_allocator.free(
+                    prep.allocated_mamba_slot
+                )
+                req.kv.mamba_pool_idx = None
+            # The superseded deferred COW never runs either: drop its source
+            # lock (F-1, site #10); otherwise the node pins forever.
+            if req is not None:
+                clear_mamba_cow(req)
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
