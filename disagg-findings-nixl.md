@@ -172,3 +172,28 @@ a remote OOB write should be impossible-by-assert, not by convention).
 Remaining open items assigned to me: none blocking. F4 deep-dive only if a concrete
 interleaving emerges. Wire-compat note: F2 count-only assert — geometry equality check via wire
 (aux_item_lens frame) is an optional follow-up.
+
+
+## v0.5.16 vs HEAD semantic pin: mamba host-pool PD "XFER" path (for K3-fork delta)
+Task: pin upstream semantics so the fork-check (K3 base 87dd4596/bd4828e2, ~v0.5.16;
+vendor-only, unfetchable — lead has it flagged) becomes a pure delta.
+
+Upstream names — NO construct named XFER/xfer_role exists upstream (grep-clean); if the
+K3 branch has "XFER roles" in the mamba host pool it is a fork-internal rewrite.
+
+V0.5.16 path (tag pinned locally):
+- File: mem_cache/hi_mamba_radix_cache.py (2184 lines; REMOVED at HEAD).
+- PD routing: server_args.py:5225 — PD mode allows HiMambaRadixCache (host-offload variant of MambaRadixCache); int8-ckpt + host-offload are mutually exclusive (:5236).
+- Ownership model: tree-node-owned. Each TreeNode carries value (device KV), host_value (host KV indices), mamba_value (device mamba slot), mamba_host_value (host mamba slot). Host mamba slot allocated in write_backup() via cache_controller.write(extra_pools=mamba_backup_transfers(node)); freed LOCALLY by _evict_regular ()/evict paths on the owning rank only. LRU lists per medium (mamba_host_lru_list). No cross-rank (DP/TP) sync of mamba host slot attach/free anywhere in the file (attach/free is per-rank tree bookkeeping) — this is the "unsynced per-rank mamba attach/free" class mamba2-auditor confirmed LIVE at public v0.5.16.
+- Retract interplay: no drain-before-retract; eviction of backuped nodes does GPU->CPU demotion (_evict_to_host) and `_free_device_mamba` immediately; copies in flight are not awaited. Aborts invoke prefetch_abort + _force_release_pending_storage_ops (storage-control-queue drain only).
+
+HEAD path (rewritten subsystem):
+- hi_mamba_radix_cache.py deleted; replaced by mem_cache/hybrid_cache/{hybrid_cache_controller.py (1624), hybrid_pool_assembler.py (2234), linker_pool_assembler.py, host_pool_config.py} + mem_cache/pool_host/mamba.py (MambaPoolHost, synchronized free-list alloc/free with delayed release_slots merge).
+- PD decode offload: disaggregation/decode_kvcache_offload_manager.py — drain_before_retraction (:280) DOES all_reduce(MAX) over pending offload copies and RAISES on pending (fix #21 converts the raise to skip-retraction at the scheduler seam; HEAD-only — absent from v0.5.16 and v0.5.20).
+- Ownership model still tree-node-led with per-rank local decisions for slot bookkeeping; cross-rank coordination exists only at specific barriers (e.g. drain_before_retraction), not for mamba host attach/free. The asymmetric-per-rank semantics therefore SPAN both versions.
+
+Fork-delta instructions: diff K3-base/head against public v0.5.16 (base ~ same era) on
+mem_cache/hi_mamba_radix_cache.py + server_args PD routing; any new "XFER" role plumbing
+there is fork-internal — check whether it adds cross-rank sync of mamba slot attach/free
+(if yes, fork may already carry the C4 fix; if it just renames/re-plumbs, class is
+presumed live, per mamba2-auditor).
