@@ -88,11 +88,19 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
    Historical violator: lmcache_unified_radix_cache.py:763 (min-clamp; OOS).
 
 ## Suspects under verification
-- C4: PrefetchAck.pool_hits not rank-reduced → asymmetric SWA sidecar fetch
-  failure ⇒ TP-rank host-tree divergence (one rank inserts, other frees same
-  buffers). CONFIRMED at mock level driving the real
-  _check_hybrid_prefetch_result (prefetch-ctl-audit). Fix drafting: MIN-reduce
-  per-pool hits in _reduce_prefetch_ack + regression test.
+- C4: ~~PrefetchAck.pool_hits not rank-reduced ⇒ TP host-tree divergence~~
+  REFUTED at HEAD + v0.5.20 (hicache-lead review): HybridCacheController
+  ._reduce_prefetch_ack override (:1796) already MIN-reduces ack.pool_hits over
+  the fixed PoolName universe with failure-safe empty-dict semantics; every
+  ack-carrying producer (only Hybrid._page_transfer_sidecar) flows through it.
+  Team repro hand-diverged decision-fn inputs, bypassing the reducing sync
+  thread → unreachable. Proposed base-class fix was itself a WEDGE (empty-dict
+  ranks would skip the new collective) — parked, never merged. Per-version
+  archaeological note: v0.5.14/15/17 have no PrefetchAck.pool_hits field at
+  all (pre-dates the ack design); whether their SWA prefetch has an equivalent
+  asymmetric path via different structure is OPEN (prefetch-ctl continuing).
+  Teach-in: reviewing reviewer MUST chase overridden methods up the MRO before
+  accepting "no sync exists" claims on subclass code paths.
 - storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
   fails at clean HEAD — bug vs env artifact (prefetch-ctl-audit).
 - T3 (low): graceful shutdown doesn't drain ongoing_offload before host-pool
