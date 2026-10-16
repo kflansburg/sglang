@@ -29,4 +29,41 @@ Status codes: CANDIDATE (reasoning shown, needs repro/second review), VERIFIED, 
 
 ## F7. CANDIDATE — `free()` empty-ring branch sets `head=0` and `round+=1`, and watermark=(new round, 0). A stale WATERMARK comparison in prefill `handle_watermark_msg` uses tuple compare `(round,tail) > prev` — fine. But `is_watermark_ready` returns True immediately for alloc_round<=0 — if allocator rounds ever wrap to negatives, no. Skip; kept for completeness.
 
-(to be continued: conn.py bootstrap/metadata buffers, dcp_pack)
+## F15. CANDIDATE (logic verified; config trigger identified) — get_mha_kv_ptrs_with_pp draft-model branch silently skipped when dst_total % num_kv_layers == 0 -> main K/V ptr mixup, silent garbled V
+- conn.py:1556-1579.
+- Branch selection:
+  - if num_kv_layers == dst_num_total_layers: fast path.
+  - elif `num_kv_layers < dst_num_total_layers and dst_num_total_layers % num_kv_layers != 0`: draft-model layout [K_main,V_main,draft_K,draft_V].
+  - else: 'PP equal or 1' layout [K...,V...]: dst_v_ptrs = dst_kv_ptrs[dst_total+start_layer : dst_total+end_layer].
+- Trigger case A (wrong V pointer set): prefill has NO spec decoding, decode HAS draft (EAGLE/DSPARK). e.g. main=4 layers: src_kv_ptrs=8 -> num_kv_layers=4; dst has main+draft=8 layers -> dst_total=8 (16 ptrs). 8 % 4 == 0 -> ELSE branch: dst_v_ptrs = dst_kv_ptrs[8:12] = draft_K pointers; dst_k_ptrs = dst_kv_ptrs[0:4] = main K (ok by luck). Result: main V data is RDMA-written into the DRAFT K buffers; main V and draft V never transferred -> decode serves stale/uninit V for every layer -> massively garbled output with no error. Only the modulo!=0 quirk saves other shapes.
+- Trigger case B (silent slice truncation): else branch indexes dst_kv_ptrs[dst_total+start_layer : dst_total+end_layer]; with start_layer>0 (prefill PP>1) this can exceed len(dst_kv_ptrs); Python slicing truncates silently -> len(dst_v_ptrs) < len(src_v_ptrs).
+- Propagation: _get_mha_head_slice_blocks (conn.py:1616) does entries = zip(src_k+src_v, dst_k+dst_v, ...) — zip drops the shortest side silently, so missing layers are never transferred and no exception is raised. Decode reads stale buffer leftovers from a previous request that owned those pages -> cross-request leakage / garbled output.
+- Production relevance: staging path (SGLANG_DISAGG_STAGING_BUFFER) + spec-decoding draft models: listed as possible in our deployments; DeepSeek V4 Pro + DSPARK on v0.5.15.post1 is a candidate config if staging is enabled for non-MLA there.
+
+## F16. CONFIRMED-DEAD-CODE-RISK — _get_mha_head_slice_blocks zip() silently truncates layer lists (sibling of F15): any ptr-count mismatch in get_mha_kv_ptrs_with_pp or get_mla_kv_ptrs_with_pp variants becomes silent partial transfer.
+
+## F12. SEAM finding — AuxDataCodec.deserialize_data_to_buffer (common/utils.py:101): dst_addr = aux_ptr + item_len*aux_index with NO bounds or length validation of wire-provided aux_index/data. Callers: mooncake/conn.py:1815-1824 takes aux_index = int(msg[3]) from ZMQ metadata msg. A stale/duplicated AUX_DATA message after metadata-buffer slot reuse writes hidden_states/output tensors into a slot owned by ANOTHER request -> cross-request metadata corruption. Coordinate w/ disagg-mooncake: msg has no room-generation tag. Known-class sibling: 'KV integrity tagging'.
+
+## F8. check_status race window (conn.py:564 check_status raises KeyError if room cleared between poll and check) is guarded by callers holding conclude_state; _clear pops request_status then a concurrent poll() via check_status[room] -> KeyError crash of scheduler thread? poll() reads conclude_state first, but update happens on other threads (apply_prefill_status from bootstrap thread). Only if clear runs on scheduler and poll on scheduler same thread -> safe. KEPT as watch item, not a finding.
+
+## F13. CANDIDATE (needs decode-side invariant check) — staging CHUNK_READY page_start is request-suffix-relative (mooncake/conn.py:563 sends kv_chunk.index_slice.start), and _scatter_region does token_start = cache_protected_len + page_start*page_size. This is only correct if dst_kv_indices in the prefill's wire metadata EXCLUDES the decode cached prefix pages. If decode ever publishes full indices (or prefix changes after retraction), token_start overshoots the request's allocated req_to_token row; the slice then reads page indices of whatever occupies the row tail (stale indices from a previous owner are 0s or another request's pages) -> triton scatter writes KV into WRONG pages -> cross-request KV corruption, silent. Also unguarded: token_end > row length is never checked in _scatter_region (staging_handler.py:415). Production: page 64 + staging enabled.
+
+## F9. minor — early-policy receivers: poll()/clear()/abort_notified read from scheduler thread; _run_prefill_recompute (executor thread) can call abort() concurrently when PD-rebootstrap retraction is used WITHOUT defer_decode_allocation policy: _lifecycle_lock is nullcontext then. conclude_state/aborts race benign-ish (double abort idempotent, record_failure under lock), but abort_notified flag check-then-set unsynchronized -> duplicate ABORT notifications to prefill (harmless by design).
+
+## F17. watch — FastQueue has no sentinel/drain on shutdown; worker threads block forever on get() (known class 'Mooncake transfer worker keep-alive'); not my file's owner but FastQueue is mine: put-with-sentinel pattern absent. Ref: 'Mooncake transfer worker keep-alive' known bug class.
+
+
+## F15 UPDATE — verified arithmetic (branch selection wrong whenever decode draft entries make dst_total divisible by num_kv_layers; and in the draft branch, v_ptr_offset = num_kv_layers*multiplier_ratio points into draft_K for the canonical [K_main,V_main,draft_K,draft_V] layout when start_layer=0). Both branches mis-place V for "prefill without spec, decode with EAGLE/DSPARK draft" + staging head slicing. Case C (PP2 stage, no draft) is correct. The draft branch condition reads inverted: it requires dst_total % num_kv_layers != 0, but exactly divisible draft layer counts are natural. See verification script output in commit history message. NOTE: head-sliced path only runs under SGLANG_DISAGG_STAGING_BUFFER / heterogeneous TP non-MLA.
+
+## F18. CANDIDATE — DeferredBootstrap.fail(room) CREATES a tombstone for any room id (`_room()` setdefault), and once failed, register() for that room returns failure forever until the ~35s tombstone expiry. An ABORT frame is unauthenticated; any decode instance (or a stray/record-replayed ZMQ message) with a guessed/stale room id can poison a room before the legitimate decode bootstraps to it -> the prefill then fails a healthy transfer. Also fail-on-cleared-room: _handle_bootstrap_message ABORT path fails bootstrap but returns False so backend still processes. Impact: failed transfers, possible cross-request cross-talk via room id reuse. Known-class sibling: deferred bootstrap state machine.
+
+## F19. CANDIDATE (handoff to disagg-mooncake) — decode._defer_release sets required_acks = len(bootstrap_infos); for MLA, bootstrap_infos includes is_dummy=True entries (one per target_tp_rank) that never send ABORT_ACK -> acks count can never reach required_acks -> deferred release only resolves via timeout (SGLANG_DISAGGREGATION_WAITING_TIMEOUT+...), at which point prefill RDMA write may still be in flight -> the '30s timeout frees KV while RDMA write in flight' class. If dummy ranks already excluded upstream, refute.
+
+## Coverage notes (conn.py shared, staging, bootstrap, dcp_pack):
+- StagingAllocator ring+watermark protocol: hand-verified for wrap/overcommit/empty-reset; prefill-side gate is consistent; no overlap proof bug found inside common/ (the O(num_allocs) alloc_order list is O(n^2) under load -- perf note only).
+- DeferredAbortAck generation scheme: sound; room-reuse resets in update_status; acks counted in a set -> duplicate ACKs harmless.
+- bootstrap.py DeferredBootstrap: open/complete/close owner checks OK; expiry cleanup OK.
+- dcp_pack.py: bound checks present (fits + capacity); pack_offset+capacity semantics flagged (F-DCP-1 lowered: caller passes pack_offset_bytes=0 today; watch).
+- common/utils.py FastQueue/pack/unpack: safe; AuxDataCodec OOB = F12.
+- compute_grid_segments/staging_grid_tokens: arithmetic checked, aligned; no off-by-one found.
+- gather/scatter kernels: masks guard tails; head-slice OOB refuted (F4); F5 OOM-class transient gather_idx int64 expansion (268MB @32k tokens x 8 heads x 128 dim) kept as candidate (memory blowup in transfer worker).
