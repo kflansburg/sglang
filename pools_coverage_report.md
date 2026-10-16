@@ -17,7 +17,7 @@ DCP-widened pools; QSA/PLE state pools; disaggregated PD runtimes.
 | 2 | MambaSlotAllocator.free always-on accounting assert + debug unique sweep | caller double-free -> mamba slot to two live requests -> cross-request state corruption | MR#20 queued, approved | all versions (class latent; caller gate open) |
 | 3 | int32 bound guards on DCP-widened virtual id spaces (configurator logical capacity + DSA index_buf_size) | latent id-space wrap -> silent cross-request KV aliasing | MR#20 queued, approved | v0.5.17+ (DCP absent pre-.17 in this shape) |
 | 4 | dsv4 transfer-index helpers raise on negative scheduler-local ids | defense-in-depth crash robustness (disagg-traced: wire-free) | MR#20 queued, approved | HEAD-only code line |
-| 5 | non-V4 hisparse pure-surplus guard port (from V4) | broken device-index density -> frees page still referenced by kept tokens | committed; review volunteered (alloc-auditor/dsa) | whichever versions carry hisparse non-V4 path (pre-V4) |
+| 5 | non-V4 hisparse pure-surplus guard (alloc-auditor #56; shared V4/non-V4 helper `_free_surplus_device_pages`) | broken device-index density -> frees page still referenced by kept tokens | in review (dsa-auditor) | vulnerable pattern in all tags w/ the non-V4 path (v0.5.14+; alloc-auditor verified vs raw tags) |
 | 6 | F-5 hisparse prefix-clobber (CONFIRMED cross-request compressed KV corruption): zero/free only fresh post-prefix slots | in-flight: alloc-auditor implements, dsa-auditor reviews | --- | hisparse+V4 radix-hit deployments |
 
 ### Team-side fix merged before mine
