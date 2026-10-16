@@ -7,7 +7,14 @@ Note: this upstream file already carries many fixes for our known bug classes (p
 with `_peer_reload_lock`/rate-limit, `_await_handles` settle barrier, deferred abort ACK,
 slice-dst dlists per head_group). Siblings / residual gaps below.
 
-## Findings (candidates, to be verified)
+## Findings (status 2026-10-16)
+
+- F1: REFUTED after re-trace — shard key = full port sum per room; same peer ⇒ same sum ⇒ same worker ⇒ reload serial vs readers. See below + #disagg #121. Candidate invariant-assert only.
+- F2: VERIFIED (low; aux geometry equal by construction; defensive count-check fix planned).
+- F3: VERIFIED; fix planned (bounded healthy wait → settle_timed_out branch).
+- F4: REFUTED (lead trace + defer re-enqueue confirmed same-queue).
+- F8: reported to disagg-decode (their file).
+
 
 ### F1. RACE: `_reload_invalidated_peers` pops prep handles while another worker uses them
 - `transfer_worker` runs in N threads (one per transfer queue, `ShardingQueue`, line ~560-570).
