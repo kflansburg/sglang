@@ -936,6 +936,10 @@ class CommonKVManager(BaseKVManager):
                 f"Failed to send drained ABORT_ACK for room {room} to "
                 f"{target.ip}:{target.port}: {e}; queued for retry"
             )
+            if not hasattr(self, "_pending_abort_acks"):
+                # Test doubles that build the manager without __init__
+                # hit the retry path without the field set.
+                self._pending_abort_acks = {}
             self._pending_abort_acks[(room, target.ip, target.port)] = (
                 target,
                 1,
@@ -950,7 +954,7 @@ class CommonKVManager(BaseKVManager):
         decode records them in a generation-guarded set. Retries give up with
         a loud error; decode keeps the pages held rather than releasing them
         early, so the failure mode is a bounded leak, not corruption."""
-        if not self._pending_abort_acks:
+        if not getattr(self, "_pending_abort_acks", None):
             return
         if now is None:
             now = time.time()
