@@ -101,8 +101,16 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   asymmetric path via different structure is OPEN (prefetch-ctl continuing).
   Teach-in: reviewing reviewer MUST chase overridden methods up the MRO before
   accepting "no sync exists" claims on subclass code paths.
-- storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
-  fails at clean HEAD — bug vs env artifact (prefetch-ctl-audit).
+- ~~storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
+  fails at clean HEAD~~ — ENV ARTIFACT (prefetch-ctl-audit root-caused):
+  65-char sandbox hostname breaks gloo unix-socket paths ("File name too
+  long"). `hostname scpu` before multirank CPU-gloo tests; suite passes 10/10
+  after. Also explains test_prefill_result_polling, test_specv2_kvcache_offloading.
+- C5 (NEW, pre-existing HEAD): test_pp_prefetch_ticket::test_allocation_error
+  _preserves_ack_sequence_and_next_ticket fails — sidecar host-pool alloc error
+  (KeyError PoolName.SWA) on a PP-broadcast ticket leaves the op NOT terminated
+  and KV staging UNFREED. Genuine leak-path candidate (PP>1 + SWA + hicache
+  config). Assigned: prefetch-ctl-audit.
 - T3 (low): graceful shutdown doesn't drain ongoing_offload before host-pool
   destroy (deferred).
 - B2 (note): flush_cache idle-gate misses ongoing_backup; reset() 10s raise
