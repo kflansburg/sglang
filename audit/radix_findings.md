@@ -32,11 +32,36 @@ Production lens: disaggregated prefill/decode everywhere, page-size 64, fp8 e4m3
 8. **SCHED retract/capacity under-estimate by 1 page for committed≡63 (mod 64) under overlap** (#16,
    agent/radix-sched, APPROVED by radix-lead; crash-class under memory pressure).
 
-## CLEAN VERDICTS (need challengers where marked)
+## CONFIRMED + FIXED (cont. / challenge-round update)
 
-- **Unified cache checkpoint_into_tree NOT vulnerable to the shrink class** (fail-stop: assert bans
-  ≥1-page shrink; only request-owned <1-page tail can shrink). Independently traced twice
-  (hicache-lead msg #637, decode-offload-audit #586). Challenger: radix-sched assigned, pending.
+9. **Unified checkpoint_into_tree multi-page shrink on trimmed finish** (#59, agent/radix-lead fcdd7d5,
+   in review w/ unified-auditor). The "assert tolerates <1-page shrink" presumption breaks on
+   strip_thinking_cache held-reasoning models: owned_kv_len == prompt while decode-time checkpoints
+   already pushed protection into generation → assert crashes scheduler; under python -O it silently
+   shrinks + frees tree-owned rows (exact #38 mechanism, unified flavor). Fixed: skip insert when
+   page_aligned_len <= cache_protected_len; components get documented 'no insert happened' cleanup.
+   Regression: test_unified_checkpoint_shrink.py (baseline: exact AssertionError fires).
+   PREVIOUS VERDICT "NOT VULNERABLE" WAS WRONG (challenger radix-sched, msgs #721/#981).
+- **lock_sever hardening** (agent/radix-lead d966186): evict() severs evicted nodes; inc/dec_lock_ref
+  assert attachedness — stale-handle underflow becomes a loud crash, not silent corruption.
+- **TLru-on-legacy startup guard** (10744f3): eviction_policy="tlru" on legacy RadixCache now
+  ValueError at cache construction instead of AttributeError inside the eviction loop under pressure.
+
+## CLEAN VERDICTS
+
+- Page-alignment contract (radix-sched): match/insert page-align → protected page-aligned →
+  free_kv_row start-alignment safe at HEAD in the non-disagg path.
+- Scheduler stale-lock skip-paths enumeration (radix-sched, #radix #907): all init_next_round_input
+  callers audited — no path reaches lock()/unlock() on a node evicted between match and lock;
+  chunked carries checkpoint lock; disagg-decode-radix carries prealloc lock; buffer_pipeline
+  re-matches every iteration; dllm low-risk non-prod. Tree-side guards added anyway (see above).
+- DP-attention req_pool side (radix-sched): rank-local; double free crashes loudly.
+- Scheduler exception paths (#10): fail loud, no silent-corruption handlers.
+- EMB insert-vs-D2H race (radix-sched challenger): CLEAN — state machine + locks verified.
+- EMB mm hash-collision: NOT SOUND as a general claim for SHARED multi-tenant Mooncake stores
+  (64-bit keyspace, ~2^32 deliberate collision feasible; token-count validation doesn't defend a
+  store-populated poisoned entry). Single-tenant honest traffic = accepted risk; flagged for the
+  coverage report as a PRODUCT decision (option: 256-bit keys behind env for shared stores).
 - **Page-alignment contract** (radix-sched): match_prefix/insert produce page-aligned lens →
   cache_protected_len page-aligned → non-disagg free_kv_row start alignment safe at HEAD.
 - **DP-attention req_pool_indices**: rank-local pools; double-free crashes loudly. schedule_batch side clean.
