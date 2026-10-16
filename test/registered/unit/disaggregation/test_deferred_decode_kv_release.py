@@ -211,7 +211,10 @@ class WorkerFailureAbortScenarios:
 
         self._provoke_worker_failure(manager)
 
-        self.assertEqual(manager._staging_outstanding[self.room], 1)
+        # The fault handler balances the dequeue-time outstanding increment
+        # (0 remaining) while still poisoning the ack: a drain can never be
+        # claimed for a transfer whose state is unknown.
+        self.assertEqual(manager._staging_outstanding[self.room], 0)
         self.assertNotIn(self.room, manager._deferred_ack_targets)
 
         self._dispatch_abort(manager)

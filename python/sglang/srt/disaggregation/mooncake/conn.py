@@ -3202,9 +3202,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
+        worker_threads = getattr(self, "_transfer_worker_threads", None) or []
         if (
-            shard_idx < len(self._transfer_worker_threads)
-            and not self._transfer_worker_threads[shard_idx].is_alive()
+            shard_idx < len(worker_threads)
+            and not worker_threads[shard_idx].is_alive()
         ):
             # A dead worker means enqueueing here waits the full 300s waiting
             # timeout while the queue grows unboundedly. Fail immediately and

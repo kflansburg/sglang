@@ -53,6 +53,12 @@ def _manager(
     manager._sent = []
     manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._send_multipart_locked = MagicMock()
+    # F4 fault-isolation path touches these when concluding the faulted room.
+    manager.transfer_infos = {}
+    manager.req_to_decode_prefix_len = {}
+    manager.failure_records = {}
+    manager.failure_lock = threading.Lock()
+    manager.deferred_bootstrap = None
     return manager
 
 
@@ -94,15 +100,17 @@ class TestMooncakeAbortNotification(
         return _manager(status=status)
 
     def _provoke_worker_failure(self, manager) -> None:
+        # Post-F4 contract: a chunk-level fault no longer kills the worker;
+        # it poisons the deferred ack, fails the room, and keeps serving.
         manager.enable_trace = False
         manager.bootstrap_port = 8998
         manager._staging_outstanding = defaultdict(int)
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
         queue = MagicMock()
-        queue.get.return_value = _chunk()
+        queue.get.side_effect = [_chunk(), None]
 
-        with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
-            manager.transfer_worker(queue, MagicMock())
+        manager.transfer_worker(queue, MagicMock())
+        self.assertEqual(manager.request_status.get(self.room), KVPoll.Failed)
         manager.check_status = lambda room: manager.request_status[room]
 
     def test_generationless_abort_marks_failed_without_ack_or_warning(self):
