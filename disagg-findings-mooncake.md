@@ -237,3 +237,17 @@ Reference commit: 3420bae (origin/main at audit time).
   RETRACTED their _handle_aux_data edit (#44 now tests-only on
   agent/disagg-decode, 10 tests verified green against this branch).
   Merge order: #42 first, then #44 tests.
+
+## Backport notes (state truncation sites, for the local-patch team)
+- v0.5.14 mooncake/conn.py:1010-1026 — SWA/DSA leniency truncation (no exact-match
+  raises at all in .14? _requires_exact_state_index_match exists? see below);
+  same warn+truncate shape as HEAD pre-F6.
+- v0.5.15.post1: paged-state site at :1028-1044 (same as HEAD pre-F6) PLUS the
+  MiniMax branch unconditional truncation at :1075-1077 — the MiniMax branch is
+  present on HEAD too (~conn.py:2175-2185, MINIMAX_INDEX_K silently truncates on
+  any drift). MiniMax is not in our production matrix -> no HEAD fix shipped;
+  backport only if a MiniMax deployment appears. K3 (v0.5.16 proxy) per
+  version-triage: same two sites.
+- v0.5.14 has no MINIMAX branch.
+- All versions: kv_chunk truncation site (F2) at .14:1244 / .15p1:1298 / .17:1621
+  / HEAD:2558 -> my V5 fix cherry-picks (the surrounding loop is identical).
