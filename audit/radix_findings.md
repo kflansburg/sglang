@@ -111,3 +111,24 @@ Scheduler abort/retract/finish: radix-sched sweep complete modulo challenge roun
 
 Queue: #38 approved — submit pending env GO (plain python3 pytest format). #45 in review. #16 approved —
 radix-sched submits. EMB #13/#14/#15/#18: radix-emb resubmits at GO.
+
+## FINAL COVERAGE TABLE (radix-lane vs production surface, 2026-10-16)
+
+| Surface item | Lane verdict |
+|---|---|
+| Disaggregated prefill/decode abort/retract lifecycle (generic) | radix-sched: single release gate release_kv_cache; holds_kv assert; retract resets ownership atomically; all init_next_round_input skip-paths audited (pinned). Flagged disagg-specific (protected=total_prefix_len incl host-gap rows, bounded) → disagg lane. |
+| RadixCache checkpoint/release (#38) | CONFIRMED+FIXED (tests, approved; MR41). Trigger: disagg decode mid-generation checkpoint + trimmed finish. All prod tags. |
+| RadixCache lock_ref underflow / stale-handle classes (#45) | FIXED+GUARDS (tests, approved; MR41). Generic path unreachable at HEAD per enumeration; tripwires make it crash-loud if a future caller violates. |
+| lock-sever hardening (radix; hicache_Lens-adjacent free lists) | FIXED (tests, approved; MR41). |
+| TLru-on-legacy eviction-loop crash | FIXED (startup guard, tests; MR41). |
+| Unified checkpoint shrink (#59) | CONFIRMED+FIXED (tests, approved by unified-auditor; MR41). HEAD only (no unified checkpoint at v0.5.20). Component-cleanup equivalence verified; SWA same-page tombstone deferral accepted (bounded, freed at release). |
+| Retract decode capacity overlap off-by-one (#16) | FIXED (radix-sched; approved by radix-lead; MR40). Production: page 64 + overlap default. |
+| pinned/unpinned embedding controller (#13/#14/#15/#18 (shared-store pin-theft + FILLING leak + short-read-as-success), #36 wedge) | FIXED (radix-emb; approved by radix-lead; MR45 chained). v0.5.20+ for controller. Classic short-read boundary matches canonical predicate. |
+| Multimodal cache hash collision | NOT SOUND as written for shared multi-tenant Mooncake stores (64-bit key, ~2^32 deliberate collision practical; token-count validation doesn't defend store-populated entries). Single-tenant honest traffic: accepted risk — PRODUCT DECISION (option 256-bit keys behind env for shared stores). |
+| mm insert-vs-D2H race | CLEAN (challenged by radix-sched; state machine + locks verified). |
+| SWA/mamba on unified: COW/retract/eviction semantics | maintained by features/pools lanes via seam agreements; no radix-lane-owned findings; unified component lifecycles cross-checked during #59 review. |
+| DP-attention radix interactions | CLEAN rank-local pools; double-free crashes loudly (radix-sched). |
+| Spec/EAGLE/DSPARK draft KV interactions with radix tree | decode lock_ref suite (13/13) exercises retract/admission/abort/DRADIS/decode greedy/token paths post-guards; draft-KV specifics owned by features lane (seam). |
+| flush_cache / events.py | READ: CLI client + hash-recording paths; low memory-safety surface; no findings. |
+| RadixKey bigram edges | delegated probe (features Lens, backlog) — open ledger if Lens doesn't surface; no evidence of a writes-violations path today. |
+| pause/refusal desync (weight update over live batch) | RECORDED #70 (bigger protocol change; lead). |
