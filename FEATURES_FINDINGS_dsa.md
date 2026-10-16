@@ -207,3 +207,45 @@ Decisive code evidence (2026-10-16):
 - Consumers (:2330/:2379, forward_mha fp8 dequant) all read the same metadata field. Consistent.
 - aiter filter/translate is ROCm raw-layout compensation (576B vs 656B comment forward_mha.py:664-685).
 - Reported to unified-auditor (#756).
+
+## CANDIDATE R-1 (swa challenge, msg #768/#773): COMPACT ragged-verify cap=None last-row inflation
+- deepseek_v4_backend.py:1279 calls layout.padded_to_bucket(padded_bs=bs) with NO cap (COMPACT mode only),
+  feeding graph capture tiers; trtllm_mha:1149, trtllm_mla:1559, flashattention:3122 same.
+- PaddedToBucket (ragged_verify_kernels.py): leftover = graph_num_tokens - sum(verify_lens); when
+  num_pad_reqs == 0 (batch exactly fills the tier), leftover folds into the LAST REAL ROW.
+- Trigger: padded_bs == bs AND sum(ragged verify lens) < graph_num_tokens — happens with variable
+  draft acceptance in EAGLE/DSPARK where real per-req verify lens < num_draft.
+- Effect: last real request's verify window widened beyond num_draft into committed/future positions
+  → attention reads past drafted width (garbled verify for that request; committed-region reads,
+  NO cross-request page reads expected since same req's row).
+- NOT closed: swa's suspicion stands; the only-closed case is num_pad_reqs > 0 (phantom rows absorb).
+- Needed: downstream consumer check (verify mask/positions used by trtllm/dsv4 kernels for the last
+  row) + PoC: craft lens with sum < tier total, padded_bs == bs, watch last-row positions overstep.
+- Filed after re-verifying consumer paths; candidate, not confirmed (needs kernel-side check).
+
+## F-5 residual sub-verdict (#913): uninitialized host C4 read of radix-hit prefix — UNREACHABLE-by-construction
+- hisparse_coordinator.request_finished (:1417) zeroes full_to_hisparse_device_index_mapping over the
+  request's compressed allocated_locs at finish (kv_allocated_len basis, pre-release).
+- Consequently a decode-worker radix-hit prefix row's C4 mapping reads mapping==0 → host fallback via
+  the 0 sentinel (disagg-decode's PD note) rather than uninitialized host C4 rows.
+- Top-k/swap-in kernel inputs come from the device buffer built by alloc_device_buffer; unmapped
+  (0) prefix rows take the host path. No route reads uninitialized host C4 for the prefix.
+- Caveat (efficiency, not safety): finish-time zeroing destroys shared-prefix compression reuse
+  (later radix-hit requests re-derive/restore from host); note for coverage rollup only.
+- F-5 main: fixed by alloc-auditor #56 (approved by me), board #51 closed.
+
+## Q3 policy verdict (#931/#937): alloc_device_buffer else-branch fabricated continuation ids — keeps residual channel POST-F-5
+Mechanics (pools-lead proven): fabricate arange(hisparse[-1]+1 .. page end) claiming residual of the
+last kept page. Post-F-5: hisparse_indices = [prefix_vals(shared)..., fresh...]. If the request's
+fresh tail is empty (pure radix-prefix reuse), hisparse[-1] sits in a TREE-OWNED shared prefix page
+→ fabricated filler claims slots in a page the tree owns; buffer ownership bookkeeping
+(req_device_buffer ownership at request_finished) can then free that shared page's slots
+(all_hi path) = sibling of F-5 under the else branch.
+POLICY CALL (dsa): guard the fabrication on "last kept index belongs to a FRESH (non-prefix) page":
+if the kept run's tail derives from prefix_vals only, either skip fabrication (pad with the alloc'
+d device's real next page) or assert denseness. Cheapest implementation: keep prefix/fresh segments
+separate through the else branch (post-F-5 they are distinct) and only fabricate from fresh tail
+indices; falls back to whole-page alloc otherwise (rare: pure-prefix requests).
+pools hosts the mechanics change; assigned via message. Severity: same class as F-5 (cross-owner
+page release), but only when a request has ZERO fresh compressed slots at alloc_device_buffer time
+(full radix prefix hit + complete page alignment) — narrow but real on hi-share workloads.
