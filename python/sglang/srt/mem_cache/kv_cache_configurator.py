@@ -124,7 +124,11 @@ logger = logging.getLogger(__name__)
 
 
 def _assert_dcp_widened_ids_fit_int32(
-    *, max_total_num_tokens: int, attn_dcp_size: int, page_size: int
+    *,
+    max_total_num_tokens: int,
+    attn_dcp_size: int,
+    page_size: int,
+    loc_space_scale: int = 1,
 ) -> None:
     """DCP-WIDENED virtual KV ids must fit int32.
 
@@ -136,12 +140,13 @@ def _assert_dcp_widened_ids_fit_int32(
     cross-request context leakage). Failing at config time turns that latent
     corruption into a loud sizing error.
     """
-    widened_id_bound = max_total_num_tokens * attn_dcp_size
+    widened_id_bound = max_total_num_tokens * attn_dcp_size // loc_space_scale
     assert widened_id_bound < 2**31, (
         f"DCP-widened virtual KV id bound {widened_id_bound} exceeds the "
         f"int32 read-index/req_to_token limit (2^31): reduce "
         f"max_total_num_tokens (incl. page pad: {max_total_num_tokens}) or "
-        f"attn_dcp_size ({attn_dcp_size}) at page_size {page_size}."
+        f"attn_dcp_size ({attn_dcp_size}) at page_size {page_size} "
+        f"(loc_space_scale={loc_space_scale})."
     )
 
 
@@ -526,11 +531,15 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens *= loc_scale
 
         # DCP-WIDENED virtual ids must fit the int32 req_to_token / read-index
-        # buffers (see _assert_dcp_widened_ids_fit_int32).
+        # buffers (see _assert_dcp_widened_ids_fit_int32). `max_total_num_tokens`
+        # here already carries loc_scale (draft replicated; target 1), so the
+        # write-side widened space is * dcp / loc_scale -- the mirror of
+        # logical_token_capacity's derivation.
         _assert_dcp_widened_ids_fit_int32(
             max_total_num_tokens=max_total_num_tokens + self.page_size,
             attn_dcp_size=get_parallel().attn_dcp_size,
             page_size=self.page_size,
+            loc_space_scale=self.loc_space_scale,
         )
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's

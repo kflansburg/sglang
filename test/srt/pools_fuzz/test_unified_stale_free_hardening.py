@@ -68,6 +68,36 @@ class TestStaleFreeHardening(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 alloc.free(tok)
 
+    def test_default_mode_stale_free_stays_sync_free_and_unfiltered(self):
+        """Pin the production default-mode contract on _free_lazy:
+
+        With no debug flags the free path must (a) perform NO host sync (the
+        item/unique ban), and (b) NOT filter the stale -1 -- the guard layers
+        downstream (kernel store guards, idle byte-accounting value checks)
+        are the documented catches. A future "always filter" change would
+        either re-introduce the host sync test_unified_free_no_host_sync bans,
+        or change accounting semantics; this fails on both.
+        """
+        assert not os.getenv("SGLANG_DEBUG_MEMORY_POOL")
+        assert not os.getenv("SGLANG_ENABLE_ASYNC_ASSERT")
+        alloc = build_swa_pool(page_size=4)
+        full = alloc.full_attn_allocator
+        tok = alloc.alloc(16)
+        # `.item()` is the sync must be disclosed on; `torch.unique` is allowed
+        # on the token-free path (pre-existing page-rep dedup, see _free_lazy).
+        # An "always filter" change NEEDS a value read of freed_p_pages -> .any()
+        # -> item, so banning item fails exactly the regression we pin.
+        with mock.patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+        ):
+            alloc.free(tok.clone())
+            alloc.free(tok)  # caller bug: same ids twice
+        holes = full._free_phys_pages.tolist()
+        assert any(h == -1 for h in holes), "default mode must admit the stale -1"
+        assert full.live_page_count < 0
+        viol = full._byte_accounting_violations()
+        assert any("out-of-range hole" in v for v in viol), viol
+
     def test_idle_verifier_reports_injected_stale(self):
         # Simulate pre-patch state to prove the new value checks are not blind
         # where the old count identity was.

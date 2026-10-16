@@ -1407,12 +1407,24 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         SYNC POLICY: the free paths are host-sync-free zones (asserted by
         test_unified_free_no_host_sync), so in production this installs only
         the no-sync ``SGLANG_ENABLE_ASYNC_ASSERT`` tripwire (fires at the next
-        sync point) and relies on the store guards in virtual_slot.py (the
-        stale -1 can no longer write OOB; a stale hole handed out later makes
-        ``bind`` a no-op with v2p[v] left -1 = unbound, never an OOB index).
-        Under ``SGLANG_DEBUG_MEMORY_POOL`` it pays one ``.any()`` sync and
-        filters + raises like the eager path. The idle verifiers catch the
-        values either way.
+        sync point) and relies on the store guards in virtual_slot.py. The
+        guards guarantee: NO OOB write into the p2v table at p=-1 (was a raw
+        8B-below-table store on Triton / index_fill_ -1 wrap on CPU), and NO
+        tombstone wrap of p2v[last]; a later handout of a stale hole makes
+        ``bind`` a no-op with ``v2p[v]`` left -1.
+
+        RESIDUAL (default prod config, probes env-gated): that request's
+        translate still yields physical -1 for its virtual id, and WRITE
+        kernels (``write_cache/update_cache_legacy`` and the sink-clamped
+        ``write_cache_virtual``) take unmasked phys ids from ``req_to_token``
+        raw -1 / sink-clamped 0 -- a wrap/-0 write can corrupt a neighbor row
+        until a probe (``SGLANG_ENABLE_ASYNC_ASSERT``, idle verifiers) or the
+        caller stops it. So a double-free in default config is still a
+        wrong-site WRITE risk via the consuming request, unchanged by this
+        filter; the guaranteed wins are the table-write ones above. Under
+        ``SGLANG_DEBUG_MEMORY_POOL`` this filter pays one ``.any()`` sync and
+        raises exactly like the eager path; the idle byte-accounting
+        verifiers catch the hole/live values regardless of mode.
         """
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             torch._assert_async(

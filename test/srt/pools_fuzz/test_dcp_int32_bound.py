@@ -53,6 +53,32 @@ class TestDcpInt32Bound(unittest.TestCase):
                 max_total_num_tokens=2**31 - 1, attn_dcp_size=2, page_size=64
             )
 
+    def test_loc_space_scale_unwinds_draft_widening(self):
+        # Draft sizes already carry the dcp factor via loc_space_scale: a
+        # config that fits must NOT refail when loc_scale divides it back.
+        # 512M per-request tokens * dcp 4 fails raw, passes with loc_scale=4.
+        with self.assertRaises(AssertionError):
+            _assert_dcp_widened_ids_fit_int32(
+                max_total_num_tokens=2**31 - 1,
+                attn_dcp_size=2,
+                page_size=64,
+                loc_space_scale=1,
+            )
+        _assert_dcp_widened_ids_fit_int32(
+            max_total_num_tokens=2**31 - 1,
+            attn_dcp_size=2,
+            page_size=64,
+            loc_space_scale=4,
+        )
+        # But the exact same division still fails when the result is ≥ 2^31.
+        with self.assertRaises(AssertionError):
+            _assert_dcp_widened_ids_fit_int32(
+                max_total_num_tokens=2**32,
+                attn_dcp_size=4,
+                page_size=64,
+                loc_space_scale=4,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
