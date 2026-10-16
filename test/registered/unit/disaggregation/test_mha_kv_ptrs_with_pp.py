@@ -18,8 +18,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from types import SimpleNamespace
 
+# NOTE: keep the import surface minimal — sglang.test.test_utils pulls the
+# benchmark/datasets chain, which is not part of the CPU test env.
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.test.test_utils import CustomTestCase
 
 
 def _mgr(num_draft_entries: int, start_layer: int = 0, end_layer=None, total_layers: int = 0):
@@ -43,7 +44,7 @@ def _ptrs(M: int, D: int, tag: str):
     )
 
 
-class TestGetMhaKvPtrsWithPP(CustomTestCase):
+class TestGetMhaKvPtrsWithPP(unittest.TestCase):
     def test_prefill_no_draft_decode_draft_multiple_of_main(self):
         # THE bug shape: M=4 main, D=4 draft on decode only.
         src = _ptrs(4, 0, "s")

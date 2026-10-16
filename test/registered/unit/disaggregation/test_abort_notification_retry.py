@@ -17,9 +17,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+# NOTE: keep the import surface minimal — sglang.test.test_utils pulls the
+# benchmark/datasets chain, which is not part of the CPU test env.
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-from sglang.test.test_utils import CustomTestCase
 
 
 class _ConcreteReceiver(CommonKVReceiver):
@@ -39,6 +40,7 @@ def _receiver(num_ranks: int, fail_ranks: set):
     receiver._abort_notify_failed_ranks = []
     receiver._abort_notify_attempts = 0
     receiver._abort_notify_next_retry_ts = 0.0
+    receiver.init_time = 1.0
     receiver.conclude_state = None
     receiver._owns_bootstrap_room = True
     receiver.kv_mgr = SimpleNamespace(
@@ -49,6 +51,7 @@ def _receiver(num_ranks: int, fail_ranks: set):
         record_failure=Mock(),
         update_status=Mock(),
         check_status=Mock(return_value=KVPoll.Transferring),
+        register_deferred_abort_room=Mock(return_value=3),
     )
 
     sent = []
@@ -78,7 +81,7 @@ def _receiver(num_ranks: int, fail_ranks: set):
     return receiver
 
 
-class TestAbortNotificationRetry(CustomTestCase):
+class TestAbortNotificationRetry(unittest.TestCase):
     def test_failed_sends_are_retried_and_eventually_succeed(self):
         # Rank 1 fails once, then recovers.
         receiver = _receiver(num_ranks=3, fail_ranks={1})
