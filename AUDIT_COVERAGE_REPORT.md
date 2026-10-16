@@ -54,6 +54,39 @@ Product-decision flags: multi-tenant shared Mooncake store with deliberate 64-bi
 
 ---
 
-> ASSEMBLED FROM LEAD'S PARTS; marker kept until final.
-## FREEZE-GATE: <pending>
-(Registered CPU-suite sweep on the shared env @ dev HEAD bed816b — totals land here.)
+## Load-bearing local patches (keep these when bumping versions)
+Eight classes where your local patch is what actually protects the fleets on v0.5.14–v0.5.20; the upstream fix exists only at HEAD/main post-audit. Losing any of these in a version bump REINTRODUCES the bug. Per-tag status + apply order: `hotfix/README`-family READMEs; the table of record is board #4 (mirrored in `audit/version_triage_matrix.md`).
+1. **Deferred decode KV release (CLASS-1 / V4 family)** — absent in all tags before ~v0.5.20 (the code point isn't safely backportable to pre-.20 in one patch; the fleet choices are: keep local patch / wholesale-backport the .20 machinery / accept the risk). Decision table on board #4.
+2. **Retract+SWA-offload drain guard (CLASS-5)** — patches ×5 under `hotfix/CLASS-5.*` (incl. a true .16 shape, not a clone).
+3. **DSA tail req_pool** — already fixed in ALL production versions upstream; your local patch is redundant but harmless.
+4. **NIXL invalidated-peer reload** — upstream fix (fine-grained connect-retry on get_new_notification) is sound and present at HEAD; local patch redundant on .20+, needed on older.
+5. **HiCache host reclaim order / C4 hi_mamba MIN asymmetry (FF-1)** — hotfix C4-MAMBA-MIN ×4 tags.
+6. **RadixCache.checkpoint shrink** — hotfix `hotfix/38.*` ×5 tags. (Most urgent single patch in the kit: this is a fatality-class tree UAF.)
+7. **Mooncake short reads (4 sites)** — hotfix MC-SHORTREAD ×5 + EMB family.
+8. **Host-pool free/SENTINEL guards (H-F1/H-F2)** — hotfix H-FREEGUARDS ×5.
+Plus F-1 mamba COW ×5, F-4 SWA alloc_decode ×5, F-5 hisparse ×5, F15 draft-V ×4, FF-1, R-1, the disagg V-family (V2/V3 aux + V5/V6/V7 mooncake + F6/F12 wire).
+
+## Residuals and open items (signed, with owners)
+1. **R-1 kernel clamp backport (OPEN, partial cover):** hotfixes ship the COMPACT-shape gate but the triton kernel fold's uncapped branch under K3/.16 GPU fleets is only fixed by the #68/#69 merged kernel clamp; backporting that kernel clamp is one focused patch that has not been produced (features-lead can generate it on demand; hours-scale). The DATA exposure is read-only cross-request (no writes), bounded to COMPACT+full-tier+variable-lens.
+2. **K3 vendor-fork verification (needs your side):** K3 SHAs (87dd4596, bd4828e2) are not fetchable from public upstream. Every K3-row in the matrix is from the public v0.5.16 base; files the fork rewrote are flagged UNVERIFIABLE-FROM-UPSTREAM in the matrix. Apply-check each hotfix patch against the fork locally (READMEs include per-tag shape-check guidance; the .16 proxy patches are the right starting point for most).
+3. **Tokenizer pause-ack / weight-update gate (#57/#58/#70, design change, deferred):** pause_generation sets is_pause tokenizer-side before fire-and-forget dispatch; if the scheduler refuses a retract-mode pause (post-B1 this is possible on a D2H wedge), a later weight update proceeds over a live unretracted batch. Today mitigated by a CRITICAL log; the fix is a scheduler→tokenizer ack/nack. Owner for next wave: scheduler lane; risk window narrow (needs decode-KV-offload + wedge + operator sequence).
+4. **F18 bootstrap availability-side (parked):** register-before-receive gate on prefill origin side; no per-tag hotfix (availability, not corruption). Documented.
+5. **test_unified_radix_cache_unittest suite registry hygiene** (pre-existing; non-CPU test parked in the CPU registry list + 10-minute matrix, flagged; fix = module-level skip marks; not a main blocker).
+6. **test_two_rank_completion_capacity_and_anchor_loss** fails when the sandbox hostname is 64 chars (gloo unix-socket sun_path overflow); fix = tcp rendezvous (one-line, hicache-lead owns the suite). Workaround meantime: `hostname sgc`.
+7. **RadixKey bigram micro-edge probe** (delegated probe, deferred on resource grounds; low prior).
+8. **Multi-tenant shared-store embedding-hash hardening** (product decision): 64-bit blake3-collision is reachable by a deliberate attacker (~2^32 work) against a SHARED Mooncake embedding store; single-tenant accepted; if you ever share, upgrade to 256-bit keys (patched key_format switch commented in embedding_store.py on dev).
+
+## Deliverables map (all on `main` after this merge, under one checkout)
+- Fix commits: merged via dev queue; per-fix SHAs in each `audit/*_findings*.md` and the team manifests (board #1–#6 notes).
+- Regression tests: `test/registered/unit/mem_cache/` (SWA/mamba/unified/checkpoint/short-read/host-pool/pp-ticket...), `test/registered/unit/disaggregation/` (V-family + F12/F15/F20/F21 + drain), `test/srt/pools_fuzz/` (pools adversarial), plus smoke/witness PoCs under `audit/repros/`.
+- Findings docs (24): `audit/*.md` — per-team ledgers with per-bug mechanics, reproduction commands, challenge trail.
+- Version matrix: `audit/version_triage_matrix.md` (also board #4).
+- Hotfix kit: `hotfix/` — 110 files, ~17 families × production tags, per-family READMEs (apply commands, per-tag shape adapters, K3 notes, regression refs). All git-apply-verified; ~20 independent spot-verifications.
+- This report: `audit/AUDIT_COVERAGE_REPORT.md`.
+
+## Freeze-gate (final gate before dev→main)
+Scoped sweep of every audit-touched test file (mem_cache + disaggregation registries + wave-touched files elsewhere — 235 files) at dev HEAD on a fresh sandbox with the plain command (`PYTHONPATH=python python3 -m pytest <file> -q`):
+FREEZE-GATE: <pending — to be filled when the sweep completes>
+
+## Known limitations of method
+CPU-only harness: races are demonstrated at the lock/ownership/event level rather than on hardware timing; the RDMA paths are exercised through the test-hook transfers and byte-level simulations, not NIC hardware. GPU-specific kernel-path bugs (e.g. the remaining R-1 kernel clamp backport) are out of reach of the harness and are called out where partial. The K3 fork's private deltas are unreachable; K3 rows are correctly labeled as base-proxied. SWA+decode-KV-offload configuration --disaggregation-decode-enable-offload-kvcache with hierarchical cache + SWA fails a server-args assert on unmodified upstream main — your deployment necessarily runs the K3-era or locally-patched validation; the retract-drain fix family assumes that patched validation.
