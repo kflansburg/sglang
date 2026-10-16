@@ -98,6 +98,44 @@ class TestStaleFreeHardening(unittest.TestCase):
         viol = full._byte_accounting_violations()
         assert any("out-of-range hole" in v for v in viol), viol
 
+    def test_multi_page_shrink_shape_is_contained(self):
+        """board #59 route: unified cache's own shrink guard tolerates <1
+        page; a production-shaped trim (strip_thinking finish + mid-generation
+        unified checkpoint) can shrink k>1 PAGES, freeing tree-owned rows and
+        later double-freeing them under -O (silently). Allocator-level clone
+        of the containment test with a k-page burst: free(v) (k pages) ->
+        realloc -> burst stale free of k pages."""
+        assert not os.getenv("SGLANG_DEBUG_MEMORY_POOL")
+        assert not os.getenv("SGLANG_ENABLE_ASYNC_ASSERT")
+        alloc = build_swa_pool(page_size=4)
+        full = alloc.full_attn_allocator
+
+        k_pages = 4
+        toks_a = alloc.alloc(k_pages * 4)
+        toks_b = alloc.alloc(k_pages * 4)
+        v_a_pages = [int(t) // 4 for t in toks_a]
+        v_b_pages = [int(t) // 4 for t in toks_b]
+        # shrink frees superset: tree-owned rows spanning both allocs.
+        alloc.free(torch.cat([toks_a, toks_b]))
+        # pages hand out to new owners...
+        toks_c = alloc.alloc(8)  # 2 pages
+        toks_d = alloc.alloc(8)
+        # ...then the tree's eviction frees the SAME rows again.
+        alloc.free(torch.cat([toks_a, toks_b]))
+
+        for t in list(toks_c) + list(toks_d):
+            assert full.virtual_to_physical[int(t) // 4].item() >= 0, (
+                "new owners' bindings must survive the stale burst free"
+            )
+        holes = full._free_phys_pages.tolist()
+        seen = set()
+        dups = [h for h in holes if h in seen or seen.add(h)]
+        assert not any(d == d and d >= 0 for d in dups), (
+            f"physical page handed out twice after multi-page stale free: {dups}"
+        )
+        viol = full._byte_accounting_violations()
+        assert any("out-of-range hole" in v for v in viol), viol
+
     def test_pre_radix38_checkpoint_shrink_shape_is_contained(self):
         """Historical caller class for F0: the pre-#38 RadixCache.checkpoint
         shrink made release_kv_cache free rows the TREE still owned, and the
