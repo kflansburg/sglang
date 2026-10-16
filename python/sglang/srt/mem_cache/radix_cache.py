@@ -516,6 +516,16 @@ class RadixCache(BasePrefixCache):
         key_limit = (
             ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
         )
+        # cache_protected_len is monotone: publishing a shorter key than the
+        # tree already owns for this request would shrink cache_protected_len
+        # backwards, letting release_kv_cache free rows the tree still
+        # references (e.g. disagg-decode checkpoints advance protection into
+        # generated output, and a stop-matched finish trims owned_kv_len back
+        # below it). Skip the no-op checkpoint instead.
+        key_len = len(token_ids) if key_limit is None else min(key_limit, len(token_ids))
+        aligned_len = key_len // self.page_size * self.page_size
+        if aligned_len <= req.kv.cache_protected_len:
+            return
         radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True
         )
