@@ -1,10 +1,14 @@
-"""Regression PoC for candidate C1: a wedged Mooncake batch_get wedges the
-EmbeddingCacheController's single _io_loop; its FILLING entries' pages are
-never freed and are un-evictable, permanently shrinking the pool, and the
-content hash becomes a permanent cache miss (dedup keeps the FILLING entry).
+"""Invariant pin for the C1 embedding-prefetch wedge finding (verifier: spec).
 
-Current code FAILS the pool-recovery assertions; it passes once a cancel /
-deadline path frees timed-out FILLING entries.
+Originally the leak PoC: a wedged Mooncake batch_get wedged the controller's
+single _io_loop, leaking FILLING pages and permanently deduping the content
+hash. The shipped fix (board #36, agent/radix-emb) resolves it with a
+worker-thread deadline + late-op drain; per the do-not-free-in-flight rule
+(from the 30s-RDMA class), pages of a late op are freed only after the
+backend call returns. This test now PINS the shipped invariants that hold at
+the moment of a live wedge: FILLING entries are un-evictable and the same
+hash dedups (liveness-only misss until resolution). If a future cancellation
+API appears, the alternate branch asserts freeing.
 """
 
 import threading
