@@ -95,6 +95,12 @@ real enough to add detection on the base but missed the overrides.
 **Versions affected:** v0.5.14 (all pools, silent); v0.5.15.post1, ~v0.5.16/K3,
 v0.5.17, v0.5.20, HEAD (mamba/DSv4-paged/logical pools silent; MHA/MLA/unified
 pools crash-loud). Kimi K3 branch uses MambaPoolHost → exposed.
+(version-triage independently verified all of the above by fetching tags incl.
+v0.5.16: base guard only exists .15p1+; all three override frees unguarded on
+EVERY tag. CHERRY-PICK NUANCE: at v0.5.14/.15p1 MambaPoolHost and
+DeepSeekV4PagedHostPool live in mem_cache/memory_pool_host.py; at v0.5.20+
+mamba moved to pool_host/mamba.py while DSv4/Logical stayed in
+memory_pool_host.py — prod backports of the fix need both file paths.)
 
 **Suggested fix:** move the slot_used bookkeeping into a shared helper
 (HostKVCache mixin) used by every override: set bit in alloc, assert+clear in
