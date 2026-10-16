@@ -201,18 +201,26 @@ returned (release_transfers in group.py does exactly this). A caller freeing
 only need_size elements would leak the rounded tail permanently (capacity
 leak, not corruption). Not found in-scope.
 
-### F5. [SUSPECT -> handed to controller-owner] Unified page-envelope pool:
+### F5. [CLEAN — resolved by two independent traces] Unified page-envelope pool:
 mooncake store L3 IO uses raw physical ptrs WITHOUT layout lease.
 UnifiedPageEnvelopeHostPool.get_page_buffer_meta (unified.py:1065) resolves
 physical addrs under lock but returns raw ptrs; the mooncake store
 (mooncake_store.py:1075,1139,1152) then issues RDMA set/get on those ptrs
 with NO acquire_layout(). If _compact() runs while that IO is in flight,
 physical pages move -> RDMA reads/writes the wrong host page (cross-request
-leak / corruption). Mitigant: compaction is allocator-thread (scheduler)
-synchronous; mooncake batch_set/get must be ASYNC for overlap to exist.
-Needs controller-side verdict: is storage IO synchronous on the scheduler
-thread, or deferred? (cache_controller/storage op queues - outside my
-scope; hicache-lead to route.)
+leak / corruption). RESOLVED CLEAN by independent traces from prefetch-ctl-audit and
+mooncake-audit (2026-10-16): (1) mooncake batch_get_into/batch_put_from are
+SYNCHRONOUS per the per-key byte-count return contract — no async RDMA
+outlives the call; (2) unified pools pair only with HybridCacheController
+(unified_radix_cache.py:285), whose _page_transfer/_page_backup wrap ALL
+mooncake L3 calls in mem_pool_host.layout_lease()
+(hybrid_cache_controller.py:1481/1567); (3) _begin_compaction blocks on
+_layout_users and syncs _pending_transfer_events (which l2_transfer posts);
+(4) plain HiCacheController (no layout_lease) pairs only with
+non-compacting plain MHA/MLA pools. Residual hardening idea (mooncake-audit):
+assert base HiCacheController host pools don't require layout leases so a
+future base+unified pairing can't silently recreate the hole. So: NOT
+exploitable in shipped pairings.
 The L2 device-side transfer path DOES lease correctly
 (l2_transfer.py:103-128 + per-release finish events; event overwrite for
 same transfer_key is SAVED by same-stream ordering: the last recorded
