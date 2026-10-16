@@ -55,13 +55,43 @@ slice-dst dlists per head_group). Siblings / residual gaps below.
   the check → `return None` race is benign here but `handle_staging_rsp(waiting_req_bytes,
   self.transfer_infos)` (line 3232) passes the live dict to a handler with no snapshot.
 
-### F5. `_handle_abort_notification` / decode prealloc path — to be finished reading.
+### F4 (confirmed at code level). Deferred-ACK predicate treats "popped" as "drained"
+- transfer_worker top-of-loop (1250): chunk for a cleared room pops
+  `self._staging_outstanding.pop(room, None)` then calls `_maybe_ack_drained_abort(room)`
+  (_staging_outstanding is a defaultdict; the increment at 1261 only happens AFTER this check).
+- If an ABORT already queued this room as Failed (so the counted, uncountered, or about-to-be-
+  counted chunks are skipped at loop top), each skip pops the counter; the FIRST such pop
+  drops any count contributed by a sibling counted chunk that is *actually still in flight*
+  (e.g. re-enqueued via staging defer — `staging_deferred` re-queues the counted chunk onto
+  the same queue, see 1484-1490/2988). `_maybe_ack_drained_abort` then sees outstanding==0 and
+  fires the ACK, telling decode its KV slots are free while the deferred chunk's NIXL WRITE may
+  still target them → later reuse hands those slots to another request, and the in-flight RDMA
+  writes OLD KV over the new request's pages → cross-request corruption.
+- Reachability requires: deferred release on + a counted chunk re-enqueued as staging_deferred
+  + room cleared while it sits in the queue + another skipped chunk popping the count before
+  the re-enqueued one drains. The `staging_counted` flag suggests the author intended dequeue-
+  time idempotence but the pop at loop top(/bottom, 1549) breaks the invariant.
 
-### F6. Notification parsing uses `split("_", 8)` with assumptions about agent_name containing
-underscores — a `room` or tag with unexpected content throws ValueError inside
-`update_transfer_status` (runs on decode's update thread); unhandled exception kills that loop /
-(or if caught, drops all remaining notifications in the batch → lost completion signals →
-timeouts). Need to confirm caller's exception handling.
+### F5. `_handle_abort_notification` status flip races the worker's settle barrier
+- Bootstrap thread marks room Failed immediately on ABORT (3175-3187); a worker currently in
+  `_await_handles` for that room is unaffected and later ALSO calls conclude_failure — benign
+  double-notify path exists (`conclude_state` dedup in sender poll). OK.
+- But `request_status` check uses `.get(..., KVPoll.WaitingForInput)` (723): an
+  abort for a never-seen room registers a failure_record that is never cleaned
+  (`failure_records.pop` only in failure_exception) → **slow memory leak of failure records**
+  for garbage/attacker rooms on the ZMQ bootstrap socket. Minor.
+
+### F6. Notification parsing — no unhandled-exception kill; update_transfer_status called only
+from NixlKVReceiver.poll:3517, and malformed UTF-8/int raises propagate up through poll into
+the decode scheduler's exception path (room fails). Batched notifications after the bad one in
+the same `get_new_notifs()` map are lost → later chunks time out rather than complete cleanly.
+Low severity (requires malformed peer).
+
+### F7. `send_kvcache_staged` bounding: `dst_write_ptr = dst_staging_ptr + rank_offset` with
+`rank_offset` and `per_rank_bytes` computed entirely from local params; only
+`dst_staging_size < total_staging_needed` checked, but rank_offset+per_rank_bytes vs
+total_staging_needed consistency depends on compute_staging_layout correctness
+(common/staging_buffer.py — cross-check belongs to whoever owns that file).
 
 ## Known-bug verification status (upstream main)
 - NIXL reload of invalidated peer: FIXED upstream (lines 1671-1709) — but see F1 (fix itself is racy).
