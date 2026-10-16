@@ -245,3 +245,14 @@ garbling found. SGLANG_USE_HND_KVCACHE + CPU offload is assert-rejected
 - MR #7 (F-4) in merge queue.
 - Backport patches for v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 (awaiting
   features-lead's preference: findings-file reference diffs vs branches).
+
+## retract->offload->resume scheduler-e2e conservation (board #39)
+Registered CPU test test_swa_retract_offload_cycle.py pins the whole
+production decode flow against the real allocator: tail-prealloc admit,
+window eviction via free_swa_segment at the page-aligned frontier
+(committed - max(window, ps)), retract with the get_cpu_copy mask, fresh
+tail prealloc on resume, restorable intersection, repeated cycles.
+Result: conservation exact at every phase; mapping always coherent; no
+bleed over 5 cycles. The SWA+offload retract guard class is CLEAN at
+HEAD as seen from the allocator; the earlier static verdict now has a
+runtime pin.
