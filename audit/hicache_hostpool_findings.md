@@ -39,10 +39,13 @@ github.com/sgl-project/sglang for archaeology.
   a -1 page_offset — sibling of F2 via the storage-key path, not only free().
 
 ### K3 branch check
-git fetch of bd4828e2 from public upstream fails (branch not public) —
-K3-version archaeology for F1/F2 is "assume affected": MambaPoolHost
-overrides match the v0.5.17 archetype, which precedes/accompanies the K3
-base (~v0.5.16).
+git fetch of bd4828e2 from public upstream fails (branch not public).
+version-triage then FETCHED v0.5.16 directly (2026-10-16 ~04:00) and
+verified line-by-line: v0.5.16 DeepSeekV4PagedHostPool.free +
+LogicalHostPool.free = `release_slots.append` with no guard; MambaPoolHost
+unguarded likewise — so the K3-production base (~v0.5.16) is CONFIRMED
+affected by F1 (and by F2, which has no bounds check on any tag).
+(No longer "assume affected".)
 
 ---
 
