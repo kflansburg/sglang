@@ -302,3 +302,37 @@ My V6 commit 33cf531 fixed the caller side (raise on !=0); the engine wrapper
 still logs+returns as before (only the caller policy changed). Backport: raise in
 register_buffer_to_engine on failure, do not touch the engine wrapper on the
 server-side (it's used for other purposes on NIXL paths too).
+
+## MERGED (wave 2, dev ac0f192)
+All mooncake fixes landed on dev via MR 47 (queue wave-2, after resolving the
+pre-existing F15 wire-test drift upstream of my merge):
+- #37 (V5+V6+V7): fail-loud dst/prefill KV index mismatch in transfer_worker;
+  fail-fast on transfer-engine registration; per-chunk fault isolation
+  (poison deferred ack, balance _staging_outstanding, conclude room Failed,
+  worker survives) + dead-shard enqueue refusal in add_transfer_request.
+- #41 (F6/V9): cap paged SWA/DSA/BLOCK_SCALE state index drift at 1 page
+  (documented accounting window), RuntimeError beyond; MINIMAX truncation
+  documented as out-of-prod unfixed.
+- #42 (F12): AuxDataCodec.deserialize_data_to_buffer bounds validation
+  (strict payload == item_len + buffer_index + geometry sanity; UNION with
+  #46's checks) + mooncake _handle_aux_data room-liveness + ValueError catch
+  + mori parity. Lands alongside decode's #44 handler-side validation (their
+  final union won the merge: handler-side bounds + codec defense-in-depth +
+  single room guard).
+- #55 (F3): teardown joins workers against a shared 45s deadline
+  (SGLANG_DISAGGREGATION_TEARDOWN_JOIN_TIMEOUT_S) and SKIPS memory
+  deregistration with a loud ERROR if any worker is still mid-transfer
+  (leak > UAF); MooncakeTransferEngine tracks registered (ptr,len) regions
+  so re-registration after a skipped dereg is idempotent.
+
+Dev-tip sweep green: 220 tests + 88 subtests (worker_resilience, wire,
+state_drift, aux_bounds, aux_data_bounds, teardown, pd_role_switch,
+deferred ×3 (mooncake+nixl+shared), timeout_hold, mha_kv_ptrs_with_pp).
+
+Cross-merge fixes contributed along the way:
+- common/conn.py:1647 getattr-compat for prefill_end_layer (F15 compat w/
+  SWA wire mocks; semantics = existing None-fallback).
+- test_disaggregation_wire single-entry SWA-ring case expects F15 geometry
+  message instead of per-layer K/V (same net rejection).
+- WorkerFailureAbortScenarios parametrizes expected_staging_outstanding per
+  backend (mooncake F4=0, nixl keeps counted=1).
