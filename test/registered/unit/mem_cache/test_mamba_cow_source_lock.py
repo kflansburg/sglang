@@ -235,5 +235,35 @@ class TestMambaCowSourceLock(CustomTestCase):
         self.assertEqual(self._mamba_lock(match.best_match_node), 0)
 
 
+    def test_release_kv_cache_early_mamba_no_kv_releases_lock(self):
+        """Catch-all (swa's counter-flow): a mamba-staged request released with
+        holds_kv == False (admission failed post-match; wait-queue abort) must
+        not leak the staged COW source lock — the early branch of
+        release_kv_cache returns before the pool-side free that otherwise
+        covers it. Also exercises the session-claim branch variant insofar as
+        the funnel is identical (both run clear_mamba_cow)."""
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        node_src = self._insert_node_with_mamba(SOURCE_TOKENS)
+        req, match = self._stage_cow(SOURCE_TOKENS)
+        self.assertIsNotNone(req.kv.mamba_cow_lock)
+        # Emulate the no-KV early path state: mamba allocated at staging,
+        # req_pool_idx still None (never row-allocated). release_kv_cache
+        # asserts (not holds_kv) == is_kv_released — the req property
+        # defaults respect that pairing on this test stub.
+        assert not req.kv.holds_kv
+        release_kv_cache(req, self.cache, checkpoint=False)
+
+        self.assertIsNone(req.kv.mamba_cow_lock)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(
+            self._mamba_lock(match.best_match_node),
+            0,
+            "catch-all missed: early-mamba release leaked the COW source lock",
+        )
+        self.assertEqual(self._full_lock(match.best_match_node), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
