@@ -19,7 +19,62 @@ github.com/sgl-project/sglang for archaeology.
 
 ## Findings (ranked)
 
-### F1. [SUSPECT] Missing double-free guard in subclass free() implementations
+### F1. [CONFIRMED] Double-free is silent corruption in subclass host pools (guards missing), incl. all pools on v0.5.14
+
+**Impact chain (repro below):** one double-free puts the same slot ids twice in
+`release_slots`; after `_merge_release_slots`, two `alloc()` calls return the
+same page → two live owners write/read one host KV buffer → cross-request KV
+corruption / context leakage. Completely silent (no assert, no log).
+
+The known-prod bug class "host pool free-list double free" was an upstream
+caller bug (e.g. evict + abort freeing the same host_indices). Response:
+- v0.5.14: base `HostKVCache.free` is `free_slots = torch.cat(...)` — NO lock,
+  NO guard. Double-free is silent for EVERY pool (MHA/MLA/mamba). v0.5.14 is
+  in production for Kimi K2.6/K2.7 and Gemma.
+- v0.5.15..HEAD: base `HostKVCache.free` (pool_host/base.py:555) got a
+  `threading.RLock` + `slot_used[]` assert detector. Base-pool double-frees
+  now crash loud instead of corrupting.
+- BUT the following subclass free()/alloc() OVERRODE the base and never got
+  the guard on ANY version incl. HEAD:
+  - `MambaPoolHost` mamba.py:389 (also no slot_used anywhere; own __init__
+    never creates it). Used by Kimi K3 hybrid mamba HiCache.
+  - `DeepSeekV4PagedHostPool` memory_pool_host.py:449. DSv4 production.
+    (`DeepSeekV4StateHostPool.free` raises NotImplementedError — no free
+    list — by design.)
+  - `LogicalHostPool` memory_pool_host.py:140. DSv4 anchor pool; its slots
+    are FULL-pool anchors: two owners of one anchor = two writers to one
+    unified full-KV region.
+  - `_SharedPageEnvelopeHostBacking.free` (unified.py:603) HAS its own
+    detector. OK.
+
+**Repro (verbatim class source exec'd; HEAD):**
+```
+PAGE=64; pool=LogicalHostPool(size=128,page_size=64)
+a1=pool.alloc(64); a2=pool.alloc(64)
+pool.free(a1.clone()); pool.free(a1.clone())   # double free
+b1=pool.alloc(64)                               # merge pulls a1's slots twice
+b2=pool.alloc(64)                               # b2 == b1's slots
+# b1 ∩ b2 == 64 slots  -> SILENT ALIASING CONFIRMED
+```
+Same repro textually applies to MambaPoolHost.free (mamba.py:389) and
+DeepSeekV4PagedHostPool.free (mph:449) — identical `release_slots.append`
+bodies with no guard.
+A parallel exec of base.py HostKVCache.free on HEAD raises
+`AssertionError: Double-free detected` — i.e., upstream considered the class
+real enough to add detection on the base but missed the overrides.
+
+**Versions affected:** v0.5.14 (all pools, silent); v0.5.15.post1, ~v0.5.16/K3,
+v0.5.17, v0.5.20, HEAD (mamba/DSv4-paged/logical pools silent; MHA/MLA/unified
+pools crash-loud). Kimi K3 branch uses MambaPoolHost → exposed.
+
+**Suggested fix:** move the slot_used bookkeeping into a shared helper
+(HostKVCache mixin) used by every override: set bit in alloc, assert+clear in
+free; logical_size-sized bool tensor per pool (~1 byte/slot). Or add the same
+asserts to the three overrides + LogicalHostPool.
+
+(legacy SUSPECT section kept for reference below)
+
+### F1-notes. Guard inventory used above
 Base HostKVCache.free (pool_host/base.py:555-566) has a `slot_used[]`
 double-free/double-alloc detector (added upstream between v0.5.14 (absent)
 and v0.5.15 (present); present in v0.5.20 and HEAD).
