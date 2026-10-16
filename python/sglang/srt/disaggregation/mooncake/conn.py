@@ -269,6 +269,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        # Transfer workers only, parallel to transfer_queues (PREFILL role):
+        # add_transfer_request refuses to enqueue onto a dead shard.
+        self._transfer_worker_threads: List[threading.Thread] = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -329,6 +332,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 t.start()
                 self._worker_threads.append(t)
+                self._transfer_worker_threads.append(t)
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -2851,12 +2855,50 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                if kv_chunk is not None:
-                    self.poison_deferred_ack_room(kv_chunk.room)
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # Fault isolation: a buggy chunk used to kill this daemon
+                # thread. Nothing restarted it, its queue kept growing, and
+                # every room hashing to this shard then hung until the 300s
+                # waiting timeout. Fail the chunk's room loudly and keep the
+                # worker alive so other rooms still progress.
+                logger.exception(
+                    "Mooncake transfer worker %d hit an error processing room "
+                    "%s; failing that room and continuing",
+                    worker_index,
+                    getattr(kv_chunk, "room", None),
                 )
+                if kv_chunk is None:
+                    # Failed before/while dequeuing (queue-level fault): the
+                    # outstanding accounting below cannot be repaired, so keep
+                    # the process loud rather than limp along.
+                    raise RuntimeError(
+                        f"Transfer queue failed: {e}. Prefill instance with "
+                        f"bootstrap_port={self.bootstrap_port} is dead."
+                    )
+                room = kv_chunk.room
+                # The transfer may be partially in flight; the drain ack must
+                # not fire for it.
+                self.poison_deferred_ack_room(room)
+                # Balance the dequeue-time increment so _staging_outstanding
+                # does not leak this room and block every later drain ack. The
+                # >0 guard skips the decrement when the exception fired AFTER
+                # the normal-path decrement (one chunk per room per worker).
+                if kv_chunk.staging_counted and self._staging_outstanding.get(room, 0) > 0:
+                    self._staging_outstanding[room] -= 1
+                    if self._staging_outstanding[room] <= 0:
+                        self._staging_outstanding.pop(room, None)
+                try:
+                    self.conclude_failure(
+                        bootstrap_room=room,
+                        failure_reason=(
+                            f"Mooncake transfer worker hit an unexpected error: {e}"
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to conclude room %s after transfer error", room
+                    )
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3105,6 +3147,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+
+        if (
+            shard_idx < len(self._transfer_worker_threads)
+            and not self._transfer_worker_threads[shard_idx].is_alive()
+        ):
+            # A dead worker means enqueueing here waits the full 300s waiting
+            # timeout while the queue grows unboundedly. Fail immediately and
+            # loudly instead (the per-chunk fault isolation in transfer_worker
+            # should make this unreachable).
+            self.conclude_failure(
+                bootstrap_room=bootstrap_room,
+                failure_reason=(
+                    f"Mooncake transfer worker for shard {shard_idx} is dead; "
+                    "refusing to enqueue"
+                ),
+            )
+            return
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
