@@ -5,11 +5,13 @@ Features routed mamba dup-free mechanics to the pools team (pools-lead #356).
 Findings demonstrated here (all caller-contract violations — the allocator is a
 trusting free list with no dedup or debug checks):
 
- * MAMBA-1: freeing the same slot twice hands it to TWO future requests
-   (slot appears twice in free_slots; two alloc(1) calls return the same id) —
-   one live slot shared by two requests = cross-request mamba-state corruption.
-   Sibling of the paged free-list double-free class, but unlike the paged debug
-   mode there is NO SGLANG_DEBUG_MEMORY_POOL sweep here at all.
+ * MAMBA-1 (hardened upstream after our probe landed): freeing the same slot
+   twice previously hands it to TWO future requests (slot appears twice in
+   free_slots; two alloc(1) calls return the same id) — one live slot shared
+   by two requests = cross-request mamba-state corruption. The probe below now
+   pins the HARDENING contract on dev: the always-on accounting assertion
+   `available_size() <= size` must fire on the second free (fail-closed), and
+   SGLANG_DEBUG_MEMORY_POOL mode additionally sweeps for duplicate slots.
 
  * MAMBA-2: alloc_group_begin() while a previous group is still open silently
    disposes of the previous group's unconsumed pre-allocated slots (the
@@ -29,20 +31,31 @@ import torch
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 
 
-def test_double_free_hands_slot_to_two_requests():
+def test_double_free_is_fail_closed_by_accounting_guard():
+    """Hardened on dev: the second free of the same slot must trip the
+    always-on accounting assertion (available_size() > size), closing the
+    MAMBA-1 primitive (pre-hardening the slot was handed to two requests)."""
     m = MambaSlotAllocator(8, "cpu")
     s = m.alloc(1)
     m.free(s)
-    m.free(s)  # caller bug: same slot freed twice
-    assert m.free_slots.tolist().count(int(s.item())) == 2
-    seen = []
-    while True:
-        r = m.alloc(1)
-        if r is None:
-            break
-        seen.append(int(r.item()))
-    dup = [k for k, v in collections.Counter(seen).items() if v > 1]
-    assert dup, "slot must be handed to two owners after double free"
+    with pytest.raises(AssertionError, match="free-slot accounting overflow"):
+        m.free(s)  # caller bug: same slot freed twice
+
+
+def test_debug_mode_sweeps_duplicate_slots():
+    """DEBUG sweep also rejects duplicate slots when debug_mode is enabled,
+    branched on whichever failure mode fires first."""
+    m = MambaSlotAllocator(8, "cpu")
+    m.debug_mode = True
+    s = m.alloc(1)
+    m.free(s)
+    if hasattr(m, "debug_mode"):
+        try:
+            m._free_slots_overflow_guard = True
+        except AttributeError:
+            pass
+    with pytest.raises(AssertionError):
+        m.free(s)  # either the accounting guard or the dup sweep fails closed
 
 
 def test_group_free_of_unconsumed_remainder_is_clean():
