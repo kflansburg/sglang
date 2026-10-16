@@ -3167,8 +3167,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in reqs:
             if req.kv.mamba_cow_src_index is not None:
                 # Gather the COW indices FIRST, then drop the source lock: the
-                # source slot must stay pinned while its index is fed to the
-                # forward-stream copy launch (F-1).
+                # source slot must stay pinned from staging-right-here-until-
+                # collect (F-1). Ordering dependency: "until collect" relies on
+                # collect and the subsequent copy-launch running on the SAME
+                # scheduler step as the batch prep that consumed this staged
+                # state — a cancellation interleaved between this collect and
+                # the forward launch would be a re-lock requirement (currently
+                # no such interleave exists; this method runs inline in
+                # prepare_for_extend/prepare_for_decode batch prep).
                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 clear_mamba_cow(req)

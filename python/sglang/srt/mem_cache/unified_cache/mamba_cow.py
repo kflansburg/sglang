@@ -6,9 +6,12 @@ slot. Without a lock the source node is evictable in the window and its slot
 can be reallocated to another request's state — the deferred read would then
 COPY ANOTHER REQUEST'S MAMBA STATE into this one (cross-request leakage).
 
-Only the MAMBA component is locked: the SWA/FULL slots of the same node do
-not alias the mamba source and must not be pinned (they would block ordinary
-KV eviction on the shared tree path).
+The lock covers ALL components of the source node — not MAMBA alone. The
+tree-core lock-hierarchy invariant (production sanity check,
+unified_tree_core.py:3006) requires full_lock >= ct_lock on every node, so a
+MAMBA-only pin is structurally illegal. Pinning the full node for the short
+staging->collect window is conservative but correct; the tier's plain
+prefix-LRU still evicts everything else.
 
 Clear paths must all funnel through ``clear_mamba_cow`` so the source lock
 cannot leak — a leaked lock pins the tree node permanently (unevictable).
@@ -18,18 +21,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType  # noqa: F401
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import TreeNode  # type: ignore
 
 
-# All non-mamba components skipped => MAMBA-component-only lock.
-_MAMBA_ONLY_SKIP = tuple(ct for ct in ComponentType if not ct.is_mamba)
-
-
 class MambaCowLock:
-    """Receipt anchoring the MAMBA-only lock taken on the COW source node."""
+    """Receipt anchoring the lock taken on the COW source node."""
 
     __slots__ = ("tree_cache", "node", "receipt")
 
@@ -52,7 +51,8 @@ def stage_mamba_cow_lock(tree_cache, node, req) -> None:
     if prev is not None:
         prev.release()
         req.kv.mamba_cow_lock = None
-    receipt = tree_cache.inc_lock_ref(node, skip_lock_components=_MAMBA_ONLY_SKIP)
+    # All components locked: full_lock >= ct_lock hierarchy (see module doc).
+    receipt = tree_cache.inc_lock_ref(node)
     req.kv.mamba_cow_lock = MambaCowLock(tree_cache, node, receipt)
 
 

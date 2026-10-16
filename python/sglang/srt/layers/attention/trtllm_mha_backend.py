@@ -1146,7 +1146,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = forward_batch.seq_lens[:bs]
         req_pool_indices = forward_batch.req_pool_indices[:bs]
-        padded_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+        # R-1: cap the no-padding-row fold at the request's draft budget.
+        padded_layout = ragged_layout.padded_to_bucket(
+            padded_bs=bs, last_row_cap=self.speculative_num_draft_tokens
+        )
         geometry = build_ragged_target_verify_geometry(
             seq_lens=seq_lens, layout=padded_layout
         )
