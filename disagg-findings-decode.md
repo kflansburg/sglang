@@ -1,5 +1,13 @@
 # Decode-side disaggregation audit findings (disagg-decode)
 
+## FIXED (shipped, in review/merge queue)
+- V4-decode FIX (board #19, @be5bd52): device deferred release holds past 30s until drain/peer-down. (See top section.)
+- F12 FIX (board #44, @d7f400f): mooncake _handle_aux_data now bound-checks every wire field (room ∈ request_status; buffer_index 0..n; aux_index*item_len within aux_data_lens; payload ≤ item_len) before the ctypes write. Kills the wire-controlled arbitrary-offset aux write + the aux-races-reused-slot cross-request metadata overwrite. Codec side left to disagg-prefill.
+
+## Extra verdicts (role-switch watch)
+- Heartbeat/node-failure vs role-switch: CLEAN. CommonKVManager.teardown sets _heartbeat_shutdown; the daemon thread is not joined and can run one more iteration on the dying manager (possible late zmq exception, logged and harmless) — all mutated tables are per-manager; class-level receiver socket cache (close_all_sockets) keeps _ctx reusable; no cross-role state corruption possible. No fix needed.
+- is_fully_idle gates role-switch on has_pending_deferred_releases() and ongoing_offload — verified; V4 holds correctly block destructive ops.
+
 ## FIXED (shipped)
 - V4-decode FIX on agent/disagg-decode @be5bd52, board #19: device-destination deferred release no longer frees at 30s timeout; holds until drain ack or prefill-down (prefill_info_table pop). 'peer_dead' metric outcome. Supersedes CAND-1 below for device path on HEAD. Older prod versions (v0.5.14/.15.post1/.17) have NO deferred release at all and free immediately on failure — confirmed via fetched tags; the local-patch backport story for those belongs to release engineering.
 
