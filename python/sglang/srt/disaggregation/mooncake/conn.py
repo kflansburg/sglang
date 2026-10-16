@@ -2111,12 +2111,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
-                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
-                    # lenient truncation below.
+                    # Paged SWA/DSA tolerate at most a 1-page drift (the
+                    # documented accounting window for the block being
+                    # filled); a larger drift means a bookkeeping bug -- in
+                    # that case truncating would skip or alias whole pages of
+                    # state and conclude Success over stale/never-written
+                    # rows, so fail the room instead.
                     if self._requires_exact_state_index_match(st):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                    if abs(len(src_indices) - len(dst_indices_local)) > 1:
+                        raise RuntimeError(
+                            f"{st.upper()} state index drift exceeds the 1-page "
+                            f"accounting window: prefill={len(src_indices)}, "
+                            f"dst={len(dst_indices_local)}"
                         )
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
