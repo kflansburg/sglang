@@ -104,3 +104,21 @@ Branch: agent/spec-auditor (off origin/main 3420bae)
 **Versions:** check needed - controller introduced with mm global cache; likely present in v0.5.14+ (Kimi/Gemma
 deployments). Confirm via git tag diff before filing.
 
+
+## Turn-2 additions
+- Read existing tests: test_embedding_cache_controller.py (rich pin/unpin LRU coverage), test_staging_draft_kv_slots
+  (Mooncake draft slot ordering), kernels/ops/speculative tests. GAPS confirmed: no test for disagg+spec both-sides
+  KV release; no test for retract-during-spec alloc/free round trip; no test on embedding prefetch timeout.
+- eagle_utils.eagle_prepare_for_verify: verify out_cache_loc = row view [seq_lens, seq_lens+draft_token_num)
+  (assign_extend_cache_locs_uniform_func), bound by page-aligned reserve; no independent alloc -> no free needed.
+- dp_spec_prefill_coordination.py (53 lines, phase orchestration only), spec_tp_sync.py: no KV ownership.
+- adaptive spec (eagle_worker_v2 apply_runtime_state/_override_worker_state): swaps whole backend/graph-runner
+  objects; reserve reserve-per-decode reads max over configured candidates via bags; pool slot math unchanged.
+- DSpark RaggedVerifyLayout validates cap/verify_lens bounds at construction; worker caps budget per-req.
+- mm abort paths: Req.release_mm_inputs_on_abort -> MultimodalInputs.release_features (per-item
+  release_transport_proxies + feature=None; finally-guarded) for session/non-session; scheduler handle_generate_request
+  wraps proxy release in ExitStack mm_cleanup. Double-release safe (proxy release is idempotent pop-and-release).
+- disagg prefill + spec: draft KV rides target's virtual ids in a SEPARATE pool object (fused lanes) shipped as
+  extra entries (num_draft_entries) in the same transfer; decode prealloc allocates fill_len; deferred decode KV
+  release class is disagg-lead's territory - leaving both-sides-release verification to coordinate with them.
+
