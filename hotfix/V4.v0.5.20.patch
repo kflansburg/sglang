@@ -1,0 +1,67 @@
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 6d806fda33..67aae803d2 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -2490,8 +2490,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+         return bool(self._deferred_releases)
+ 
+     def resolve_deferred_releases(self) -> None:
+-        """Release held requests once every prefill rank acks the drain, or the
+-        hold times out."""
++        """Release drained transfers; undrained ones are held, never timed out.
++
++        A timeout cannot prove that a remote write has stopped, so device
++        destinations use the same rule as host destinations: hold the pages
++        until every prefill rank that could still write them has acked. The
++        only early release is when the prefill instance itself is declared
++        down (its entry is popped from ``kv_mgr.prefill_info_table`` by
++        ``_handle_node_failure``): a dead engine owns no RDMA transfers, so
++        its late writes cannot exist. The deadline field only rate-limits
++        the re-log; it no longer frees.
++        """
+         if not self._deferred_releases:
+             return
+         now = time.monotonic()
+@@ -2501,19 +2510,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+             room = decode_req.req.bootstrap_room
+             kv_mgr = decode_req.kv_receiver.kv_mgr
+             drained = kv_mgr.is_abort_release_safe(room, required_acks)
+-            if not drained and now < deadline:
+-                still_held.append((decode_req, deadline, idx, required_acks))
+-            else:
+-                to_release.append((decode_req, idx, room, drained))
++            if drained:
++                to_release.append((decode_req, idx, room, True))
++                continue
++            if decode_req.kv_receiver.bootstrap_addr not in kv_mgr.prefill_info_table:
++                # The prefill instance is declared down: its RDMA engine is
++                # dead, so no late writer can still target these pages.
++                # Releasing is the only way to retire the failed room.
++                to_release.append((decode_req, idx, room, True))
++                continue
++            if now >= deadline:
++                logger.warning(
++                    f"Deferred KV release for room {room} still waiting on a "
++                    f"drain ack from prefill {decode_req.kv_receiver.bootstrap_addr} "
++                    f"after {self.deferred_kv_release_timeout}s; holding "
++                    f"(freeing while a remote write may be in flight would "
++                    f"corrupt whichever request is reissued these pages)."
++                )
++                # Rate-limit the re-log; not a release deadline.
++                deadline = now + self.deferred_kv_release_timeout
++            still_held.append((decode_req, deadline, idx, required_acks))
+         # Commit the survivors before releasing so a _do_release exception can't
+         # leave a released entry in the list (double-free / None receiver on retry).
+         self._deferred_releases = still_held
+         for decode_req, idx, room, drained in to_release:
+             if not drained:
++                # Unreachable: releases now happen only on drain or peer-down.
+                 logger.warning(
+-                    f"Deferred KV release for room {room} timed out after "
+-                    f"{self.deferred_kv_release_timeout}s without a full drain "
+-                    f"ack from prefill; releasing anyway."
++                    f"Deferred KV release for room {room} releasing without a "
++                    f"drain ack because the prefill instance is down."
+                 )
+             try:
+                 self._do_release(decode_req, idx)

@@ -12,6 +12,49 @@ v0.5.14, v0.5.15.post1, k3-branch (base 87dd4596 / bd4828e2), v0.5.17, v0.5.20.
 Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
 (remote `upstream` = https://github.com/sgl-project/sglang). k3 base commit still to fetch.
 
+## FINAL LEADERSHIP SUMMARY (05:05 UTC)
+
+**Fixes merged/queued to dev (4):**
+1. #33/MR#26 — mooncake_store short-read-as-success: exact-byte equality checks
+   (`_expected_io_bytes`, session `expected_sizes`) on ALL get paths
+   (single/multi/multi_buffers + get_session_start zero-copy); P2-2 empty
+   batch_set RPC guard cherry-picked from mooncake-audit; 6-case regression
+   suite (5 fail pre-fix). Live upstream in v0.5.14/.15p1/.17/.20/HEAD → WE FIX.
+2. #25/MR#31 — host-pool free() guards: unguarded double-accept in
+   DeepSeekV4PagedHostPool/LogicalHostPool/MambaPoolHost (worst v0.5.14
+   base free unguarded+unlocked) + -1 sentinel wrap (`slot_used[-1]`);
+   `assert_valid_host_slot_indices` + per-class guards + release-ordering
+   fix (host buffers touched before slot release); queue-safe dual-mode
+   regression file + 7 CI tests.
+3. #52 — B1 drain raise → engine SIGQUIT: catch at the two call sites
+   (update_running_batch :4399, pause_generation :5727), refuse-pause
+   semantics; full sweep confirmed exactly 2 call sites. Main-only
+   (prod tags have NO drain → exposed to the unguarded UAF instead — see below).
+4. #67/MR#42 — C6 external-linker PP-consensus: finish verdict MIN-reduce
+   now includes pp_group (unconditional per-batch per-stage collective,
+   attn MIN rid-gated as before); middle-PP-stage load failure no longer
+   streams ≥1 garbage token via downpipe hidden states. Hygiene folded:
+   complete() after fail() no longer masks as InvalidStateError;
+   broadcast_loads device tensors popped on failure (leak). Config note:
+   linker ⊥ HiCache (outside production surface) — fixed as an upstream
+   garbage-token class.
+
+**Version-live windows handed to fleet/version-triage (no dev fix by design):**
+- C4-class mamba prefetch slot divergence: v0.5.14/.15p1/.16(verified)/.17
+  (+ K3 presumptive) legacy hi_mamba_radix_cache path; guarded at .20/HEAD
+  (hybrid _reduce_prefetch_ack per-pool MIN). Backport analogue = pack mamba
+  hit into the existing terminate-time MIN reduce. Fleet decides carry.
+- Retract-vs-offload UAF: v0.5.14/.15/.17/.20 have NO drain — retract →
+  read/write-back into freed host pages possible (decode-offload-audit
+  evidence; version-triage entry in flight). Prod patch analogue =
+  V8 drain + V8.1 call-site catch.
+
+**Discipline notes for the record:** C5 PP-ticket leak = env artifact (JIT
+toolchain); storage_prefetch_lifecycle failure = hostname/gloo env artifact;
+C4 HEAD-form refuted 3× then 4-way traced guard-verified; one dev-suite
+regression (test_pp_prefetch_ticket 9-fail on dev) found during review and
+flagged to lead (not hicache-caused).
+
 ## Sub-areas and owners
 | Sub-area | Agent | Findings file (their branch) |
 |---|---|---|
@@ -87,6 +130,52 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
    extracted for radix-lead's plain-radix bug (adopt the assert + invariant).
    Historical violator: lmcache_unified_radix_cache.py:763 (min-clamp; OOS).
 
+- C6 (NEW, promising): MooncakeDirectLinker layer-wise L3→GPU loads — per-rank
+  layer failure lets forward run on stale GPU slots (documented behavior,
+  unified_cache_linker.py:66-73); correctness rests on abort-before-output-use
+  at finish()/finish_loads (cache_controller.py:360, unified_cache_linker.py:532).
+  If output can race the abort → TP rank gets garbage-forward window
+  (cross-rank divergence / leaked garbage tokens). Airtightness trace assigned:
+  decode-offload-audit (scheduler ordering) + mooncake-audit (linker root).
+  Fix shape if gap: pre-forward load-fail gate or TP MIN-sync of load status.
+  LINKER HALF DONE (mooncake-audit): abort VERDICT is TP-consistent
+  (finish_loads MIN-reduces landed across attn groups); failed rids marked
+  FINISH_ABORT + no tree insert; request-private slots while loading.
+  Window REAL but deliberately designed; containment = post-forward
+  output-drop gate. DECISIVE QUESTION (decode-offload half): is
+  finish_external_linker_loads (u_radix:3490) invoked per batch BEFORE any
+  output consumption. MLA-dedup wrinkle: stale data STILL broadcast to peers
+  on failure (by design) → garbage enters all ranks' forward batch →
+  containment rests ENTIRELY on the drop gate. Hygiene: InvalidStateError
+  complete-after-fail masking; broadcast_loads tensors linger until reset()
+  FINAL VERDICT (both halves done): TP/dp-attn AIRTIGHT (discard checked
+  before token/embed commit; verdict TP-MIN consistent; request-private
+  slots, no tree insert). PP>1 CONFIRMED ESCAPE by two-path trace:
+  landed/success verdicts MIN-reduced ONLY over attn groups
+  (unified_radix_cache.py:328-335, :3315/:3517/:3522); middle-stage failure
+  → garbage hidden states down-pipe; last stage commits/streams ≥1
+  garbage token before abort reconciliation. Scope: external linker opt-in
+  & mutually exclusive with HiCache → OUTSIDE production surface today;
+  HEAD/dev affected; 0.5.14-.20 N/A (postdates); K3 unchecked. Fix ACK'd =
+  OPTION A: include pp_group (exists at :274) in finish-verdict MIN-reduce;
+  fallback = args stopgap. Owner decode-offload-audit -> theirs after
+  disagg-lead ACK; hygiene micros folded into the fix branch.
+  TP AIRTIGHTNESS PROOF (scheduler half, sealed): finish_external_linker
+  _loads = LAST step of run_batch (:4843); event loop processes batch
+  results only after run_batch returns; per-req discard gate BEFORE
+  stream_output (batch_result_processor.py:316/:473-478/:502/:1089);
+  linker loads admission-only (schedule_policy.py:1456) → failing forward
+  is FIRST-forward → no earlier tokens exist to leak; logprobs same
+  stream; garbage never reaches radix insert. MLA-dedup stale broadcast:
+  peers share the MIN-verdict attn group → all discard. Cost of a load
+  failure = one wasted forward; no output leak.
+  BONUS CONFIRMED (same path family): broadcast_loads[index] DEVICE
+  tensor leak on abort-before-last-layer (mooncake_direct_linker.py
+  :271-291 — cleanup only at threshold==last layer, else reset()-only;
+  leaked tensors accumulate over failures). Fix: pop on failure; folds
+  into the C6 fix branch. InvalidStateError complete-after-fail:
+  unreachable in current call graph → done() guard as hardening only.
+
 ## Suspects under verification
 - C4: ~~PrefetchAck.pool_hits not rank-reduced ⇒ TP host-tree divergence~~
   REFUTED at HEAD + v0.5.20 (hicache-lead review): HybridCacheController
@@ -101,6 +190,22 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   asymmetric path via different structure is OPEN (prefetch-ctl continuing).
   Teach-in: reviewing reviewer MUST chase overridden methods up the MRO before
   accepting "no sync exists" claims on subclass code paths.
+  SECOND INDEPENDENT CLAIM (mamba2-auditor): HEAD mamba attach/free
+  (unified_cache/components/mamba.py:895-925, same legacy decision shape).
+  How resolved: the READ site is real but its data source is guarded — the
+  only WRITE of extra_pool_hit_pages[MAMBA] is hybrid
+  prefetch_sync_thread_func ~:1830 from the ack JUST MIN-reduced by the
+  :1796 override (verified write-side on origin/dev; the unified radix cache
+  submits mamba sidecars only through the hybrid controller). Asked
+  mamba2-auditor for any write path bypassing the ack reduce as falsifier.
+  SETTLED, 4-way convergence: features-lead (taking #61 after mamba2
+  retired), decode-offload-audit (decisive drain line ~:3079=_drain_ack
+  _prefetch overwrites rank-local with reduced ack.pool_hits), mooncake-audit
+  (completeness sweep of ALL 3 write sites) all agree: no un-reduced write
+  feeds a load-side attach/free at HEAD. features-lead withdrew #61's
+  "dev fix for HEAD" claim by evidence. FINAL C4-class verdict: HEAD +
+  v0.5.20 guarded; v0.5.14/.15p1/.16/.17 (legacy hi_mamba path) + K3 branch
+  exposed (backport analogue recorded; decision = fleet).
   SALVAGED VULN WINDOW (prefetch-ctl version archaeology, hicache-lead spot-
   verified v0.5.17:1869-1917 by line): hi_mamba_radix_cache.py
   check_prefetch_progress MIN-reduces completed_tokens across TP but reads

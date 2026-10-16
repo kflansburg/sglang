@@ -1,0 +1,132 @@
+diff --git a/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py b/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+index 6321efb2..0543668a 100644
+--- a/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
++++ b/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+@@ -216,6 +216,57 @@ class DecodeKVCacheOffloadManager:
+         self._check_offload_progress(n_write)
+         self._check_backup_progress(n_backup)
+ 
++
++    def drain_before_retraction(self):
++        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy.
++
++        Pending D2H copies complete on the order of milliseconds, while a
++        retraction here would otherwise crash the scheduler. Wait (bounded by
++        SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S) for every rank to stop tracking
++        a copy instead of failing outright; on the timeout we still refuse,
++        since retracting while a copy reads the device KV corrupts it.
++        """
++        deadline = time.monotonic() + envs.SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S.get()
++        logged_wait = False
++        while True:
++            self.check_offload_progress()
++            cc = self.cache_controller
++            # Retraction frees the device KV these copies read. Storage backups read only
++            # host memory, so they do not count.
++            pending = torch.tensor(
++                [
++                    bool(
++                        cc.ack_write_queue
++                        or self.ongoing_offload
++                        or self.offload_inflight
++                    )
++                ],
++                dtype=torch.int,
++            )
++            if self.tp_world_size > 1:
++                torch.distributed.all_reduce(
++                    pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
++                )
++            if not pending.item():
++                if logged_wait:
++                    logger.info("Decode KV offload drained; proceeding with retraction")
++                return
++            if time.monotonic() >= deadline:
++                raise RuntimeError(
++                    "Decode KV offload copies are still pending on some rank; "
++                    f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
++                    f"{len(self.ongoing_offload)} copies, "
++                    f"{len(self.offload_inflight)} requests)."
++                )
++            if not logged_wait:
++                logger.info(
++                    "Waiting for pending decode KV offload copies before retraction "
++                    f"(local: {len(cc.ack_write_queue)} acks, "
++                    f"{len(self.ongoing_offload)} copies, "
++                    f"{len(self.offload_inflight)} requests)"
++                )
++                logged_wait = True
++            time.sleep(0.001)
+     def _check_offload_progress(self, finish_count):
+         """Check the progress of offload from device to host."""
+         while finish_count > 0:
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 790acce9..52fb7a9d 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -217,6 +217,11 @@ class Envs:
+     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
+     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+ 
++    # Bounds the wait for in-flight decode KV offload copies
++    # (device->host) before refusing retraction. Copies normally land in
++    # milliseconds; retraction while a copy reads device KV corrupts it.
++    SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S = EnvFloat(30.0)
++
+     # IPC
+     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 0630f942..5095195e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3065,6 +3065,24 @@ class Scheduler(
+         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+         ):
++            if self.decode_offload_manager is not None:
++                # Pending offload copies may still read the device KV that retraction frees.
++                # The drain already waited (bounded) for them; reaching RuntimeError
++                # means a copy is wedged past the timeout. Do not crash the engine:
++                # skip retraction this iteration — in-flight pages stay allocated,
++                # and the next loop retries the drain before retracting.
++                try:
++                    self.decode_offload_manager.drain_before_retraction()
++                except RuntimeError as e:
++                    logger.error(
++                        "Decode offload copies still pending; deferring retraction "
++                        f"one iteration: {e}"
++                    )
++                    batch.batch_is_full = False
++                    # Keep serving the batch untouched (this tag's batch consumer
++                    # does not accept a None running_batch); the next loop retries
++                    # the drain before any retraction.
++                    return batch
+             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+             old_ratio = self.new_token_ratio_tracker.current
+             mamba_allocator = getattr(
+@@ -4011,6 +4029,24 @@ class Scheduler(
+             tmp_batch, tmp_result = self.result_queue.popleft()
+             self.process_batch_result(tmp_batch, tmp_result)
+ 
++        if self.decode_offload_manager is not None:
++            # Pending offload copies may still read the device KV that retraction
++            # frees, and the paused decode loop never drains them. The drain
++            # already waited (bounded); RuntimeError means a copy is wedged past
++            # the timeout. Do not crash the engine and do NOT proceed to retract
++            # or mangle batch state: refuse the pause, keep serving, operator may
++            # retry PauseGeneration later.
++            try:
++                self.decode_offload_manager.drain_before_retraction()
++            except RuntimeError as e:
++                self._engine_paused = False
++                logger.critical(
++                    "PAUSE REFUSED: decode offload copies still pending after the "
++                    f"drain timeout; refusing retract-mode pause (engine keeps "
++                    f"serving; operator may retry). Noise to page on prod: {e}"
++                )
++                return
++
+         if self.last_batch and self.last_batch.forward_mode.is_extend():
+             chunked_req_to_exclude = set()
+             self.last_batch.filter_batch(

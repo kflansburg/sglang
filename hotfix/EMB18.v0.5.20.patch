@@ -1,0 +1,57 @@
+diff --git a/python/sglang/srt/disaggregation/encoder/server.py b/python/sglang/srt/disaggregation/encoder/server.py
+index 68877a0ed6..3ff708b896 100644
+--- a/python/sglang/srt/disaggregation/encoder/server.py
++++ b/python/sglang/srt/disaggregation/encoder/server.py
+@@ -1523,6 +1523,12 @@ class MMEncoder:
+             if idx not in fallback_index_set
+         ]
+         hit_views = {}
++        # get_pool_views pins an entry once per occurrence of its hash, but
++        # only when it returned a non-None view list. release_pool_views must
++        # receive exactly those pinned hashes, with the same multiplicity, or
++        # it can drop a pin taken by a concurrent request whose entry became
++        # READY in the meantime (use-after-free of pool pages).
++        pinned_view_hashes: List[str] = []
+         try:
+             if hit_view_hashes:
+                 cached_slice_lists = self.mm_global_cache.get_pool_views(
+@@ -1534,6 +1540,7 @@ class MMEncoder:
+                             f"Cached embedding {h} not available for req {ctx.req_id}"
+                         )
+                     hit_views[h] = slices
++                    pinned_view_hashes.append(h)
+ 
+             offset = 0
+             for idx, num_tokens in enumerate(token_counts):
+@@ -1558,8 +1565,8 @@ class MMEncoder:
+             torch.cuda.current_stream(self.device).synchronize()
+             return mm_embedding
+         finally:
+-            if hit_view_hashes:
+-                self.mm_global_cache.release_pool_views(hit_view_hashes)
++            if pinned_view_hashes:
++                self.mm_global_cache.release_pool_views(pinned_view_hashes)
+ 
+     def _assemble_global_cache_gpu(
+         self,
+diff --git a/python/sglang/srt/mem_cache/embedding_cache_controller.py b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+index 4a95d36351..f6530dbfa5 100644
+--- a/python/sglang/srt/mem_cache/embedding_cache_controller.py
++++ b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+@@ -847,7 +847,15 @@ class EmbeddingCacheController:
+         return results
+ 
+     def release_pool_views(self, mm_hashes: List[str]):
+-        """Release pins acquired by get_pool_views."""
++        """Release pins acquired by get_pool_views.
++
++        Callers MUST pass only the hashes for which get_pool_views actually
++        returned views (non-None result). get_pool_views pins an entry only
++        when it exists and is READY; passing a hash that was not pinned here
++        may decrement a pin taken by a *concurrent* request (the entry may
++        have become READY in between), making its pages evictable while the
++        other request is still reading them (use-after-free).
++        """
+         with self.lock:
+             for mm_hash in mm_hashes:
+                 entry = self.entries.get(mm_hash)

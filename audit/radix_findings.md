@@ -35,7 +35,7 @@ Production lens: disaggregated prefill/decode everywhere, page-size 64, fp8 e4m3
 ## CONFIRMED + FIXED (cont. / challenge-round update)
 
 9. **Unified checkpoint_into_tree multi-page shrink on trimmed finish** (#59, agent/radix-lead fcdd7d5,
-   APPROVED by unified-auditor: fail-pre identified at exact upstream assert site; guard mirrors the
+   APPROVED by unified-auditor + MERGED on dev via MR50: fail-pre identified at exact upstream assert site; guard mirrors the
    two existing 'no insert happened' exits; monotonicity holds; <1-page assert retained fail-stop).
    Component-cleanup equivalence verified by radix-sched: skip shape (a)=cleanup(insert_result=None,
    insert_params) is argument-identical to the existing effective_cache_len<=0 exit; mamba int8-pool
@@ -117,9 +117,9 @@ radix-sched submits. EMB #13/#14/#15/#18: radix-emb resubmits at GO.
 | Surface item | Lane verdict |
 |---|---|
 | Disaggregated prefill/decode abort/retract lifecycle (generic) | radix-sched: single release gate release_kv_cache; holds_kv assert; retract resets ownership atomically; all init_next_round_input skip-paths audited (pinned). Flagged disagg-specific (protected=total_prefix_len incl host-gap rows, bounded) → disagg lane. |
-| RadixCache checkpoint/release (#38) | CONFIRMED+FIXED (tests, approved; MR41). Trigger: disagg decode mid-generation checkpoint + trimmed finish. All prod tags. |
-| RadixCache lock_ref underflow / stale-handle classes (#45) | FIXED+GUARDS (tests, approved; MR41). Generic path unreachable at HEAD per enumeration; tripwires make it crash-loud if a future caller violates. |
-| lock-sever hardening (radix; hicache_Lens-adjacent free lists) | FIXED (tests, approved; MR41). |
+| RadixCache checkpoint/release (#38) | CONFIRMED+FIXED (tests, approved; MERGED on dev via MR50). Trigger: disagg decode mid-generation checkpoint + trimmed finish. All prod tags. |
+| RadixCache lock_ref underflow / stale-handle classes (#45) | FIXED+GUARDS (tests, approved; MERGED on dev via MR50). Generic path unreachable at HEAD per enumeration; tripwires make it crash-loud if a future caller violates. |
+| lock-sever hardening (radix; hicache_Lens-adjacent free lists) | FIXED (tests, approved; MERGED on dev via MR50). |
 | TLru-on-legacy eviction-loop crash | FIXED (startup guard, tests; MR41). |
 | Unified checkpoint shrink (#59) | CONFIRMED+FIXED (tests, approved by unified-auditor; MR41). HEAD only (no unified checkpoint at v0.5.20). Component-cleanup equivalence verified; SWA same-page tombstone deferral accepted (bounded, freed at release). |
 | Retract decode capacity overlap off-by-one (#16) | FIXED (radix-sched; approved by radix-lead; MR40). Production: page 64 + overlap default. |

@@ -66,13 +66,24 @@ for the same req_id silently overwrites the older op.
   get_pool_views pins only READY entries; release_pool_views is called for all
   hashes; unpin guards ref_count<=0 with a warning. FILLING entries always have
   ref_count==0 (all pin sites check READY), so no underflow corruption. Wart only.
-- EMB-C2 mm hash collision (class 4): both scheduler cache (mm_schedule.py) and
-  global cache key on sha256(content) truncated to 8B; identical images shared
-  intentionally; mm_schedule.py additionally validates token counts against each
-  item's expected counts and discards mismatched entries
-  (_discard_mismatched_cached_embedding). combine_hashes uses tuple-hash of the
-  content hashes. No per-request salt, but content-addressing makes wrong-content
-  collision infeasible except adversarial 64-bit collision.
+- EMB-C2 mm hash collision (class 4): CHALLENGED BY radix-sched (#radix #980),
+  verdict amended. Hash space is 64 bits (sha256 digest()[:8] everywhere incl
+  combine_hashes). Honest-traffic collision risk negligible (2^-64/pair);
+  token-count validation + discard (_discard_mismatched_cached_embedding)
+  defends scheduler-side mismatches. AMENDED CLAIM: an adversary able to WRITE
+  a shared store can mount a ~2^32 sha256 birthday collision and make a poisoned
+  entry pass numeric validation (store num_tokens is writer-controlled
+  metadata). Our production shares the Mooncake embedding store only across
+  replicas of the same fleet (same tenant/backend tag): an attacker with store
+  write access can already overwrite any entry by key, so collision-poisoning
+  adds no capability beyond the existing trust boundary. ACCEPTED RISK for
+  trusted-store deployments; FLAGGED product decision for genuinely
+  multi-tenant stores: full-256-bit keys or tenant-namespaced keys
+  (emb_{tenant}_{hash}) behind an env/arg. (radix-sched analysis credited.)
+- EMB-C6 insert-vs-D2H race: challenged-CONFIRMED CLEAN by radix-sched (#980):
+  FILLING->READY only via own copy-handle wait; store skips READY (touch only)
+  and conflicting FILLING; FILLING never in evictable LRU; no re-write over
+  READY/pinned. Race windows closed by entry-state machine + controller lock.
 - EMB-C3 double-free of pool pages: freed ranges merge defensively; each entry is
   created/finished by exactly one op type (GET for prefetch-created, D2H wait for
   store-created), single-free holds. _finish_get can only free FILLING entries it

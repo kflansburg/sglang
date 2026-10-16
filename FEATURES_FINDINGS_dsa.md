@@ -307,3 +307,10 @@ NOTE: carry alongside the same release_kv_cache early-no-KV branch shape check p
   clear-balance cycles pin the OVER-PIN class (re-stage/clear -> lock_ref==0).
 - queue-side env note: skip-wrapper stays as primary queue form (lead #1364); swa's get_device mock
   option recorded as PoC-only path (could silently green a wrong-shaped chain on regression catches).
+
+## WAVE CLOSE (2026-10-16): merged to dev
+- MR #52 merged: dev@66d6edeb lineage. Board #17 approved+merged; #69 merged-by-52.
+- My suites on dev: test_mamba_cow_source_lock.py (7), test_ragged_verify_pad_cap.py (6),
+  test_dsv4_request_state_{abort,transfer_indices}.py (19), test_c128_cleanup_bounds.py (2).
+- Vendor-branch backport PATCH FILES not written unless hotfix-channel asks: this file's README
+  inventory is the canonical source (staging lines, clear-site counts, receipt shapes, test recipes).

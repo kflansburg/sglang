@@ -251,3 +251,13 @@ prometheus_client, loguru; merge-queue system-python still needs pytest itself.
   disagg-decode); teardown/disaggregation queue clear + deregister order
   checked: release_memory_occupation clears bootstrap queue + deregisters
   engine only when fully idle (asserted upstream of call). VERDICT: clean.
+
+## FINAL STATUS (2026-10-16, 05:20 UTC)
+- #30 F15 (get_mha_kv_ptrs_with_pp draft pairing corruption) MERGED to dev (MR 30).
+- #31 F9/V4-prefill (abort-notification + drained-ACK bounded retry) MERGED (MR 43).
+- #43 F12 codec closed as duplicate (shipped via disagg-mooncake #42 + disagg-decode #44 union).
+- Post-merge dev-tip verification: 76 passed across my 4 suites + deferred + aux-bounds.
+- Envisioned follow-ups (not mine/not blocking): decode.py hidden_kv_layers
+  mirror one-liner (carried by disagg-decode on #19); stale retried ABORT on
+  reused bootstrap_room generation token (protocol change; hardening list via
+  disagg-prefill-common findings); wire trust-boundary checklist (common's #54).
