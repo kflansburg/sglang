@@ -178,3 +178,36 @@ Reference commit: 3420bae (origin/main at audit time).
   np.int32. Caller (_send_kv_metadata in decode.py) converts via
   `_transfer_page_indices(...).astype(np.int32)` at decode.py:2177. Safe as
   long as every caller goes through that helper — noted for the decode agent.
+
+## Update (fixes landed on agent/disagg-mooncake)
+- F2 FIXED (commit "fail loud on dst/prefill KV index count mismatch"):
+  conclude_failure + break, chunk never mutated. disagg-decode's trigger
+  hunt found NO normal path producing the drift (page counts equal by
+  construction both sides); the fix converts any *future* bookkeeping drift
+  into a request failure instead of corruption. Synthetic unit tests shipped.
+- F1 FIXED: register fail-fast raise; deregister logs error.
+- F4 FIXED: per-chunk fault isolation in transfer_worker + dead-shard
+  enqueue refusal in add_transfer_request.
+- F6 FIXED: drift cap 1 page for paged SWA/DSA/BLOCK_SCALE(_SWA); exact-match
+  types unchanged. Production relevance: SWA (silent before) IS in production
+  (--swa-full-tokens-ratio 0.075-0.1); QSA/SWA_RING/DSV4_REQUEST_STATE
+  already raised. Backport note (version-triage): v0.5.15.post1/.16 have a
+  SECOND unconditional truncation site in the state branch (~:150-151)
+  needing the same cap; also MINIMAX_INDEX_K truncation below maybe_send_extra
+  (~:2135-2160) still truncates silently on HEAD (MiniMax not in prod configs).
+
+## Mooncake counterpart of refuted nixl F1 (peer/handle invalidation+reload)
+- No analog: Mooncake sessions are address-derived (host:rpc_port), the
+  engine dedups by (hostname, gpu_id, ib_device); the ONLY peer metadata
+  reload is _publish_peer_registration (kv args re-registration), which is
+  ordering-safe: decode_kv_args_table[slot] replace happens inside
+  session_lock AFTER state_strides_validated discard, so an unlocked reader
+  (transfer worker) can never observe (new table + stale
+  validated-present); GIL keeps single-op reads atomic. REFUTED for mooncake.
+- Residual (leak, not corruption): failed_sessions, session_failures,
+  decode_kv_args_table, state_layout_rejections, state_strides_validated are
+  keyed by session id and never expire across decode-instance restarts.
+- Residual (abort-ack path, being fixed by disagg-prefill in F9 follow-up):
+  _send_abort_ack best-effort one-shot; transient zmq failure loses the ACK
+  -> decode device path frees at 30s regardless (V4 compound; disagg-decode's
+  fix removes the deadline-release entirely).
