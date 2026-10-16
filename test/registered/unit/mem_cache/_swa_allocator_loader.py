@@ -1,8 +1,14 @@
-"""Loader for the real SGLang allocator modules on a CPU-only box.
+"""Local-dev loader for the real SGLang allocator modules on a CPU-only box
+WITHOUT a full sglang install (e.g. ssh sandboxes, editor venvs).
 
 Injects lightweight fakes for the heavy deps (triton kernels, platform
 detection) so the real base.py/token.py/paged.py/swa.py import from their
 actual file locations and run on CPU tensors with need_sort=False.
+
+CI tests (test_swa_alloc_decode_leak.py et al.) import the installed package
+directly and DO NOT use this loader; keep it for quick local repro scripts.
+Never load it in the same pytest process as package-importing tests - it
+pollutes sys.modules with stubs.
 """
 import importlib.util
 import sys
@@ -11,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[4]
 ROOT = REPO / "python/sglang/srt"
 
 
