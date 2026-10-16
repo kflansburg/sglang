@@ -154,3 +154,12 @@ deployments). Confirm via git tag diff before filing.
 - eagle_draft_extend/frozen_kv_mtp cuda graph runners: padded rows write reserved req_pool slot 0 / out_cache_loc zeroed (dummy slot), seq_lens fill; consistent with pool's +1 dummy slot; CLEAN.
 - decoupled_spec_io.py + pp_spec_relay.py: NOT in production surface (decoupled_spec_role=null, PP not deployed); skipped with reason.
 - draft_utils.py has NO alloc/free/kv mentions (grep-verified).
+
+## Turn-4 additions (all CLEAN)
+- spec_tp_sync.py / spec_sampling_mask.py / adaptive_spec_params.py: zero alloc/free/kv refs (grep). CLEAN.
+- _compact_accept_to_front adversarial CPU check: valid positions preserved for mixed accept lengths
+  (bs=4, nd=10, s1=6); padded clamp-to-0 lands only past accept_lens where downstream never reads
+  (draft-extend select_index = i*nd + accept_lens-1; committed-KV reads [0..accept_len)). Documented claim verified.
+- dspark planner verify budget: local_verify_tier_num_tokens caps total at bs*verify_num_draft_tokens;
+  RaggedVerifyLayout.__post_init__ validates per-row cap + sum bounds; cap-accept consistency enforced;
+  SGLANG_SIMULATE_ACC misuse guarded by explicit raise. CLEAN.
