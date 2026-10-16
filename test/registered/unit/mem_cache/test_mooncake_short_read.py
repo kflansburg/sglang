@@ -11,6 +11,7 @@ Fix: a get is successful iff the engine returned EXACTLY the requested
 number of bytes for every slice of the page.
 """
 
+import sys
 import types
 import unittest
 from typing import List
@@ -196,6 +197,17 @@ def _make_config(is_mla_model=False):
 
 
 def _make_store(is_mla_model=False):
+    # Force a fresh import so our fake engine/pool modules apply even when
+    # other test files have already imported the module under their own
+    # sys.modules patches (pytest runs files in one process).
+    for mod in (
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+        "sglang.srt.mem_cache.pool_host",
+        "sglang.srt.mem_cache.pool_host.mla",
+        "mooncake",
+        "mooncake.store",
+    ):
+        sys.modules.pop(mod, None)
     with patch.dict(
         "sys.modules",
         {

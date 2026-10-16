@@ -1,3 +1,4 @@
+import sys
 import types
 import unittest
 from unittest.mock import patch
@@ -248,6 +249,17 @@ def _make_store(
     tp_lcm_size=None,
 ):
     fake_store_cls = _fake_store_class()
+    # Fresh import so this file's fakes apply even when other mooncake test
+    # files already imported the module under their own sys.modules patches
+    # (pytest runs files in one shared process).
+    for mod in (
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+        "sglang.srt.mem_cache.pool_host",
+        "sglang.srt.mem_cache.pool_host.mla",
+        "mooncake",
+        "mooncake.store",
+    ):
+        sys.modules.pop(mod, None)
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
         extra_backend_tag=extra_backend_tag,
@@ -278,6 +290,16 @@ def _make_store(
 class TestMooncakeGroupSemantics(CustomTestCase):
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
+        # Fresh import under this test's fakes (other mooncake test files may
+        # have cached the module under their own sys.modules patches).
+        for mod in (
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+            "sglang.srt.mem_cache.pool_host",
+            "sglang.srt.mem_cache.pool_host.mla",
+            "mooncake",
+            "mooncake.store",
+        ):
+            sys.modules.pop(mod, None)
         with patch.dict(
             "sys.modules",
             {
