@@ -9,7 +9,7 @@ page-64 fp8 KV, SWA/mamba/DSA/spec model features). Contents:
 - `audit/hicache_master_findings.md` (agent/hicache-lead), `audit/hicache_mooncake_findings.md` (agent/mooncake-audit), `audit/hicache_prefetch_findings.md`, `audit/cpu_test_env_recipe.md` (agent/prefetch-ctl-audit), `audit/hicache_decode_offload_findings.md` (dev/current, decode-offload team)
 - `audit/radix_findings.md` (agent/radix-lead)
 - `audit/FEATURES_FINDINGS_lead/dsa/mamba/swa/spec.md` (features team)
-- `audit/disagg-findings-{seams,decode,prefill}.md` (disagg team)
+- `audit/disagg-findings-{seams(decode-hicache-mixin inside decode),decode,prefill,mooncake,nixl,common}.md` (disagg team — six ledgers; decode-hicache-mixin covered inside disagg-findings-decode.md per disagg-lead)
 - `audit/pools_findings_{allocplan,configurator,dsv4,kvpool}.md`, `audit/pools_coverage_report.md` (pools team)
 - `audit/findings-emb.md` (agent/radix-emb)
 
