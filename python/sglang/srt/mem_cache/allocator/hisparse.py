@@ -166,7 +166,24 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
+            surplus = hisparse_indices[need_size:]
+            if surplus.numel() > 0:
+                # Pure-surplus guard: free only pages with NO kept token. If
+                # the request's device indices are non-dense within a run
+                # (e.g. after free-list churn, where the
+                # token-contiguity assumption of the old unconditional free
+                # breaks), a page may host both kept and surplus tokens; a
+                # token-granularity //page free of the whole surplus would
+                # release that page while live tokens still reference it
+                # (the V4 alloc_device_buffer carries the same guard).
+                # A mixed page is retained (leak-side, not corruption):
+                # mapping zeroing above means it is reclaimed only at
+                # request end.
+                buffer_pages = torch.unique(buffer_indices // self.page_size)
+                surplus_pages = torch.unique(surplus // self.page_size)
+                pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
+                if pure_surplus.numel() > 0:
+                    self.free_hisparse_indices(pure_surplus * self.page_size)
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size

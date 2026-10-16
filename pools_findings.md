@@ -108,3 +108,8 @@ Fetched tags v0.5.14, v0.5.15.post1, v0.5.17, v0.5.20 (+ K3 base commits 87dd459
 4. memory_pool DSATokenToKVPool DCP-widen: same as 3 (DSA/v4 pools only in .17+).
 5. deepseek_v4_compress_state transfer-index helpers: HEAD-only code line (helpers introduced after v0.5.20; tags have _lcm-only module tops and the transfer logic inline elsewhere / not extracted). No backport needed to prod tags.
 6. unified F0 stale-free (unified_sub_pool free_unbind kernel + Float.free): present in v0.5.20+HEAD only (virtual_slot.py free_unbind_inplace_kernel exists at v0.5.20, absent at v0.5.17 and earlier; v0.5.15p1's multi_ended_allocator.py is a different precursor structure — the specific free_unbind kernel + Float.free negative-wrap mechanism is .20+/HEAD). Class = caller-across-call double-free (radix gate), mechanics empirically proven on HEAD.
+
+## FIX LANDED (agent/pools-lead): non-V4 hisparse alloc_device_buffer pure-surplus guard (dsa Q2)
+- allocator/hisparse.py (~:167-185): ported the V4 guard — only pages with NO kept token (pure_surplus) are freed; mixed pages retained (leak-side, not corruption; reclaimed at request end per mapping zeroing).
+- Pre-fix under broken density (non-dense device indices within a run, e.g. after free-list churn / retract-resume): token-granularity //page free of the full surplus would free the SHARED page while live buffer tokens reference it (fp8 store into a page later handed to another request = cross-request corruption).
+- Tests test_hisparse_surplus_guard.py (2, real CPU class + stub kvcache): interleaved kept/surplus page case FAILS pre-fix verified by stash-run, passes post-FIX; dense case asserts pure surplus still reclaimed (no leak regression).
