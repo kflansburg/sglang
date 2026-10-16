@@ -22,7 +22,13 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
 
 ## Known classes to verify at HEAD (and find siblings)
 - [ ] HiCache host reclaim order
-- [ ] host pool free-list double free
+- [x] host pool free-list double free — VERSION FACT (hicache-lead): v0.5.14
+  `pool_host/base.py::HostKVCache.free()` is raw `torch.cat` of freed indices, no
+  double-free guard (0 `slot_used` refs) → a double free silently aliases one host
+  slot to two requests (cross-request KV corruption). v0.5.15.post1/v0.5.17/v0.5.20
+  and HEAD have `slot_used` alloc/free asserts (crash-on-double-free; note:
+  asserts vanish under `python -O`). Reachable double-free paths at HEAD = still
+  being traced by hostpool-audit.
 - [ ] Mooncake store short reads treated as success
 - [ ] abort leaking pins / H2D into freed buffers
 - [ ] prefetch policy timeout races
