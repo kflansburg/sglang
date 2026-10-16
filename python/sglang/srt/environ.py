@@ -728,6 +728,11 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
+    # Max seconds drain_before_retraction waits for pending decode KV offload
+    # (device->host) copies before refusing retraction. Copies normally land in
+    # milliseconds; retraction while a copy reads device KV corrupts it.
+    SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S = EnvFloat(30.0)
+
     # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================

@@ -278,26 +278,55 @@ class DecodeKVCacheOffloadManager:
         self._check_backup_progress(n_backup)
 
     def drain_before_retraction(self):
-        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""
-        self.check_offload_progress()
-        cc = self.cache_controller
-        # Retraction frees the device KV these copies read. Storage backups read only
-        # host memory, so they do not count.
-        pending = torch.tensor(
-            [bool(cc.ack_write_queue or self.ongoing_offload or self.offload_inflight)],
-            dtype=torch.int,
-        )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy.
+
+        Pending D2H copies complete on the order of milliseconds, while a
+        retraction here would otherwise crash the scheduler. Wait (bounded by
+        SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S) for every rank to stop tracking
+        a copy instead of failing outright; on the timeout we still refuse,
+        since retracting while a copy reads the device KV corrupts it.
+        """
+        deadline = time.monotonic() + envs.SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S.get()
+        logged_wait = False
+        while True:
+            self.check_offload_progress()
+            cc = self.cache_controller
+            # Retraction frees the device KV these copies read. Storage backups read only
+            # host memory, so they do not count.
+            pending = torch.tensor(
+                [
+                    bool(
+                        cc.ack_write_queue
+                        or self.ongoing_offload
+                        or self.offload_inflight
+                    )
+                ],
+                dtype=torch.int,
             )
-        if pending.item():
-            raise RuntimeError(
-                "Decode KV offload copies are still pending on some rank; "
-                f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
-                f"{len(self.ongoing_offload)} copies, "
-                f"{len(self.offload_inflight)} requests)."
-            )
+            if self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+                )
+            if not pending.item():
+                if logged_wait:
+                    logger.info("Decode KV offload drained; proceeding with retraction")
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Decode KV offload copies are still pending on some rank; "
+                    f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
+                    f"{len(self.ongoing_offload)} copies, "
+                    f"{len(self.offload_inflight)} requests)."
+                )
+            if not logged_wait:
+                logger.info(
+                    "Waiting for pending decode KV offload copies before retraction "
+                    f"(local: {len(cc.ack_write_queue)} acks, "
+                    f"{len(self.ongoing_offload)} copies, "
+                    f"{len(self.offload_inflight)} requests)"
+                )
+                logged_wait = True
+            time.sleep(0.001)
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
