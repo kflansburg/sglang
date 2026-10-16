@@ -575,6 +575,13 @@ class EmbeddingCacheController:
         keys, all_ptrs, all_sizes = [], [], []
 
         with self.lock:
+            stale_op = self.ongoing_prefetch.pop(req_id, None)
+            if stale_op is not None:
+                logger.warning(
+                    f"Req {req_id}: dropping stale prefetch op "
+                    f"({len(stale_op.keys)} pending keys); the io thread "
+                    f"will still finish it."
+                )
             for mm_hash, num_tokens in zip(mm_hashes, expected_tokens):
                 entry = self.entries.get(mm_hash)
                 if entry is not None:
@@ -619,6 +626,14 @@ class EmbeddingCacheController:
             op = EmbeddingPrefetchOperation(req_id, keys, all_ptrs, all_sizes)
             self.ongoing_prefetch[req_id] = op
             self.prefetch_queue.put(op)
+
+    def release_prefetch(self, req_id: str):
+        """Drop a request's prefetch op bookkeeping (e.g. after a wait
+        timeout or request abort). The io thread still completes the GET and
+        resolves the entries; only the req_id -> op bookkeeping is removed so
+        it cannot leak in ongoing_prefetch."""
+        with self.lock:
+            self.ongoing_prefetch.pop(req_id, None)
 
     def insert_batch(
         self,
@@ -846,7 +861,15 @@ class EmbeddingCacheController:
         return results
 
     def release_pool_views(self, mm_hashes: List[str]):
-        """Release pins acquired by get_pool_views."""
+        """Release pins acquired by get_pool_views.
+
+        Callers MUST pass only the hashes for which get_pool_views actually
+        returned views (non-None result). get_pool_views pins an entry only
+        when it exists and is READY; passing a hash that was not pinned here
+        may decrement a pin taken by a *concurrent* request (the entry may
+        have become READY in between), making its pages evictable while the
+        other request is still reading them (use-after-free).
+        """
         with self.lock:
             for mm_hash in mm_hashes:
                 entry = self.entries.get(mm_hash)
@@ -967,11 +990,48 @@ class EmbeddingCacheController:
                 pending.append((tensor, entry))
 
         handles: List[Tuple[EmbeddingCacheEntry, AsyncCopyHandle]] = []
-        for tensor, entry in pending:
-            handle = self._copy_tensor_to_pool(tensor, entry, pool)
-            handles.append((entry, handle))
+        try:
+            for tensor, entry in pending:
+                handle = self._copy_tensor_to_pool(tensor, entry, pool)
+                handles.append((entry, handle))
+        except Exception:
+            # A copy launch failure must not leak the FILLING entries (they
+            # are not in the evictable LRU, so their pages would be lost
+            # permanently). Wait for copies issued so far, then free all
+            # pending entries and their pages.
+            self.cancel_store_to_pool(handles)
+            with self.lock:
+                for _tensor, entry in pending[len(handles) :]:
+                    current = self.entries.get(entry.hash)
+                    if current is entry and current.state == EntryState.FILLING:
+                        self._evict_entry(entry.hash)
+            raise
 
         return handles
+
+    def cancel_store_to_pool(
+        self,
+        handles: List[Tuple["EmbeddingCacheEntry", "AsyncCopyHandle"]],
+    ):
+        """Abort a store: wait for issued D2H copies (best effort) and free
+        the FILLING entries and their pool pages.
+
+        Must be called by any caller that obtained handles from
+        store_to_pool_async() but will not call wait_store_to_pool()
+        (e.g. because request assembly failed). Without this the entries are
+        stuck in FILLING state; FILLING entries are never added to the
+        evictable LRU, so their pages would leak permanently.
+        """
+        for _entry, handle in handles:
+            try:
+                handle.wait()
+            except BaseException:
+                pass
+        with self.lock:
+            for entry, _handle in handles:
+                current = self.entries.get(entry.hash)
+                if current is entry and current.state == EntryState.FILLING:
+                    self._evict_entry(entry.hash)
 
     def wait_store_to_pool(
         self,

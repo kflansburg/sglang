@@ -473,22 +473,236 @@ class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
             ["emb_b"], [[22]], [[4]]
         )
 
-    def test_batch_get_multi_buffers_maps_positive_result_to_true(self):
+    def test_batch_get_multi_buffers_requires_exact_byte_count(self):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
             MooncakeEmbeddingStore,
         )
 
         store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
         store.store = MagicMock()
+        # Full read for "a" (4+4=8 bytes), error for "b".
         store.store.batch_get_into_multi_buffers.return_value = [8, -1]
 
         results = store.batch_get_into_multi_buffers(
             ["a", "b"],
-            [[11], [22]],
-            [[4], [4]],
+            [[11, 12], [22]],
+            [[4, 4], [8]],
         )
 
         self.assertEqual(results, [True, False])
+
+    def test_batch_get_multi_buffers_short_read_is_failure(self):
+        """Regression: a short read (0 < bytes < requested) must be a failure.
+
+        Previously res > 0 was treated as success: a partially filled buffer
+        was cached and served to every later request hitting the hash.
+        """
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+            MooncakeEmbeddingStore,
+        )
+
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = MagicMock()
+        # 4 bytes read of the 8 requested for "a".
+        store.store.batch_get_into_multi_buffers.return_value = [4]
+
+        results = store.batch_get_into_multi_buffers(
+            ["a"],
+            [[11, 12]],
+            [[4, 4]],
+        )
+
+        self.assertEqual(results, [False])
+
+    def test_batch_get_short_read_is_failure(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+            MooncakeEmbeddingStore,
+        )
+
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = MagicMock()
+        store.store.batch_get_into.return_value = [4, 8, -1]
+
+        results = store.batch_get(["a", "b", "c"], [11, 22, 33], [8, 8, 8])
+
+        self.assertEqual(results, [False, True, False])
+
+
+class TestStoreCancelAndPrefetchReap(unittest.TestCase):
+    def test_cancel_store_to_pool_frees_filling_entries(self):
+        """Regression: abandoned D2H handles must not strand FILLING entries.
+
+        FILLING entries are never added to the evictable LRU, so without a
+        cancel path their pages leak permanently.
+        """
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=page_runs,
+            state=EntryState.FILLING,
+        )
+        ctrl.entries["h"] = entry
+        handle = MagicMock()
+
+        ctrl.cancel_store_to_pool([(entry, handle)])
+
+        handle.wait.assert_called_once_with()
+        self.assertNotIn("h", ctrl.entries)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 4)
+
+    def test_cancel_store_to_pool_survives_handle_error(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=page_runs,
+            state=EntryState.FILLING,
+        )
+        ctrl.entries["h"] = entry
+        handle = MagicMock()
+        handle.wait.side_effect = RuntimeError("copy failed")
+
+        ctrl.cancel_store_to_pool([(entry, handle)])
+
+        self.assertNotIn("h", ctrl.entries)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 4)
+
+    def test_prefetch_same_req_id_replaces_stale_op(self):
+        """Regression: a repeated prefetch for one req_id must not leak the
+        older op in ongoing_prefetch (the new op replaces it)."""
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+
+        ctrl.prefetch("req", ["h1"], [2], Modality.IMAGE)
+        stale = ctrl.ongoing_prefetch["req"]
+        ctrl.prefetch("req", ["h2"], [2], Modality.IMAGE)
+
+        self.assertIsNot(ctrl.ongoing_prefetch["req"], stale)
+        self.assertIn("h2", ctrl.ongoing_prefetch["req"].keys)
+
+    def test_release_prefetch_reaps_abandoned_op(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+
+        ctrl.prefetch("req", ["h"], [2], Modality.IMAGE)
+        self.assertIn("req", ctrl.ongoing_prefetch)
+
+        ctrl.release_prefetch("req")
+
+        self.assertNotIn("req", ctrl.ongoing_prefetch)
+        # The FILLING entry remains for the io thread to resolve.
+        self.assertIn("h", ctrl.entries)
+
+
+class TestStoreLaunchFailureCleanup(unittest.TestCase):
+    def test_copy_launch_failure_evicts_pending_entries(self):
+        """Regression: if _copy_tensor_to_pool raises mid-loop, every entry
+        created by this store_to_pool_async call must be freed (they would
+        otherwise leak as FILLING forever), and issued copies are awaited
+        first so pages are not freed under an in-flight D2H."""
+
+        class _FakeCudaTensor:
+            """Minimal stand-in passing the CUDA-device guard and the shape
+            introspection done by store_to_pool_async."""
+
+            ndim = 2
+            shape = (2, 4)
+
+            @property
+            def device(self):
+                class _Dev:
+                    type = "cuda"
+
+                return _Dev()
+
+        ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
+        issued = []
+        real_copy = ctrl._copy_tensor_to_pool
+
+        def fake_copy(t, entry, pool):
+            if entry.hash == "second":
+                raise RuntimeError("launch failed")
+            handle = MagicMock()
+            issued.append((entry, handle))
+            return handle
+
+        ctrl._copy_tensor_to_pool = fake_copy
+        try:
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                ctrl.store_to_pool_async(
+                    ["first", "second", "third"],
+                    [_FakeCudaTensor(), _FakeCudaTensor(), _FakeCudaTensor()],
+                    Modality.IMAGE,
+                )
+        finally:
+            ctrl._copy_tensor_to_pool = real_copy
+
+        # All three entries must be gone and all pages free again.
+        self.assertEqual(ctrl.entries, {})
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 8)
+        # The issued copy for "first" was awaited before freeing its pages.
+        issued[0][1].wait.assert_called_once_with()
+
+
+class TestPoolViewPinPairing(unittest.TestCase):
+    def test_release_only_pinned_hashes_preserves_other_pin(self):
+        """Regression for asymmetric pin/unpin (board EMB-#18).
+
+        Request A calls get_pool_views while H is FILLING -> returns None,
+        no pin. H then becomes READY and request B pins it. A must NOT pass
+        H to release_pool_views; when A releases only the hashes it pinned,
+        B's pin survives (ref_count stays 1, no premature evictability).
+        """
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        ctrl.entries["h"] = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=[PageRun(0, 1)],
+            state=EntryState.FILLING,
+        )
+
+        results = ctrl.get_pool_views(["h"])
+        self.assertEqual(results, [None])
+
+        entry = ctrl.entries["h"]
+        entry.state = EntryState.READY
+        ctrl._mark_ready(entry)
+
+        b_views = ctrl.get_pool_views(["h"])
+        self.assertIsNotNone(b_views[0])
+        self.assertEqual(entry.ref_count, 1)
+        self.assertNotIn("h", ctrl.vision_pool.evictable)
+
+        # Correct caller behavior: A only releases hashes with non-None views.
+        a_pinned = [h for h, s in zip(["h"], results) if s is not None]
+        self.assertEqual(a_pinned, [])
+        ctrl.release_pool_views(a_pinned)
+
+        self.assertEqual(entry.ref_count, 1)
+        self.assertNotIn("h", ctrl.vision_pool.evictable)
+
+        ctrl.release_pool_views(["h"])
+        self.assertEqual(entry.ref_count, 0)
+        self.assertIn("h", ctrl.vision_pool.evictable)
+
+    def test_duplicate_hashes_pin_and_unpin_with_same_multiplicity(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        entry = _insert_ready_entry(ctrl, "h", tensor)
+
+        views = ctrl.get_pool_views(["h", "h"])
+        self.assertEqual(len(views), 2)
+        self.assertEqual(entry.ref_count, 2)
+
+        ctrl.release_pool_views(["h", "h"])
+        self.assertEqual(entry.ref_count, 0)
 
 
 if __name__ == "__main__":

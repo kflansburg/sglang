@@ -1449,6 +1449,12 @@ class MMEncoder:
                         f"Prefetch failed for req {ctx.req_id}: {e}. "
                         f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
+                    # Reap the prefetch bookkeeping so the op cannot leak in
+                    # ongoing_prefetch (the io thread still resolves entries).
+                    try:
+                        self.mm_global_cache.release_prefetch(ctx.req_id)
+                    except Exception:
+                        logger.exception("Failed to release prefetch state")
                     for idx in hit_indices:
                         fallback_mask[idx] = 1
 
@@ -1479,6 +1485,23 @@ class MMEncoder:
             )
             return [], []
         return hashes, handles
+
+    def _cancel_staged_cache_inserts(self, *d2h_handle_lists: List[Any]):
+        """Abort staged cache inserts whose assembly failed.
+
+        Without this, entries created by store_to_pool_async stay in FILLING
+        state forever; FILLING entries are not evictable, so their pool pages
+        would be lost permanently.
+        """
+        if self.rank != 0:
+            return
+        handles = [h for lst in d2h_handle_lists for h in lst]
+        if not handles:
+            return
+        try:
+            self.mm_global_cache.cancel_store_to_pool(handles)
+        except Exception:
+            logger.exception("Failed to cancel staged cache inserts")
 
     def _launch_global_cache_insert(
         self,
@@ -1540,6 +1563,12 @@ class MMEncoder:
             if idx not in fallback_index_set
         ]
         hit_views = {}
+        # get_pool_views pins an entry once per occurrence of its hash, but
+        # only when it returned a non-None view list. release_pool_views must
+        # receive exactly those pinned hashes, with the same multiplicity, or
+        # it can drop a pin taken by a concurrent request whose entry became
+        # READY in the meantime (use-after-free of pool pages).
+        pinned_view_hashes: List[str] = []
         try:
             if hit_view_hashes:
                 cached_slice_lists = self.mm_global_cache.get_pool_views(
@@ -1551,6 +1580,7 @@ class MMEncoder:
                             f"Cached embedding {h} not available for req {ctx.req_id}"
                         )
                     hit_views[h] = slices
+                    pinned_view_hashes.append(h)
 
             offset = 0
             for idx, num_tokens in enumerate(token_counts):
@@ -1575,8 +1605,8 @@ class MMEncoder:
             torch.cuda.current_stream(self.device).synchronize()
             return mm_embedding
         finally:
-            if hit_view_hashes:
-                self.mm_global_cache.release_pool_views(hit_view_hashes)
+            if pinned_view_hashes:
+                self.mm_global_cache.release_pool_views(pinned_view_hashes)
 
     def _assemble_global_cache_gpu(
         self,
@@ -1598,28 +1628,36 @@ class MMEncoder:
 
         offset = 0
         copy_handles = []
-        for idx, num_tokens in enumerate(token_counts):
-            if idx in miss_slice_pos:
-                mm_embedding[offset : offset + num_tokens].copy_(
-                    new_slices[miss_slice_pos[idx]],
-                    non_blocking=True,
-                )
-            elif idx in fallback_slice_pos:
-                mm_embedding[offset : offset + num_tokens].copy_(
-                    fallback_slices[fallback_slice_pos[idx]],
-                    non_blocking=True,
-                )
-            else:
-                handle = self.mm_global_cache.load_to_device_async(
-                    ctx.str_mm_hashes[idx], mm_embedding, offset
-                )
-                if handle is None:
-                    raise InternalError(
-                        f"Cached embedding {ctx.str_mm_hashes[idx]} disappeared "
-                        f"during assembly for req {ctx.req_id}"
+        try:
+            for idx, num_tokens in enumerate(token_counts):
+                if idx in miss_slice_pos:
+                    mm_embedding[offset : offset + num_tokens].copy_(
+                        new_slices[miss_slice_pos[idx]],
+                        non_blocking=True,
                     )
-                copy_handles.append(handle)
-            offset += num_tokens
+                elif idx in fallback_slice_pos:
+                    mm_embedding[offset : offset + num_tokens].copy_(
+                        fallback_slices[fallback_slice_pos[idx]],
+                        non_blocking=True,
+                    )
+                else:
+                    handle = self.mm_global_cache.load_to_device_async(
+                        ctx.str_mm_hashes[idx], mm_embedding, offset
+                    )
+                    if handle is None:
+                        raise InternalError(
+                            f"Cached embedding {ctx.str_mm_hashes[idx]} disappeared "
+                            f"during assembly for req {ctx.req_id}"
+                        )
+                    copy_handles.append(handle)
+                offset += num_tokens
+        except BaseException:
+            # Release the read pins taken by load_to_device_async before
+            # propagating; otherwise the entries stay pinned forever and
+            # their pool pages can never be evicted (permanent pool leak).
+            if copy_handles:
+                self.mm_global_cache.wait_load_to_device(copy_handles)
+            raise
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
         torch.cuda.current_stream(mm_embedding.device).synchronize()
@@ -1691,22 +1729,34 @@ class MMEncoder:
                             ctx, fallback_indices, fallback_slices
                         )
                     )
-                mm_embedding = self._assemble_global_cache_gpu(
-                    ctx,
-                    missing_indices,
-                    fallback_indices,
-                    new_slices,
-                    fallback_slices,
-                )
+                try:
+                    mm_embedding = self._assemble_global_cache_gpu(
+                        ctx,
+                        missing_indices,
+                        fallback_indices,
+                        new_slices,
+                        fallback_slices,
+                    )
+                except BaseException:
+                    self._cancel_staged_cache_inserts(
+                        miss_d2h_handles, fallback_d2h_handles
+                    )
+                    raise
             else:
-                mm_embedding = self._assemble_global_cache_cpu(
-                    ctx,
-                    hit_indices,
-                    missing_indices,
-                    fallback_indices,
-                    new_slices,
-                    fallback_slices,
-                )
+                try:
+                    mm_embedding = self._assemble_global_cache_cpu(
+                        ctx,
+                        hit_indices,
+                        missing_indices,
+                        fallback_indices,
+                        new_slices,
+                        fallback_slices,
+                    )
+                except BaseException:
+                    self._cancel_staged_cache_inserts(
+                        miss_d2h_handles, fallback_d2h_handles
+                    )
+                    raise
 
             self._launch_global_cache_insert(
                 ctx,
