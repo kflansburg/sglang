@@ -142,3 +142,15 @@ So entry count and item_lens are symmetric for same-version peers; spec decode
 metadata aux set. F2 therefore requires version skew or a geometry bug in
 metadata_buffers itself. Downgrade F2 to LOW (defensive check still warranted:
 a remote OOB write should be impossible-by-assert, not by convention).
+
+
+## Fix delivery log
+- V3 (bounded healthy _await_handles, SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S=300.0):
+  commit 669903f + d31ab20 (distinct reason) + 9aeeb22 (env import fix), board #34 approved by disagg-lead.
+- V2 (send_aux geometry assert, count-only per lead): same commits.
+- V1/F1 REFUTED: documented the complete-sets sharding invariant at _reload_invalidated_peers (d31ab20).
+- V4/F8 fixed by disagg-decode (be5bd52, board #19 done; reviewed + approved).
+- Regression tests: TestNixlAwaitHandlesHealthyBound (3), TestNixlSendAuxGeometry (2); full disagg suite
+  645 passed; 12 failing tests pre-exist on origin/main (proved by running with nixl/conn.py+environ.py
+  restored to origin/main: identical 12 failures).
+- Merge queue: first submit failed on env (no pytest in queue image); env rebuild in progress by lead.
