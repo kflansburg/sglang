@@ -1685,51 +1685,56 @@ class MMEncoder:
 
         miss_hashes = []
         miss_d2h_handles = []
-        # The CPU output path starts D2H staging before waiting for cache-hit loads.
-        if self.rank == 0 and new_slices and not keep_on_gpu:
-            miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
-                ctx, missing_indices, new_slices
-            )
-
-        fallback_indices = await self._wait_global_cache_prefetch(
-            ctx, hit_indices, hit_hashes, prefetch_failed
-        )
-
-        fallback_slices = []
         fallback_hashes = []
         fallback_d2h_handles = []
-        if fallback_indices:
-            logger.info(
-                f"Req {ctx.req_id}: All ranks running ViT fallback "
-                f"for {len(fallback_indices)} items."
-            )
-            fallback_slices = self._encode_missing(
-                ctx.mm_feature,
-                ctx.preprocess_result,
-                fallback_indices,
-                ctx.modality,
-                ctx.get_feature_fn,
-            )
-            if self.rank == 0 and not keep_on_gpu:
-                fallback_hashes, fallback_d2h_handles = self._stage_global_cache_slices(
-                    ctx, fallback_indices, fallback_slices
+        try:
+            # The CPU output path starts D2H staging before waiting for
+            # cache-hit loads.
+            if self.rank == 0 and new_slices and not keep_on_gpu:
+                miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+                    ctx, missing_indices, new_slices
                 )
 
-        if self.rank == 0:
-            if keep_on_gpu:
-                # Start staging newly computed GPU slices into the CPU cache
-                # pool asynchronously before assembling the GPU output.
-                if new_slices:
-                    miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
-                        ctx, missing_indices, new_slices
-                    )
-                if fallback_slices:
+            fallback_indices = await self._wait_global_cache_prefetch(
+                ctx, hit_indices, hit_hashes, prefetch_failed
+            )
+
+            fallback_slices = []
+            if fallback_indices:
+                logger.info(
+                    f"Req {ctx.req_id}: All ranks running ViT fallback "
+                    f"for {len(fallback_indices)} items."
+                )
+                fallback_slices = self._encode_missing(
+                    ctx.mm_feature,
+                    ctx.preprocess_result,
+                    fallback_indices,
+                    ctx.modality,
+                    ctx.get_feature_fn,
+                )
+                if self.rank == 0 and not keep_on_gpu:
                     fallback_hashes, fallback_d2h_handles = (
                         self._stage_global_cache_slices(
                             ctx, fallback_indices, fallback_slices
                         )
                     )
-                try:
+
+            if self.rank == 0:
+                if keep_on_gpu:
+                    # Start staging newly computed GPU slices into the CPU
+                    # cache pool asynchronously before assembling the output.
+                    if new_slices:
+                        miss_hashes, miss_d2h_handles = (
+                            self._stage_global_cache_slices(
+                                ctx, missing_indices, new_slices
+                            )
+                        )
+                    if fallback_slices:
+                        fallback_hashes, fallback_d2h_handles = (
+                            self._stage_global_cache_slices(
+                                ctx, fallback_indices, fallback_slices
+                            )
+                        )
                     mm_embedding = self._assemble_global_cache_gpu(
                         ctx,
                         missing_indices,
@@ -1737,13 +1742,7 @@ class MMEncoder:
                         new_slices,
                         fallback_slices,
                     )
-                except BaseException:
-                    self._cancel_staged_cache_inserts(
-                        miss_d2h_handles, fallback_d2h_handles
-                    )
-                    raise
-            else:
-                try:
+                else:
                     mm_embedding = self._assemble_global_cache_cpu(
                         ctx,
                         hit_indices,
@@ -1752,20 +1751,27 @@ class MMEncoder:
                         new_slices,
                         fallback_slices,
                     )
-                except BaseException:
-                    self._cancel_staged_cache_inserts(
-                        miss_d2h_handles, fallback_d2h_handles
-                    )
-                    raise
 
-            self._launch_global_cache_insert(
-                ctx,
-                miss_hashes + fallback_hashes,
-                miss_d2h_handles + fallback_d2h_handles,
-            )
-            return mm_embedding
+                self._launch_global_cache_insert(
+                    ctx,
+                    miss_hashes + fallback_hashes,
+                    miss_d2h_handles + fallback_d2h_handles,
+                )
+                # Ownership of the handles moved to the background task.
+                miss_d2h_handles = []
+                fallback_d2h_handles = []
+                return mm_embedding
 
-        return None
+            return None
+        except BaseException:
+            # Any failure after staging must abort the staged D2H stores:
+            # unfinished entries stay FILLING forever (never evictable), so
+            # their pool pages would be lost permanently.
+            if self.rank == 0:
+                self._cancel_staged_cache_inserts(
+                    miss_d2h_handles, fallback_d2h_handles
+                )
+            raise
 
     async def _compute_direct_embedding(
         self,
