@@ -111,8 +111,10 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   (KeyError PoolName.SWA) on a PP-broadcast ticket leaves the op NOT terminated
   and KV staging UNFREED. Genuine leak-path candidate (PP>1 + SWA + hicache
   config). Assigned: prefetch-ctl-audit.
-- T3 (low): graceful shutdown doesn't drain ongoing_offload before host-pool
-  destroy (deferred).
+- T3 (low, LOGGED, not fixing): graceful shutdown doesn't drain ongoing_offload
+  before host-pool destroy; teardown order issue only (process exiting;
+  worst case = crashed-on-exit noise, not served corruption). Recommend
+  upstream hardening note, not a patch in this audit. (decode-offload-audit)
 - B2 (note): flush_cache idle-gate misses ongoing_backup; reset() 10s raise
   uncaught — operator-triggered only.
 
