@@ -62,8 +62,38 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
    slot_used asserts. Reachable double-free paths at HEAD: hostpool-audit
    tracing.
 
+## Confirmed (cont.) — decoded-offload + routed
+3. **Host-pool free(): -1 sentinel wrap** (F2) — free() accepts negative
+   indices; slot_used[-1] marks the LAST live slot free → double-alloc w/o
+   double-free; -1 enters free list → issued as live slot id → kv_buffer[-1]
+   aliasing. All versions/all pools. FIX agent/hostpool-audit 1520122+1ad4f3d
+   (assert_valid_host_slot_indices + guards in 3 overrides) — board #25
+   APPROVED (hicache-lead review: completeness verified, env-control test run).
+4. **B1 drain_before_retraction uncaught raise → engine SIGQUIT** (main only;
+   all ranks via MAX allreduce; triggers: KV pressure + copy lag, pause).
+   Repro: agent/decode-offload-audit audit/repros/repro_drain_crash.py.
+   ROUTED: disagg-lead (call-site files are disagg-lane per seam).
+5. **Retract-vs-offload UAF** in v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 (no
+   drain guard in those tags; remove/retract frees device rows under in-flight
+   D2H offload → stale copy persists wrong KV under correct hashes).
+   Main guards via drain (which has B1). K3 assumed affected.
+6. **P2 raw batch_set empty-RPC** (mooncake_store.set(): batch_put_from([],[],[])
+   when key exists → native crash vector; unused in prod) — fix by mooncake-audit
+   on their branch; integrate with #33 merge.
+7. **Unified checkpoint cache_protected_len shrink sibling** (SUSPECT, routed):
+   unified_radix_cache.py:1205-1238; does component cleanup_after_caching_req
+   (base:689/swa:1032/mamba:644) release tree ownership of shrunk range?
+   Traced by decode-offload-audit; fix radix-lead if confirmed.
+
 ## Suspects under verification
-(none yet)
+- C4: PrefetchAck.pool_hits not rank-reduced → asymmetric SWA sidecar fetch
+  failure ⇒ TP-rank host-tree divergence. prefetch-ctl-audit building repro.
+- storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
+  fails at clean HEAD — bug vs env artifact (prefetch-ctl-audit).
+- T3 (low): graceful shutdown doesn't drain ongoing_offload before host-pool
+  destroy (deferred).
+- B2 (note): flush_cache idle-gate misses ongoing_backup; reset() 10s raise
+  uncaught — operator-triggered only.
 
 ## Clean areas (with assumptions)
 (none yet)
