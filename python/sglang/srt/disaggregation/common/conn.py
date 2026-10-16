@@ -376,6 +376,15 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
+        # Drained ACKs whose zmq send raised, queued for bounded retry:
+        # (room, ip, port) -> (target, attempts, next_retry_ts). A lost drained
+        # ACK keeps decode's deferred-release gate closed forever; after the
+        # device-side hold-forever fix that is a permanent page leak, so the
+        # send path retries instead of dropping (same class as the aborted-room
+        # notification retry on the decode side).
+        self._pending_abort_acks: Dict[
+            Tuple[int, str, int], Tuple[AckTarget, int, float]
+        ] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
@@ -905,8 +914,16 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
+    _ABORT_ACK_MAX_ATTEMPTS = 6
+    _ABORT_ACK_BACKOFF_BASE_S = 0.5
+    _ABORT_ACK_BACKOFF_MAX_S = 8.0
+
     def _send_abort_ack(self, room: int, target: AckTarget) -> None:
-        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        """Ack that this rank's transfer for an aborted room drained.
+
+        A lost ACK keeps decode's deferred-release gate closed, which (after
+        the device-side hold-forever fix) leaks those pages permanently, so a
+        failed send is queued for bounded retry instead of dropped."""
         try:
             na = NetworkAddress(target.ip, target.port)
             self._send_multipart_locked(
@@ -915,11 +932,74 @@ class CommonKVManager(BaseKVManager):
                 is_ipv6=na.is_ipv6,
             )
         except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+            logger.warning(
+                f"Failed to send drained ABORT_ACK for room {room} to "
+                f"{target.ip}:{target.port}: {e}; queued for retry"
+            )
+            self._pending_abort_acks[(room, target.ip, target.port)] = (
+                target,
+                1,
+                time.time() + self._ABORT_ACK_BACKOFF_BASE_S,
+            )
+
+    def _retry_pending_abort_acks(self, now: Optional[float] = None) -> None:
+        """Bounded retry for drained-ABORT_ACKs whose send raised.
+
+        Driven by later transfer completions on this manager (same thread
+        discipline as the drain path itself). Duplicate ACKs are harmless:
+        decode records them in a generation-guarded set. Retries give up with
+        a loud error; decode keeps the pages held rather than releasing them
+        early, so the failure mode is a bounded leak, not corruption."""
+        if not self._pending_abort_acks:
+            return
+        if now is None:
+            now = time.time()
+        for key, (target, attempts, next_ts) in list(self._pending_abort_acks.items()):
+            if now < next_ts:
+                continue
+            room = key[0]
+            if room in self._deferred_ack_poisoned_rooms:
+                # Drain can no longer be proven for this room; never tell
+                # decode it drained.
+                self._pending_abort_acks.pop(key, None)
+                continue
+            if attempts >= self._ABORT_ACK_MAX_ATTEMPTS:
+                self._pending_abort_acks.pop(key, None)
+                logger.error(
+                    f"Giving up sending drained ABORT_ACK for room {room} to "
+                    f"{target.ip}:{target.port} after {attempts} attempts; "
+                    "decode will keep the room's pages held"
+                )
+                continue
+            try:
+                na = NetworkAddress(target.ip, target.port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    AbortAck(
+                        room, self._prefill_unique_rank(), target.generation
+                    ).to_zmq(),
+                    is_ipv6=na.is_ipv6,
+                )
+                self._pending_abort_acks.pop(key, None)
+            except Exception as e:
+                logger.warning(
+                    f"Retry {attempts + 1} of drained ABORT_ACK for room {room} "
+                    f"to {target.ip}:{target.port} failed: {e}"
+                )
+                self._pending_abort_acks[key] = (
+                    target,
+                    attempts + 1,
+                    now
+                    + min(
+                        self._ABORT_ACK_BACKOFF_BASE_S * (1 << attempts),
+                        self._ABORT_ACK_BACKOFF_MAX_S,
+                    ),
+                )
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
+        self._retry_pending_abort_acks()
         if self._staging_outstanding.get(room, 0) > 0:
             return
         if room in self._deferred_ack_poisoned_rooms:
@@ -2200,6 +2280,15 @@ class CommonKVReceiver(BaseKVReceiver):
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        # Per-rank abort-notification delivery tracking: indices (into
+        # bootstrap_infos) whose send raised, the attempts already made and the
+        # next time a retry is due. A rank that is never notified may still be
+        # RDMA-writing these pages, so the deferred-release ack gate only opens
+        # once every rank has acked; retrying here is what keeps that gate
+        # honest instead of silently corrupting reissued pages.
+        self._abort_notify_failed_ranks: List[int] = []
+        self._abort_notify_attempts: int = 0
+        self._abort_notify_next_retry_ts: float = 0.0
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._owns_bootstrap_room = not (
             mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
@@ -2291,6 +2380,8 @@ class CommonKVReceiver(BaseKVReceiver):
             return self._poll()
 
     def _poll(self) -> KVPoll:
+        if self._abort_notify_failed_ranks:
+            self._retry_abort_notifications()
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2605,8 +2696,29 @@ class CommonKVReceiver(BaseKVReceiver):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
             )
-        for bootstrap_info in self.bootstrap_infos:
-            # Best-effort notification to prefill side that this request was aborted.
+        failed = self._send_abort_notification_to_ranks(
+            range(len(self.bootstrap_infos))
+        )
+        self._abort_notify_failed_ranks = failed
+        self._abort_notify_attempts = 1
+        if failed:
+            # First retry quickly; subsequent retries back off from poll().
+            self._abort_notify_next_retry_ts = time.time() + 0.5
+
+    _ABORT_NOTIFY_MAX_ATTEMPTS = 6
+    _ABORT_NOTIFY_BACKOFF_BASE_S = 0.5
+    _ABORT_NOTIFY_BACKOFF_MAX_S = 8.0
+
+    def _send_abort_notification_to_ranks(self, rank_indices) -> List[int]:
+        """Send the abort notification to the given prefill ranks (indices into
+        bootstrap_infos). Returns the indices whose send raised.
+
+        Retried sends are idempotent on the prefill side: the room is already
+        Failed and duplicate ABORT_ACKs are harmless (ack tracking is
+        set-based and generation-guarded)."""
+        failed: List[int] = []
+        for i in rank_indices:
+            bootstrap_info = self.bootstrap_infos[i]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -2623,9 +2735,50 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
                 )
             except Exception as e:
-                logger.debug(
-                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                logger.warning(
+                    f"Failed to send abort notification for room "
+                    f"{self.bootstrap_room} to prefill rank "
+                    f"{bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}: {e}"
                 )
+                failed.append(i)
+        return failed
+
+    def _retry_abort_notifications(self, now: Optional[float] = None) -> None:
+        """Re-armed retry for ranks whose abort-notification send raised.
+
+        Bounded and non-blocking (driven by receiver polls); persistent
+        failure leaves the deferred-release ack gate closed forever for this
+        room, which is the safe failure mode: pages are held (and loudly
+        logged) instead of being reissued while a prefill rank may still be
+        RDMA-writing them."""
+        if not self._abort_notify_failed_ranks:
+            return
+        if getattr(self, "bootstrap_infos", None) is None:
+            self._abort_notify_failed_ranks = []
+            return
+        if now is None:
+            now = time.time()
+        if now < self._abort_notify_next_retry_ts:
+            return
+        if self._abort_notify_attempts >= self._ABORT_NOTIFY_MAX_ATTEMPTS:
+            logger.error(
+                f"Giving up notifying prefill ranks "
+                f"{self._abort_notify_failed_ranks} of aborted room "
+                f"{self.bootstrap_room} after {self._abort_notify_attempts} "
+                "attempts; those ranks may never ack, so the room pages must "
+                "stay held rather than be released to the allocator"
+            )
+            self._abort_notify_failed_ranks = []
+            return
+        self._abort_notify_attempts += 1
+        backoff = min(
+            self._ABORT_NOTIFY_BACKOFF_BASE_S * (1 << (self._abort_notify_attempts - 1)),
+            self._ABORT_NOTIFY_BACKOFF_MAX_S,
+        )
+        self._abort_notify_next_retry_ts = now + backoff
+        self._abort_notify_failed_ranks = self._send_abort_notification_to_ranks(
+            self._abort_notify_failed_ranks
+        )
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

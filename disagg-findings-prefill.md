@@ -81,3 +81,74 @@ retire_unadmitted_request: releases handle, streams, no sender created, no KV he
 release_mm_inputs_on_abort nil-ing multimodal_inputs. No double-release found here.
 
 ### C9 update_finish_state/finished_reason races: none; scheduler-thread only.
+
+## Round 3 (2026-10-16 ~03:40)
+
+### F15 VERIFIED numerically (sub-agent finding, re-derived)
+get_mha_kv_ptrs_with_pp (common/conn.py:1556-1614). Called from mainstream
+mooncake/conn.py:1104 (non-MLA GQA/MHA, e.g. Gemma), nixl/conn.py:945,1845,
+ascend, staging head-slice.
+Trigger: prefill WITHOUT draft, decode WITH draft, D % M == 0, D > 0
+(D = decode draft layer count, M = main layers, per-PP-stage view).
+Branch miss -> dst_v_ptrs = dst_kv_ptrs[dst_total+start:dst_total+end] =
+draft_K block. Lengths match (all len M) so layers_params/zipping do NOT catch
+it. Consequences: (1) main V RDMA'd into draft K buffers (garbled speculation),
+(2) decode main V NEVER written -> serves previous request's V pages =
+silent cross-request KV leakage. D<M (normal EAGLE) escapes only arithmetically.
+PP>1 + draft: else-branch slice can overrun the ptr list -> zip truncation.
+Fix plan (board #30): explicit draft handling via num_draft_entries on both
+sides + fail-loud length asserts before pairing.
+
+### V4/F9 fix implemented (board #31, agent/disagg-prefill)
+(a) decode-side CommonKVReceiver._send_abort_notification: per-rank failure
+tracking + poll-driven bounded retry (0.5..8s, 6 attempts), ERROR on give-up;
+pages then stay held per decode's V4 hold-forever path.
+(b) prefill-side CommonKVManager._send_abort_ack (same class, from mooncake's
+review note): failed drained ACKs queued in _pending_abort_acks with the same
+retry discipline; poisoned rooms' pending ACKs dropped.
+Regression test: test/registered/unit/disaggregation/test_abort_notification_retry.py.
+
+### Known-class test verification (lead's request)
+- deferred decode KV release: test_deferred_decode_kv_release.py EXISTS; code
+  guard = drain-ack + poison machinery (common/conn.py register_deferred_abort_room,
+  note_abort_ack, poison_deferred_ack_room) verified present.
+- admission abort: test_admission_abort_not_enqueued.py EXISTS; prefill door
+  is_unadmitted_reject -> retire_unadmitted_request verified in PrefillBootstrapQueue.add.
+- prefill abort cache leak: test_prefill_abort_result_cleanup.py EXISTS; code
+  guard _retire_aborted_prefill_result + release_aborted_prefill_waiting_req
+  verified. Sibling gap: (a) aborted BOOTSTRAP-queue req with metadata buffer
+  pre-reserved? bootstrap queue reqs don't reserve until pop -> no sibling. 
+  (b) SWA variant of abort release: release_kv_cache handles swa_evict_floor
+  via tree cache; not re-verified deeply (mem_cache team's area).
+- grammar double release: covered in test_prefill_abort_result_cleanup.py per
+  lead; code path verified by me (C8): single to_finish path, mm release
+  idempotent (None-ing). No sibling found in my files.
+- Mooncake transfer batch indices / keep-alive: disagg-mooncake territory; their
+  F-tests exist (test_mooncake_transfer_batching.py).
+- KV integrity tagging (checksum): test_kv_checksum.py EXISTS; checksum.py
+  verified: compute covers full seq incl. decode_prefix_len; health-check
+  reqs use value 0. Siblings: XLA/other backends call set_kv_checksum? Only
+  prefill.py:Send_kv_chunk calls set_kv_checksum -> decode reliance on it is
+  the config bit disaggregation_enable_kv_checksum; F12 (AuxDataCodec wire
+  aux_index OOB) is the real sibling in this class -> flagged to mooncake.
+- paged allocator capacity check: not in my files (core-pools team).
+- NIXL reload invalidated peer: refuted upstream (nixl's re-trace, lead accepted).
+- DSA tail req_pool index: get_dsa_tail_state_indices (utils.py:1208) checks
+  pool_size>1, tail>=pool; n_valid wraps correctly. Index list
+  [req_pool_idx, start_phys, first_n, 0, second_n, tail_size] bounded by
+  construction (start_phys < tail_size; first_n+second_n = n_valid < pool_size
+  <= tail_size). No OOB found. Sibling: disagg_kimi (K3) QSA pending state
+  indices = req_pool_idx only; req.kv.req_pool_idx is int (validated non-None).
+- disagg retract with SWA offload guard: decode-side, verified by disagg-decode.
+- HiCache host reclaim order / host pool free-list double free: hicache team.
+- unified pool move_kv_cache OOB: unified memory gate (utils.py:1418)
+  verified clearing paths (C3).
+
+### C4 residual question to lead: does production set
+SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1? If OFF, abort of a chunked
+req can free prefill pages while a mooncake worker is mid-RDMA-read on a
+dequeued middle chunk (worker drops only not-yet-started chunks on Failed).
+Impact bounded (room Failed -> decode discards) but late reads of reissued
+pages still possible on prefill side's own caches... actually only reads, so
+worst case is wrong bytes sent for an aborted room = harmless. Withdrawn
+unless someone shows decode-side reuse; the real teeth are F8/F9 (fixed).
