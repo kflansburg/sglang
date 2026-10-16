@@ -151,3 +151,38 @@ Moreover the RISKY FEATURES are version-gated:
   8<->16 ring positional skew (EAGLE/MTP PD); bad-ring validation; CompressStatePool.transfer_indices
   dispatch (ratio-2 odd-only, offline matches module fn, page-scoped rejects). numpy logic verified
   locally; torch-dependent parts follow the shipped CPU-CI pattern.
+
+## TEST DSA-1 (board #23) — delivered
+test/registered/unit/mem_cache/test_dsv4_request_state_abort.py (CPU suite):
+- clear_request_scoped_state offline c128 ring: slot-local reset, clear() semantics, other slots + padding untouched.
+- ratio-2 pair state reset; all request-scoped pools reset together; page-scoped untouched.
+- ONLINE_C128 3*head_dim row layout ([score|kv|rope]) via mocked ONLINE_C128 flag.
+- prealloc slot > max_running_requests clears in-bounds.
+- Abort/recycle invariant: poisoned slot freed WITHOUT compress-state clear (deferred-clear design),
+  DecodeReqToTokenPool front-alloc/tail-free ordering verified emulated ([1] free→[2,3,4,1]), hook clears
+  on re-alloc.
+- Construction-site pins (test-gap #1): num_req_slots=req_to_token.shape[0] at DSV4 ctor site;
+  DSA tail sites feed req-capacity; pool dim0 = max_running_requests+1 (contract that callers must
+  feed capacity, not admission cap).
+Numpy-emulated logic verified locally; torch parts follow shipped CPU-CI pattern.
+
+## Mamba replayssm/dp byte-math review (for mamba-auditor, msg #235)
+RESERVATION (kv_cache_configurator.py _handle_max_mamba_cache):
+- replay_req_slots = user_max_running // attn_dp_size + 1  (:2956, GDN replayssm fixed bytes)
+- intermediate reservations use user//dp and mamba caps (:2980,:2988,:3005,:3044)
+- pool_configurator.py:930 SWA worst-case slots uses user//dp
+ACTUAL ALLOCATION:
+- MambaPool spec buffers: spec_state_size+1 rows (memory_pool.py:601/612/767/884/1038; rings :767).
+- non-decode hybrid req pool: mamba_spec_state_size = resolved max_num_reqs (kv_cache_configurator.py:1558)
+  -> actual <= reservation (resolved <= user//dp). OVER-RESERVED, safe.
+- PD-decode hybrid req pool: HybridMambaDecodeReqToTokenPool passes
+  mamba_spec_state_size = size + pre_alloc_size (disaggregation/decode.py ~:330) and
+  effective_mamba_size = max(mamba_size, (size+pre_alloc)*slots_per_req)  -> CORRECT per-slot sizing.
+  So on PD decode with GDN replayssm (+spec), ring rows = size + pre_alloc + 1 while the replayssm
+  FIXED reservation counts only user//dp + 1: UNDER-RESERVED by pre_alloc_size rows * ring_bytes_per_req.
+  Hygiene/OOM-risk only (budget carve too small -> mamba pool or kv budget overshoot at boot), not a
+  memory-corruption bug. Affected config guess: Kimi K3 decode workers with enable_linear_replayssm_spec
+  + GDN + disaggregation_decode_extra_slots > 0 + dp such that resolved == user//dp.
+- moe_hook.py:593 uses max(1, user//dp); fine.
+SUGGESTION to mamba-auditor: make replay_req_slots == actual spec_state_size basis
+(get req_to_token row count or size+pre_alloc), and add a boot-vs-reservation assertion.
