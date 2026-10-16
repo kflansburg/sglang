@@ -103,6 +103,33 @@ asserts to the three overrides + LogicalHostPool.
 
 (legacy SUSPECT section kept for reference below)
 
+### F1+F2 FIX STATUS (board #25, branch agent/hostpool-audit, commits 1520122 + 1ad4f3d)
+Fix applied on this branch:
+- `pool_host/base.py`: new module helper `assert_valid_host_slot_indices`
+  (asserts indices >= 0 and < logical_size, named-caller message);
+  `HostKVCache.free` calls it before the slot_used check.
+- `MambaPoolHost` (mamba.py), `DeepSeekV4PagedHostPool` and `LogicalHostPool`
+  (memory_pool_host.py): gained slot_used init in clear() + double-alloc
+  assert in alloc() + sentinel/double-free asserts in free(), mirroring the
+  base class. Import added for the helper.
+- Regression tests in test_mem_pool_host.py: base-pool sentinel/out-of-range
+  frees (stub-based so they run in small sandboxes), and
+  double-free+sentinel guard tests for mamba/dsv4/logical pools via the
+  existing __new__ stub pattern. Also re-verified the pinned lazy-release
+  behavior is preserved exactly (DSv4/mamba/logical lazy_release tests pass).
+- Local pytest: failure set IDENTICAL to origin/main on the same sandbox
+  (10 pre-existing env failures: host-memory budget, shm, mamba empty-pp);
+  my branch goes 14->19 passed (+5 new guard tests green).
+Re-exec of the verbatim-source repros (audit/repros) against the patched
+code now raises AssertionError ('Double-free detected', 'Host-pool free:
+negative (sentinel)...') for all three pool families + base.
+NOTE for integrator: `slot_used` bool tensor is sized `size` (or logical_size)
+— 1 byte/slot; for a 2M-token host pool ~2 MB CPU, negligible.
+Behavior change surface: free() now raises on sentinel/out-of-range input —
+callers that (incorrectly) passed them will crash loud instead of corrupting
+(which is the desired outcome per the audit), but any TEST that exercised
+that path will now fail; none found in the file's tests.
+
 ### F1-notes. Guard inventory used above
 Base HostKVCache.free (pool_host/base.py:555-566) has a `slot_used[]`
 double-free/double-alloc detector (added upstream between v0.5.14 (absent)
