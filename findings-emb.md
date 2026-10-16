@@ -4,6 +4,20 @@ Scope files: mem_cache/embedding_cache_controller.py, embedding_store.py,
 multimodal_cache.py, index_key_cache.py + callers (managers/mm_schedule.py,
 disaggregation/encoder/server.py, storage/mooncake_store/mooncake_embedding_store.py).
 
+## FIXED (branch agent/radix-emb, commit 9743d29)
+
+All of EMB-1..EMB-4 plus the escalated asymmetric-unpin bug (EMB-5 below).
+Regression tests: test/registered/unit/mem_cache/test_embedding_cache_controller.py
+(32 tests pass on CPU torch 2.14.1+cpu; the 6 store/controller-failing tests were
+verified to FAIL against the pre-fix code).
+
+### EMB-5 (escalated by lead; cross-request UAF) release_pool_views asymmetric unpin
+get_pool_views pins only when entry exists AND READY; release_pool_views unpins any
+present entry. FILLING->READY between get and release + another request pinning the
+entry => release drops *the other request's* pin -> entry evictable under live read.
+Fix: server releases only hashes with non-None views (same multiplicity);
+controller docstring enforces contract. Fixes in _assemble_global_cache_cpu.
+
 ## CONFIRMED BUGS
 
 ### EMB-1 (pin leak -> permanent pool-page leak): `_assemble_global_cache_gpu` error path
