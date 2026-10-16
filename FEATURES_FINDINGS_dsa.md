@@ -249,3 +249,16 @@ indices; falls back to whole-page alloc otherwise (rare: pure-prefix requests).
 pools hosts the mechanics change; assigned via message. Severity: same class as F-5 (cross-owner
 page release), but only when a request has ZERO fresh compressed slots at alloc_device_buffer time
 (full radix prefix hit + complete page alignment) — narrow but real on hi-share workloads.
+
+## F-5b (board #71): finish-side sibling — request_finished frees shared prefix C4 pages
+- request_finished (hisparse_coordinator.py:1395-1407) frees all_hi ⊇ shared prefix buffer ids
+  (post-F-5 the buffer includes prefix_vals via cat) via free_hisparse_indices (whole pages) with no
+  owner protection; tree still references those prefix C4 slots → release-under-tree at FINISH.
+- Found during #68 invariant-(ii) verification (request_finished never frees another owner's pages).
+- Fix shape: protected_pages filter applied to the finish free (same _free_surplus_device_pages
+  semantics), or prefix buffer slots kept out of ownership bookkeeping.
+- Confidence: high on the mechanism (read-side verified); extent (finish path actually taken with
+  live shared prefix) mirrors F-5 reachability. Candidate → mechanics by pools/alloc.
+
+## #68 Q3 pad fix reviewed+approved: fabricate only from fresh tail, else whole-page alloc pad; 4/4
+Q3 suite green in my sandbox (test_hisparse_q3_pad_guard.py).
