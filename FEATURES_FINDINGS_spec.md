@@ -192,3 +192,11 @@ deployments). Confirm via git tag diff before filing.
   verify staging verify_lens) (kv_index_translator.py:1213-1218) and pcl plan commit_lens <= seq
   bounds validated (pcl/target_planner.py:206-229) — invariant handed to spec callers holds.
 - VERDICT: no memory-unsafe window; the API contracts on the spec callers hold at HEAD.
+
+## Sim hardening: accept_index compact/clamp (board #11 lead ask)
+- test/registered/unit/spec/test_accept_index_coord_safety.py: 200 randomized (bs,nd,s1,lens)
+  trials verify valid-position preservation of _compact_accept_to_front; padded -1 floor-divides
+  to a negative row under torch-style floor div; degenerate full/empty accept cases. Also verified
+  at kernel level: spec_tree.verify_tree_greedy_kernel_triton writes accept_index successive-ordered
+  (num_accept_tokens+1 slots) over a -1-initialized buffer (eagle_utils.py:853), so mid-gap -1
+  structurally impossible; consumers mask valid j or use last-accepted select_index. CLAIM HARDENED.
