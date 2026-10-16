@@ -29,7 +29,16 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   and HEAD have `slot_used` alloc/free asserts (crash-on-double-free; note:
   asserts vanish under `python -O`). Reachable double-free paths at HEAD = still
   being traced by hostpool-audit.
-- [ ] Mooncake store short reads treated as success
+- [x] Mooncake store short reads treated as success — LIVE AT HEAD AND ALL PROD
+  VERSIONS (hicache-lead): `mooncake_store.py::_batch_postprocess` (HEAD ~L1191-1202)
+  maps `batch_get_into` byte counts to success via `all(res > 0 for res in group)` —
+  ANY positive byte count (short read of 1 byte on a multi-MB page) is success, and
+  the expected `buffer_sizes` computed at the call sites (L1217/1246) are never
+  compared. Caller (`batch_get_v1/v2`, cache_controller prefetch completion) then
+  treats the host page as fully valid KV → stale/garbage KV served → garbled output
+  or cross-request data (shared store). Present in v0.5.14/15.post1/17/20 (same grep
+  signature) + HEAD. Siblings + full caller chain: mooncake-audit (in progress).
+  FIX direction: success iff res == expected size per slice (group semantics: all parts).
 - [ ] abort leaking pins / H2D into freed buffers
 - [ ] prefetch policy timeout races
 - [ ] write_through double-write/ownership
