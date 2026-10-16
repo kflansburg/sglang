@@ -1868,7 +1868,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def _handle_aux_data(self, msg: List[bytes]):
-        """Handle AUX_DATA messages received by the decode thread."""
+        """Handle AUX_DATA messages received by the decode thread.
+
+        Every field is wire-controlled, so validate it before touching
+        memory: an out-of-range buffer_index or aux_index, or an oversized
+        payload, would make AuxDataCodec write outside the intended slot
+        (cross-request metadata corruption), and an aux message that races a
+        concluded room would land in a metadata slot already reissued to a
+        different request.
+        """
         room = int(msg[1].decode("ascii"))
         buffer_index = int(msg[2].decode("ascii"))
         aux_index = int(msg[3].decode("ascii"))
@@ -1878,12 +1886,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if len(data) != data_length:
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
-        if room not in self.request_status:
-            # Unknown or already-concluded room: writing its claimed aux slot
-            # would land on metadata that may have been re-issued to another
-            # request. Late/dup delivery is benign; log and drop.
+        # Unknown or already-concluded room: writing its claimed aux slot
+        # would land on metadata that may have been re-issued to another
+        # request. Late/dup delivery is benign; log and drop.
+        if self.request_status.get(room) is None:
             logger.warning(
                 f"AUX_DATA for unknown/concluded bootstrap_room {room}; dropping"
+            )
+            return
+
+        # Message-side bounds validation (the codec re-checks and raises
+        # ValueError as defense-in-depth; caught below).
+        aux_ptrs = self.kv_args.aux_data_ptrs
+        aux_item_lens = self.kv_args.aux_item_lens
+        aux_data_lens = self.kv_args.aux_data_lens
+        if not 0 <= buffer_index < len(aux_ptrs):
+            logger.error(
+                f"AUX_DATA dropped: buffer_index {buffer_index} out of range "
+                f"[0, {len(aux_ptrs)}) for bootstrap_room {room}"
+            )
+            return
+        item_len = aux_item_lens[buffer_index]
+        if item_len <= 0 or not 0 <= aux_index or (aux_index + 1) * item_len > aux_data_lens[buffer_index]:
+            logger.error(
+                f"AUX_DATA dropped: aux_index {aux_index} out of range for "
+                f"bootstrap_room {room} (buffer {buffer_index} has "
+                f"item_len={item_len}, capacity={aux_data_lens[buffer_index]})"
             )
             return
 

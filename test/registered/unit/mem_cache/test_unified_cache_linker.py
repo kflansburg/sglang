@@ -150,6 +150,8 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        # pp_size == 1 => the pp consensus is a no-op on the real cache.
+        "_all_reduce_pp_group": lambda tensor, op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
