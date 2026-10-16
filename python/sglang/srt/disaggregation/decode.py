@@ -650,6 +650,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
+        # Full-model main layer count, mirroring the prefill registration
+        # (get_mha_kv_ptrs_with_pp anchors the peer's main V block on it; the
+        # wire carries raw pointer lists whose draft tail is otherwise
+        # indistinguishable from a PP stage window). Defensive for role-switch
+        # D->P init paths.
+        kv_args.hidden_kv_layers = self.scheduler.model_config.num_hidden_layers
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
@@ -2502,9 +2508,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries:
+        # Aborted-mid-transfer requests whose KV pages/slot are held until
+        # drained (or the prefill side is declared down). Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
+        # deadline only rate-limits the re-log; it never triggers a release.
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
@@ -2949,7 +2956,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
+        """Release drained transfers; undrained ones are held, never timed out.
+
+        A timeout cannot prove that a remote write has stopped, so device
+        destinations use the same rule as host destinations: hold the pages
+        until every prefill rank that could still write them has acked. The
+        only early release is when the prefill instance itself is declared
+        down (its entry is popped from ``kv_mgr.prefill_info_table``): a dead
+        engine owns no RDMA transfers, so its late writes cannot exist. The
+        deadline field only rate-limits the re-log; it no longer frees.
+        """
         if not self._deferred_releases:
             return
         host_ready = torch.tensor(
@@ -2979,7 +2995,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             if self.enable_host_receive and decode_req.host_staged:
                 if next(host_ready):
-                    to_release.append((decode_req, start_time, idx, room, True))
+                    to_release.append(
+                        (decode_req, start_time, idx, room, "drained")
+                    )
                 else:
                     # A timeout cannot prove that a remote write has stopped.
                     still_held.append(
@@ -2988,23 +3006,39 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append(
-                    (decode_req, start_time, deadline, idx, required_acks)
+            if drained:
+                to_release.append((decode_req, start_time, idx, room, "drained"))
+                continue
+            if decode_req.kv_receiver.bootstrap_addr not in kv_mgr.prefill_info_table:
+                # The prefill instance is declared down: its RDMA engine is
+                # dead, so no late writer can still target these pages.
+                # Releasing is the only way to retire the failed room.
+                to_release.append(
+                    (decode_req, start_time, idx, room, "peer_dead")
                 )
-            else:
-                to_release.append((decode_req, start_time, idx, room, drained))
+                continue
+            if now >= deadline:
+                logger.warning(
+                    f"Deferred KV release for room {room} still waiting on a "
+                    f"drain ack from prefill {decode_req.kv_receiver.bootstrap_addr} "
+                    f"after {self.deferred_kv_release_timeout}s; holding "
+                    f"(freeing while a remote write may be in flight would "
+                    f"corrupt whichever request is reissued these pages)."
+                )
+                # Rate-limit the re-log; not a release deadline.
+                deadline = now + self.deferred_kv_release_timeout
+            still_held.append(
+                (decode_req, start_time, deadline, idx, required_acks)
+            )
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
-        for decode_req, start_time, idx, room, drained in to_release:
-            if not drained:
+        for decode_req, start_time, idx, room, outcome in to_release:
+            if outcome == "peer_dead":
                 logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
+                    f"Deferred KV release for room {room} releasing without a "
+                    f"drain ack because the prefill instance is down."
                 )
-            outcome = "drained" if drained else "timeout"
             try:
                 self._do_release(decode_req, idx)
             except Exception:
