@@ -323,3 +323,46 @@ HEAD/dev: affected (both air-tightness holes exist at :328-335 coverage and
 :4843 single call site). v0.5.14-v0.5.20: external linker/MooncakeDirectLinker
 not present (introduced after) — N/A on public prod tags. K3: to check if it
 carries the linker.
+
+### C6-narrowed (board #65): output-commit cadence & extra surfaces — VERDICT SEALED
+Decisive question: is finish_external_linker_loads invoked per batch BEFORE any
+output consumption for those rids?
+- Call graph: run_batch (generation AND embedding) calls finish_external_linker_loads
+  at scheduler.py:4843 as its LAST step before returning `ret`; discard_output_reason
+  set there (sync). The event loop processes that batch's results ONLY after
+  run_batch returns: event_loop_normal (scheduler.py:1978-1980) run_batch →
+  process_batch_result sequentially; event_loop_overlap processes batch N AFTER
+  run_batch(N) returned (overlap only defers process to the NEXT loop turn while
+  run_batch(N+1) is launched; N's discard is already marked). PP: per-rank
+  run_batch per micro-batch — see the PP escape (other rank's own processing is
+  timely; the hole is the cross-stage verdict).
+- Consumption order inside processors (both prefill :258-502 and decode
+  :942-1089): per-req loop FIRST (discard gate :316 commit-skip, :473-478
+  to_finish+release), stream_output LATER (:502, :1089). stream_output only
+  emits committed output_ids and finish states — the dropped garbage token never
+  enters output_ids. No channel re-orders these.
+- Logprobs: emitted from the same committed stream; the failing forward is the
+  request's FIRST forward (linker loads run at admission only:
+  init_load_back→linker.load_back at schedule_policy.py:1456, admission path;
+  no mid-decode linker load exists) → no prior-token logprob stream for this
+  request exists at failure time.
+- Cache-report: failed loads never reach the tree (skip_radix_cache_insert;
+  slots request-private until success, load_back_is_cache_owned False) → no
+  cache metric events from garbage.
+- MLA-dedup wrinkle (stale broadcast to peers): peers' finish verdict comes
+  from finish_loads MIN over the SAME attn group shared with the src → src's
+  failure folds in → all peers discard. Containment held; cost is one wasted
+  batch forward per failure (compute burned on garbage, nothing emitted).
+
+### C6 hygiene (verified, for the eventual fix)
+- complete()-after-fail: unreachable in current call graph (fail inside the same
+  try aborts the layer loop; the finally session-end fail path is done()-guarded).
+  The done() guard on complete() is still correct hardening for future callers —
+  keep as a 2-line hardening in the fix PR, no behavior change today.
+- broadcast_loads[index] leak on abort-before-last-layer: CONFIRMED small —
+  mooncake_direct_linker.py:271-291 only deletes the entry when
+  threshold == num_layers-1; if the req's subsequent forwards never wait the
+  final layers (aborted via discard), the entry (prepared device index tensors +
+  event) lingers until cache reset() (:423). Bounded by failed-linker batches
+  since last reset; device-side. Fix shape: pop on counter failure (hook into
+  fail path) or on finish_loads verdict=False.
