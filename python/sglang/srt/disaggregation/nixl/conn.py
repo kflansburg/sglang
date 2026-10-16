@@ -92,9 +92,7 @@ def _healthy_settle_timeout_s() -> float:
     # errors out) must not wedge the worker and starve every other room sharded
     # to its queue; past the bound we fail the room like a settle timeout and
     # let the decode side's waiting-timeout path conclude the abort.
-    from sglang.srt import environ as _envs
-
-    return _envs.SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S.get()
+    return envs.SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S.get()
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
