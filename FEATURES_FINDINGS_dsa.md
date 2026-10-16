@@ -199,3 +199,11 @@ Decisive code evidence (2026-10-16):
 - Guard-port decision: PORT V4 pure_surplus to non-V4 (pools-lead coordinates, alloc-auditor
   implements, dsa-auditor reviews).
 - Merge queue: #16 submitted by features-lead for #27/#28; local queue-venv run: 21 passed, 0 failed.
+
+## Seam verify: forward_mha.py:691 non-aiter fp8 DCP widened page_table (allocplan handoff) — REJECTED
+- page_table_1_flattened: single producer dsa_backend.py:1254 from raw physical req_to_token
+  page table (:1071). DCP widening (localize_dcp_page_table, :3846) applies to page_table_1
+  only, at call time inside the sparse flow. Metadata flatten stays physical.
+- Consumers (:2330/:2379, forward_mha fp8 dequant) all read the same metadata field. Consistent.
+- aiter filter/translate is ROCm raw-layout compensation (576B vs 656B comment forward_mha.py:664-685).
+- Reported to unified-auditor (#756).
