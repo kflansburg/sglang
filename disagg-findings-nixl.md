@@ -154,3 +154,21 @@ a remote OOB write should be impossible-by-assert, not by convention).
   645 passed; 12 failing tests pre-exist on origin/main (proved by running with nixl/conn.py+environ.py
   restored to origin/main: identical 12 failures).
 - Merge queue: first submit failed on env (no pytest in queue image); env rebuild in progress by lead.
+
+
+## Coverage verdict (nixl/conn.py, end-to-end, HEAD 3420bae)
+| Area | Lines | Verdict |
+|------|-------|---------|
+| peer registration + reload | 1598-1709 | reload fixed upstream; V1 race REFUTED (invariant documented d31ab20) |
+| transfer worker lifecycle/settle | 1232-1596 | F3 wedge FIXED (bounded healthy wait, board #34); F4 refuted |
+| _await_handles | 726-763 | fixed per V3 (default 300 s, distinct reason) |
+| descriptor/index math (expand_page_indices_for_slice, num_kv_slots, repeat_indices_over_layers, dcp) | 337-390, 1952+ | checked: no OOB found; dst geometry validated in _prepare_payload_xfer/_build_transfer_dst_indices |
+| _send_kvcache_generic prepped + non-prepped | 1710-1930 | parent mismatch length-swap guarded by group_concurrent_contiguous; no new bug |
+| send_kvcache_slice/staged/mixed/dcp | 1987-2265 | bounds tied to staging_buffer layout (owner: staging); slice-dst per-peer handles ok |
+| send_aux/state slices (mamba/SWA/DSA) | 2362-2510, 2697-2930 | V2 aux count assert fixed; state item_len pairing validated, OK |
+| abort/deferred ack interplay | 3167-3214 | F8 FIXED by disagg-decode (#19); F9 FIXED by disagg-prefill (#31 pending test fix) |
+| bootstrap thread, sender/receiver | 3214-3638 | failure-records slow-leak for unknown rooms noted (minor, unfixed); status monotonicity guarded |
+| notification parsing | 2930-3167 | F6 noted (low): one malformed notif drops batch tail |
+Remaining open items assigned to me: none blocking. F4 deep-dive only if a concrete
+interleaving emerges. Wire-compat note: F2 count-only assert — geometry equality check via wire
+(aux_item_lens frame) is an optional follow-up.
