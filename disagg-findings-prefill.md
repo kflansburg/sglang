@@ -239,3 +239,12 @@ PRODUCTION-SURFACE notes for my scope:
 
 ENVIRONMENT list for lead's rebuild (hit during my sweeps): datasets,
 prometheus_client, loguru; merge-queue system-python still needs pytest itself.
+- pp_consensus_store.py (218): replicated PUT/DELETE map; ordered PUSH per
+  rank, bounded peer_map (pp_size), malformed-frame decode drops (msgspec),
+  unauthenticated by design (cluster). Consensus consumers treat lag as
+  "undone" (verified in process_disagg_prefill_inflight_queue rids_to_check
+  branch). VERDICT: clean.
+- role_switch.py: idle-gating covers prefill queues (deep-verified by
+  disagg-decode); teardown/disaggregation queue clear + deregister order
+  checked: release_memory_occupation clears bootstrap queue + deregisters
+  engine only when fully idle (asserted upstream of call). VERDICT: clean.
