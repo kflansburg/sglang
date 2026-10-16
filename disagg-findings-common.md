@@ -74,3 +74,30 @@ Status codes: CANDIDATE (reasoning shown, needs repro/second review), VERIFIED, 
 Key choice points: (1) minter: decode receiver, when it first registers to a room, alongside bootstrap_room; (2) wire placement: extra trailing frame on BOOTSTRAP and ABORT multipart messages (old peers ignore trailing frames -> wire-compatible rollout; same pattern as the optional generation frame already on AbortNotification); (3) prefill stores (room, token) at DeferredBootstrap.register and requires match on fail(); (4) cross-version: absence of token = legacy behavior (accept), presence-with-mismatch = drop + warn; (5) token source: 64-bit random per request (NOT the room generation counter, which increments per decode instance lifecycle and is guessable). Defer until fix wave clears.
 
 ## ASYMMETRY NIT (lead-approved, follow-up): AUX_DATA out-of-bounds -> dropped (decode thread lives; request dies by waiting_timeout), whereas KV geometry mismatch -> room Failed immediately. The aux path lacks room->receiver plumbing to fail fast. Note for later hardening: pass the room's receiver into _handle_aux_data or key aux buffers per room.
+
+## F20. FIXED (this branch) — StagingAllocator.assign accepted required_bytes<=0: a wire-decoded negative page count (STAGING_REQ chunk_num_pages) would regress ring head -> same-round overlap of two live allocations -> cross-request staging corruption. Guard: raise ValueError on non-positive size (staging_buffer.py). Test: test_allocator_rejects_nonpositive_size.
+## F21. FIXED (this branch) — negative chunk_idx wire aliasing: STAGING_REQ/STAGING_RSP chunk_idx<0 would index per-chunk lists from the END (Python negative indexing), silently overwriting another chunk's (alloc_id, offset, round, end) — prefill gathers into a region owned by a different allocation -> cross-request KV corruption; verified repro (set_chunk(-1) overwrites chunk 1). Guards: ValueError in StagingTransferInfo.set_chunk (+<0 drop at handle_staging_rsp, STAGING_REQ field drop in handle_staging_req), WATERMARK out-of-range drop. Tests: 6 in test_aux_codec_bounds.py TestStagingWireFieldGuards.
+- Frame handler exposure note: the corrupted-frame precondition is a miswired/buggy peer or pointer corruption in ZMQ frames (unauthenticated intra-cluster fabric — known trust boundary). Guards convert silent corruption into drop+warn.
+- VERIFIED live-reachability at v0.5.x? STAGING_REQ/RSP only exist on staging-enabled builds; production flag SGLANG_DISAGG_STAGING_BUFFER may be enabled for non-MLA. Version tags: run version-triage separately (staging module present HEAD; likely absent pre-0.5.16).
+
+## PD TRUST-BOUNDARY CHECKLIST (lead sweep item 2) — wire-controlled fields in common/bootstrap.py + common/staging_handler.py (+ common/conn.py parsers + common/utils.py codec surfaces), each marked CHECKED (validated in code) or CONSTRAINED (provably bounded by protocol state) or OPEN:
+| Frame / surface | Field | Verdict | Where |
+|---|---|---|---|
+| BOOTSTRAP (_handle_bootstrap_message) | room | CHECKED: unknown rooms refused (F18); else sender-owned | common/bootstrap.py |
+| BOOTSTRAP | endpoint (ip, port) | CONSTRAINED: only used as ZMQ status-notify target; bogus -> send fails, no state | common/bootstrap.py + conn.py _notify_bootstrap |
+| ABORT | room | CHECKED: same as BOOTSTRAP room (F18) + backend drains via generation ACKs | conn.py + bootstrap.py |
+| STAGING_REQ | room | CONSTRAINED: must exist in room_receivers (populated at prealloc) else dropped; <0 dropped (F21) | staging_handler.py handle_staging_req |
+| STAGING_REQ | chunk_idx | CHECKED: <0 dropped (F21); large idx -> ALLOC grows list to idx on DECODE receiver.chunk_staging_infos (bounded by prefill-announced chunk count? NOT bounded by dst page count within this fn — OPEN low: unbounded list growth if idx huge, DoS only) | staging_handler.py |
+| STAGING_REQ | chunk_num_pages | CHECKED: <=0 dropped (F21); huge -> required>total -> ALLOC_OVERSIZED (bounded) | staging_handler.py |
+| STAGING_REQ | session_id | CONSTRAINED: only routed back in RSP; string | staging_handler.py |
+| STAGING_RSP | room, chunk_idx | chunk_idx CHECKED (F21) room: tinfo lookup miss -> warn+drop | staging_handler.py handle_staging_rsp |
+| STAGING_RSP | offset/round/end | CHECKED-by-protocol: consumed by check_ready against allocator state via watermark; gather bounds = fits()+watermark; corrupt values -> watermark refuse (prefill defers) | staging_handler.py |
+| WATERMARK | round/tail/session | CHECKED: <0 dropped (F21); monotonicity enforced by tuple compare (can only advance); session free-form (new sessions land in dict — OPEN low: unbounded session keys DoS) | staging_handler.py |
+| CHUNK_READY | room | CONSTRAINED: room must be registered (staging_room check) | staging_handler.py handle_chunk_arrived |
+| CHUNK_READY | page_start/num_pages | CLOSED w/ assumption (lead): token window relies on suffix-relative dst_kv_indices invariant (F13); in-pool by construction; NOT bounds-checked in _scatter_region | staging_handler.py _scatter_region |
+| CHUNK_READY | writer_id | CONSTRAINED: fan-in counter only | staging_handler.py |
+| AUX_DATA (codec, common/utils.py) | buffer_index/aux_index/len | CHECKED post-#42 union: exact-equality + bounds incl buffer_index + aux_data_lens fold | mooncake/conn.py + common/utils.py |
+| kv status msg (parse_kv_status_message) | room/status/rank/reason | CHECKED: room must exist in request_status else dropped; status enum-compared; rank counted in set; reason string only recorded | common/conn.py |
+| ABORT_ACK | room/rank/generation | CHECKED: generation must match armed generation; ranks in set | common/conn.py note_abort_ack |
+| DeferredBootstrap register frame (decode->prefill BOOTSTRAP endpoint) | room/endpoint | CHECKED: register() rejects second endpoint for a room (no replace) | common/bootstrap.py |
+Remaining OPEN-low items (documented, not gated): huge chunk_idx list growth on decode chunk_staging_infos; unbounded watermark session keys; CHUNK_READY duplicate frames can accelerate fan-in (scatter of partially-written staging region — integrity nit, trust-boundary).
