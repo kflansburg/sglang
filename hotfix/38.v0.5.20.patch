@@ -1,0 +1,42 @@
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index e7bee63c01..7ef4525588 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -508,8 +508,18 @@ class RadixCache(BasePrefixCache):
+         key_len = len(radix_key)
+         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+ 
++        # Guard: never insert or free below the tree's recorded protection for
++        # this request. A trimmed finish (e.g. stop-string / strip_thinking /
++        # spec-verify overshoot) after an unfinished checkpoint advanced
++        # cache_protected_len into generated output would otherwise hand
++        # tree-owned rows back to the allocator (freed double at evict and
++        # aliased by the next allocation). The freed tail is clamped to start
++        # past the protected prefix either way.
++        protected_len = req.kv.cache_protected_len
++        insert_and_release = key_len > protected_len
++
+         # Radix Cache takes one ref in memory pool
+-        if is_insert:
++        if is_insert and insert_and_release:
+             priority = getattr(req, "priority", 0) or 0
+             result = self.insert(
+                 InsertParams(key=radix_key, value=values, priority=priority)
+@@ -543,6 +553,8 @@ class RadixCache(BasePrefixCache):
+         else:
+             freed_end = key_len
+ 
++        tail_start = max(freed_end, key_len, protected_len)
++
+         # duplicates / uninserted range, then the unaligned tail
+         self.token_to_kv_pool_allocator.free_segments(
+             [
+@@ -550,7 +562,7 @@ class RadixCache(BasePrefixCache):
+                     kv_indices[req.kv.cache_protected_len : freed_end],
+                     req.kv.cache_protected_len,
+                 ),
+-                (kv_indices[key_len:], key_len),
++                (kv_indices[tail_start:], tail_start),
+             ]
+         )
+ 
