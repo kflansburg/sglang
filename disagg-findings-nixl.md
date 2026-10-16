@@ -99,3 +99,39 @@ total_staging_needed consistency depends on compute_staging_layout correctness
   worker loop — inspect common/conn.py (another agent's overlap) for ack target bookkeeping.
 - Freeing KV after 30s timeout while RDMA in flight: NIXL side now has `_await_handles` settle
   BEFORE conclude_failure (good), but see F3 hang risk.
+
+
+### F8 (HIGH; known-bag sibling, live in NIXL device-destination path)
+decode.py resolve_deferred_releases:2989-2996: for DEVICE destinations,
+`drained = kv_mgr.is_abort_release_safe(room, required_acks)`; if not drained and
+`now >= deadline` the entry is released ANYWAY (warning at 3000-3006, _do_release).
+Deadline = SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT, default 30 s
+(environ.py:729); deferred release default ON (environ.py:728).
+NIXL drain proof: prefill-side transfer worker must (a) observe the room, (b) post
+_all_ handles for counted chunks, (c) settle them, (d) fire _maybe_ack_drained_abort,
+(e) ACK must traverse ZMQ to the decode listener before the deadline. A slow
+multi-chunk transfer (large chunked-prefill, congested RDMA, or a peer in the
+reload path) can exceed 30 s while NIXL still holds descriptors to those remote KV
+pages. Decode then frees the pages, hands them to a new request, and prefill's
+in-flight RDMA WRITE smears aborted KV into the new request's pages → classic
+cross-request corruption, the "30 s timeout while RDMA in flight" class.
+Note the HOST path (host_staged) is correctly conservative: never releases on
+timeout ("A timeout cannot prove that a remote write has stopped", 2982-2987).
+The device path needs either the same no-timeout guarantee or a prefill-side
+NIXL-level "no handles reference this destination" proof.
+
+### F9. ABORT fanout is partial-failure-prone (ACK starvation → 30 s stall, secondary)
+_send_abort_notification (common/conn.py:2593-2640): exceptions per rank are
+swallowed (`except Exception: logger.debug`). If rank k's send fails, prefill rank
+k never marks the room Failed, keeps it WaitingForInput until its own bootstrap/
+waiting timeout, and never ACKs → decode device path releases on F8 timeout.
+Also abort_notified stays True so no retry. Fix: track failed ranks and re-arm.
+
+### Aux geometry answer for F2 (lead question)
+aux buffers on both sides are the SAME metadata-buffer class:
+- prefill.py:321 and decode.py:649 both set kv_args.aux_* = self.metadata_buffers.get_buf_infos().
+So entry count and item_lens are symmetric for same-version peers; spec decode
+(draft model) affects kv_data_ptrs (num_draft_entries) and state buffers, not the
+metadata aux set. F2 therefore requires version skew or a geometry bug in
+metadata_buffers itself. Downgrade F2 to LOW (defensive check still warranted:
+a remote OOB write should be impossible-by-assert, not by convention).
