@@ -370,9 +370,21 @@ class KVCacheConfigurator:
             return max_total_num_tokens
         # Target rows widen into attn_dcp_size ids; draft sizes already carry
         # loc_space_scale.
-        return (
+        widened = (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
+        # req_to_token stores these widened virtual ids in int32: a wrap to
+        # negative ids silently aliases requests' KV (sink clamp hides it, and
+        # torch negative indexing restores the WRONG rows on offload) with no
+        # earlier failure. Mirror unified_memory_pool's _assert_physical_id_bound.
+        assert widened < 2**31, (
+            f"DCP-widened virtual loc space {widened} exceeds the int32 bound "
+            f"(2^31) req_to_token assumes: max_total_num_tokens="
+            f"{max_total_num_tokens} * attn_dcp_size="
+            f"{get_parallel().attn_dcp_size} / loc_space_scale={self.loc_space_scale}. "
+            "Reduce the token capacity or the DCP size."
+        )
+        return widened
 
     def _resolve_kv_shard(self) -> None:
         """Resolve the logical-page KV sharding identity: ``(rank, size)`` of
