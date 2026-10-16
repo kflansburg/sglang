@@ -1,0 +1,294 @@
+diff --git a/python/sglang/srt/disaggregation/encoder/server.py b/python/sglang/srt/disaggregation/encoder/server.py
+index 68877a0ed6..08e4ac495c 100644
+--- a/python/sglang/srt/disaggregation/encoder/server.py
++++ b/python/sglang/srt/disaggregation/encoder/server.py
+@@ -1463,6 +1463,23 @@ class MMEncoder:
+             return [], []
+         return hashes, handles
+ 
++    def _cancel_staged_cache_inserts(self, *d2h_handle_lists: List[Any]):
++        """Abort staged cache inserts whose assembly failed.
++
++        Without this, entries created by store_to_pool_async stay in FILLING
++        state forever; FILLING entries are not evictable, so their pool pages
++        would be lost permanently.
++        """
++        if self.rank != 0:
++            return
++        handles = [h for lst in d2h_handle_lists for h in lst]
++        if not handles:
++            return
++        try:
++            self.mm_global_cache.cancel_store_to_pool(handles)
++        except Exception:
++            logger.exception("Failed to cancel staged cache inserts")
++
+     def _launch_global_cache_insert(
+         self,
+         ctx: EncodeContext,
+@@ -1581,28 +1598,36 @@ class MMEncoder:
+ 
+         offset = 0
+         copy_handles = []
+-        for idx, num_tokens in enumerate(token_counts):
+-            if idx in miss_slice_pos:
+-                mm_embedding[offset : offset + num_tokens].copy_(
+-                    new_slices[miss_slice_pos[idx]],
+-                    non_blocking=True,
+-                )
+-            elif idx in fallback_slice_pos:
+-                mm_embedding[offset : offset + num_tokens].copy_(
+-                    fallback_slices[fallback_slice_pos[idx]],
+-                    non_blocking=True,
+-                )
+-            else:
+-                handle = self.mm_global_cache.load_to_device_async(
+-                    ctx.str_mm_hashes[idx], mm_embedding, offset
+-                )
+-                if handle is None:
+-                    raise InternalError(
+-                        f"Cached embedding {ctx.str_mm_hashes[idx]} disappeared "
+-                        f"during assembly for req {ctx.req_id}"
++        try:
++            for idx, num_tokens in enumerate(token_counts):
++                if idx in miss_slice_pos:
++                    mm_embedding[offset : offset + num_tokens].copy_(
++                        new_slices[miss_slice_pos[idx]],
++                        non_blocking=True,
++                    )
++                elif idx in fallback_slice_pos:
++                    mm_embedding[offset : offset + num_tokens].copy_(
++                        fallback_slices[fallback_slice_pos[idx]],
++                        non_blocking=True,
++                    )
++                else:
++                    handle = self.mm_global_cache.load_to_device_async(
++                        ctx.str_mm_hashes[idx], mm_embedding, offset
+                     )
+-                copy_handles.append(handle)
+-            offset += num_tokens
++                    if handle is None:
++                        raise InternalError(
++                            f"Cached embedding {ctx.str_mm_hashes[idx]} disappeared "
++                            f"during assembly for req {ctx.req_id}"
++                        )
++                    copy_handles.append(handle)
++                offset += num_tokens
++        except BaseException:
++            # Release the read pins taken by load_to_device_async before
++            # propagating; otherwise entries stay pinned forever and their
++            # pool pages can never be evicted (permanent pool leak).
++            if copy_handles:
++                self.mm_global_cache.wait_load_to_device(copy_handles)
++            raise
+ 
+         self.mm_global_cache.wait_load_to_device(copy_handles)
+         torch.cuda.current_stream(mm_embedding.device).synchronize()
+@@ -1630,75 +1655,93 @@ class MMEncoder:
+ 
+         miss_hashes = []
+         miss_d2h_handles = []
+-        # The CPU output path starts D2H staging before waiting for cache-hit loads.
+-        if self.rank == 0 and new_slices and not keep_on_gpu:
+-            miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+-                ctx, missing_indices, new_slices
+-            )
+-
+-        fallback_indices = await self._wait_global_cache_prefetch(
+-            ctx, hit_indices, hit_hashes, prefetch_failed
+-        )
+-
+-        fallback_slices = []
+         fallback_hashes = []
+         fallback_d2h_handles = []
+-        if fallback_indices:
+-            logger.info(
+-                f"Req {ctx.req_id}: All ranks running ViT fallback "
+-                f"for {len(fallback_indices)} items."
+-            )
+-            fallback_slices = self._encode_missing(
+-                ctx.mm_feature,
+-                ctx.preprocess_result,
+-                fallback_indices,
+-                ctx.modality,
+-                ctx.get_feature_fn,
+-            )
+-            if self.rank == 0 and not keep_on_gpu:
+-                fallback_hashes, fallback_d2h_handles = self._stage_global_cache_slices(
+-                    ctx, fallback_indices, fallback_slices
++        try:
++            # The CPU output path starts D2H staging before waiting for
++            # cache-hit loads.
++            if self.rank == 0 and new_slices and not keep_on_gpu:
++                miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
++                    ctx, missing_indices, new_slices
+                 )
+ 
+-        if self.rank == 0:
+-            if keep_on_gpu:
+-                # Start staging newly computed GPU slices into the CPU cache
+-                # pool asynchronously before assembling the GPU output.
+-                if new_slices:
+-                    miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+-                        ctx, missing_indices, new_slices
+-                    )
+-                if fallback_slices:
++            fallback_indices = await self._wait_global_cache_prefetch(
++                ctx, hit_indices, hit_hashes, prefetch_failed
++            )
++
++            fallback_slices = []
++            if fallback_indices:
++                logger.info(
++                    f"Req {ctx.req_id}: All ranks running ViT fallback "
++                    f"for {len(fallback_indices)} items."
++                )
++                fallback_slices = self._encode_missing(
++                    ctx.mm_feature,
++                    ctx.preprocess_result,
++                    fallback_indices,
++                    ctx.modality,
++                    ctx.get_feature_fn,
++                )
++                if self.rank == 0 and not keep_on_gpu:
+                     fallback_hashes, fallback_d2h_handles = (
+                         self._stage_global_cache_slices(
+                             ctx, fallback_indices, fallback_slices
+                         )
+                     )
+-                mm_embedding = self._assemble_global_cache_gpu(
+-                    ctx,
+-                    missing_indices,
+-                    fallback_indices,
+-                    new_slices,
+-                    fallback_slices,
+-                )
+-            else:
+-                mm_embedding = self._assemble_global_cache_cpu(
++
++            if self.rank == 0:
++                if keep_on_gpu:
++                    # Start staging newly computed GPU slices into the CPU
++                    # cache pool asynchronously before assembling the output.
++                    if new_slices:
++                        miss_hashes, miss_d2h_handles = (
++                            self._stage_global_cache_slices(
++                                ctx, missing_indices, new_slices
++                            )
++                        )
++                    if fallback_slices:
++                        fallback_hashes, fallback_d2h_handles = (
++                            self._stage_global_cache_slices(
++                                ctx, fallback_indices, fallback_slices
++                            )
++                        )
++                    mm_embedding = self._assemble_global_cache_gpu(
++                        ctx,
++                        missing_indices,
++                        fallback_indices,
++                        new_slices,
++                        fallback_slices,
++                    )
++                else:
++                    mm_embedding = self._assemble_global_cache_cpu(
++                        ctx,
++                        hit_indices,
++                        missing_indices,
++                        fallback_indices,
++                        new_slices,
++                        fallback_slices,
++                    )
++
++                self._launch_global_cache_insert(
+                     ctx,
+-                    hit_indices,
+-                    missing_indices,
+-                    fallback_indices,
+-                    new_slices,
+-                    fallback_slices,
++                    miss_hashes + fallback_hashes,
++                    miss_d2h_handles + fallback_d2h_handles,
+                 )
++                # Ownership of the handles moved to the background task.
++                miss_d2h_handles = []
++                fallback_d2h_handles = []
++                return mm_embedding
+ 
+-            self._launch_global_cache_insert(
+-                ctx,
+-                miss_hashes + fallback_hashes,
+-                miss_d2h_handles + fallback_d2h_handles,
+-            )
+-            return mm_embedding
+-
+-        return None
++            return None
++        except BaseException:
++            # Any failure after staging must abort the staged D2H stores:
++            # unfinished entries stay FILLING forever (never evictable), so
++            # their pool pages would be lost permanently.
++            if self.rank == 0:
++                self._cancel_staged_cache_inserts(
++                    miss_d2h_handles, fallback_d2h_handles
++                )
++            raise
+ 
+     async def _compute_direct_embedding(
+         self,
+diff --git a/python/sglang/srt/mem_cache/embedding_cache_controller.py b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+index 4a95d36351..da24079af3 100644
+--- a/python/sglang/srt/mem_cache/embedding_cache_controller.py
++++ b/python/sglang/srt/mem_cache/embedding_cache_controller.py
+@@ -968,12 +968,49 @@ class EmbeddingCacheController:
+                 pending.append((tensor, entry))
+ 
+         handles: List[Tuple[EmbeddingCacheEntry, AsyncCopyHandle]] = []
+-        for tensor, entry in pending:
+-            handle = self._copy_tensor_to_pool(tensor, entry, pool)
+-            handles.append((entry, handle))
++        try:
++            for tensor, entry in pending:
++                handle = self._copy_tensor_to_pool(tensor, entry, pool)
++                handles.append((entry, handle))
++        except Exception:
++            # A copy launch failure must not leak FILLING entries (they are
++            # not in the evictable LRU, so their pages would be lost
++            # permanently). Wait for copies issued so far, then free all
++            # pending entries and their pages.
++            self.cancel_store_to_pool(handles)
++            with self.lock:
++                for _tensor, entry in pending[len(handles) :]:
++                    current = self.entries.get(entry.hash)
++                    if current is entry and current.state == EntryState.FILLING:
++                        self._evict_entry(entry.hash)
++            raise
+ 
+         return handles
+ 
++    def cancel_store_to_pool(
++        self,
++        handles: List[Tuple["EmbeddingCacheEntry", "AsyncCopyHandle"]],
++    ):
++        """Abort a store: wait for issued D2H copies (best effort) and free
++        the FILLING entries and their pool pages.
++
++        Must be called by any caller that obtained handles from
++        store_to_pool_async() but will not call wait_store_to_pool()
++        (e.g. because request assembly failed). Without this the entries are
++        stuck in FILLING state; FILLING entries are never added to the
++        evictable LRU, so their pages would leak permanently.
++        """
++        for _entry, handle in handles:
++            try:
++                handle.wait()
++            except BaseException:
++                pass
++        with self.lock:
++            for entry, _handle in handles:
++                current = self.entries.get(entry.hash)
++                if current is entry and current.state == EntryState.FILLING:
++                    self._evict_entry(entry.hash)
++
+     def wait_store_to_pool(
+         self,
+         handles: List[Tuple["EmbeddingCacheEntry", "AsyncCopyHandle"]],

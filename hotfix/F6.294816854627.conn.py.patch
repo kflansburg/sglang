@@ -1,0 +1,18 @@
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -1321,6 +1321,15 @@
+                     logger.warning(
+                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
+                     )
++                    if (
++                        abs(len(src_indices) - len(dst_indices_local))
++                        > self.kv_args.page_size
++                    ):
++                        raise RuntimeError(
++                            f"prefill/decode state index drift "
++                            f"{len(src_indices) - len(dst_indices_local)} "
++                            f"exceeds one page for room {kv_chunk.room}"
++                        )
+                     if len(src_indices) > len(dst_indices_local):
+                         src_indices = src_indices[: len(dst_indices_local)]
+                     else:

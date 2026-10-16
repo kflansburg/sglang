@@ -1,0 +1,178 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index c701dc16..2f22f760 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
+ 
+ from sglang.srt.mem_cache.pool_host import HostKVCache
+ from sglang.srt.mem_cache.pool_host.base import (
++    assert_valid_host_slot_indices,
+     _WRITE_BACK_STAGING_PAGE_CHUNK,
+     host_memory_budget_bytes,
+     synchronized,
+@@ -90,6 +91,9 @@ class LogicalHostPool:
+         # until an allocation needs the released slots.
+         self.release_slots = []
+         self.num_release_slots = 0
++        # Per-slot flag used to detect double-free/double-alloc, mirroring
++        # HostKVCache.clear: slot_used[k] is true if slot k is allocated.
++        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+ 
+     def destroy(self) -> None:
+         """Logical anchors own no backing buffers or registrations to release."""
+@@ -125,6 +129,12 @@ class LogicalHostPool:
+ 
+         select_index = self.free_slots[:need_size]
+         self.free_slots = self.free_slots[need_size:]
++
++        assert not self.slot_used[select_index].any(), (
++            f"Double-alloc detected: slots already allocated: "
++            f"{select_index[self.slot_used[select_index]].tolist()}."
++        )
++        self.slot_used[select_index] = True
+         return select_index
+ 
+     @synchronized
+@@ -134,10 +144,16 @@ class LogicalHostPool:
+                 "LogicalHostPool free must be page-aligned, "
+                 f"got len(indices)={len(indices)}, page_size={self.page_size}"
+             )
+-        indices_cpu = indices.to(dtype=torch.int64, device="cpu").flatten()
++        indices_cpu = indices.cpu()
+         if indices_cpu.numel() == 0:
+             return 0
+ 
++        assert_valid_host_slot_indices(indices_cpu, self.size)
++        assert self.slot_used[indices_cpu].all(), (
++            f"Double-free detected: slots not currently allocated: "
++            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
++        )
++        self.slot_used[indices_cpu] = False
+         self.release_slots.append(indices_cpu)
+         self.num_release_slots += len(indices_cpu)
+         return len(indices)
+@@ -390,6 +406,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+         self.release_slots = []
+         self.num_release_slots = 0
++        # Per-slot flag used to detect double-free/double-alloc, mirroring
++        # HostKVCache.clear: slot_used[k] is true if slot k is allocated.
++        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+ 
+     def available_size(self):
+         return len(self.free_slots) + self.num_release_slots
+@@ -407,6 +426,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+ 
+         select_index = self.free_slots[:need_size]
+         self.free_slots = self.free_slots[need_size:]
++
++        assert not self.slot_used[select_index].any(), (
++            f"Double-alloc detected: slots already allocated: "
++            f"{select_index[self.slot_used[select_index]].tolist()}."
++        )
++        self.slot_used[select_index] = True
+         return select_index
+ 
+     @synchronized
+@@ -415,6 +440,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+         if indices_cpu.numel() == 0:
+             return 0
+ 
++        assert_valid_host_slot_indices(indices_cpu, self.size)
++        assert self.slot_used[indices_cpu].all(), (
++            f"Double-free detected: slots not currently allocated: "
++            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
++        )
++        self.slot_used[indices_cpu] = False
+         self.release_slots.append(indices_cpu)
+         self.num_release_slots += len(indices_cpu)
+         return len(indices)
+diff --git a/python/sglang/srt/mem_cache/pool_host/base.py b/python/sglang/srt/mem_cache/pool_host/base.py
+index 7be9f25c..9f6a0103 100644
+--- a/python/sglang/srt/mem_cache/pool_host/base.py
++++ b/python/sglang/srt/mem_cache/pool_host/base.py
+@@ -110,6 +110,28 @@ def synchronized(func):
+     return wrapper
+ 
+ 
++def assert_valid_host_slot_indices(
++    indices: torch.Tensor, logical_size: int, *, context: str = "free"
++) -> None:
++    """Reject sentinel (-1) and out-of-range host slot indices.
++
++    Host slot tables in some HiCache paths are -1-padded. A negative index
++    silently wraps on torch: slot_used[-1] marks the LIVE last slot free and
++    -1 later enters the free list to be handed out as a valid slot id,
++    aliasing the final host row. Indices >= logical_size raise deep inside
++    torch; fail loudly here with a named caller instead.
++    """
++    assert bool((indices >= 0).all()), (
++        f"Host-pool {context}: negative (sentinel) slot indices are not valid: "
++        f"{indices[indices < 0].tolist()}. Filter -1-padded table entries before "
++        "freeing/indexing the host pool."
++    )
++    assert bool((indices < logical_size).all()), (
++        f"Host-pool {context}: slot indices out of range [0, {logical_size}): "
++        f"{indices[indices >= logical_size].tolist()}"
++    )
++
++
+ class HostKVCache(abc.ABC):
+     dcp_size = 1
+     dcp_rank = 0
+@@ -399,6 +421,7 @@ class HostKVCache(abc.ABC):
+         if indices_cpu.numel() == 0:
+             return 0
+ 
++        assert_valid_host_slot_indices(indices_cpu, self.logical_size)
+         assert self.slot_used[indices_cpu].all(), (
+             f"Double-free detected: slots not currently allocated: "
+             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+diff --git a/python/sglang/srt/mem_cache/pool_host/mamba.py b/python/sglang/srt/mem_cache/pool_host/mamba.py
+index 669d9966..bae51867 100644
+--- a/python/sglang/srt/mem_cache/pool_host/mamba.py
++++ b/python/sglang/srt/mem_cache/pool_host/mamba.py
+@@ -9,6 +9,7 @@ import torch
+ 
+ from sglang.srt.mem_cache.memory_pool import MambaPool
+ from sglang.srt.mem_cache.pool_host.base import (
++    assert_valid_host_slot_indices,
+     HostKVCache,
+     host_memory_budget_bytes,
+     sync_fixed_hicache_size,
+@@ -246,6 +247,9 @@ class MambaPoolHost(HostKVCache):
+         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+         self.release_slots = []
+         self.num_release_slots = 0
++        # Per-slot flag used to detect double-free/double-alloc, mirroring
++        # HostKVCache.clear: slot_used[k] is true if slot k is allocated.
++        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+ 
+     def available_size(self):
+         return len(self.free_slots) + self.num_release_slots
+@@ -263,6 +267,12 @@ class MambaPoolHost(HostKVCache):
+ 
+         select_index = self.free_slots[:need_size]
+         self.free_slots = self.free_slots[need_size:]
++
++        assert not self.slot_used[select_index].any(), (
++            f"Double-alloc detected: slots already allocated: "
++            f"{select_index[self.slot_used[select_index]].tolist()}."
++        )
++        self.slot_used[select_index] = True
+         return select_index
+ 
+     @synchronized
+@@ -271,6 +281,12 @@ class MambaPoolHost(HostKVCache):
+         if indices_cpu.numel() == 0:
+             return 0
+ 
++        assert_valid_host_slot_indices(indices_cpu, self.size)
++        assert self.slot_used[indices_cpu].all(), (
++            f"Double-free detected: slots not currently allocated: "
++            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
++        )
++        self.slot_used[indices_cpu] = False
+         self.release_slots.append(indices_cpu)
+         self.num_release_slots += len(indices_cpu)
+         return len(indices)

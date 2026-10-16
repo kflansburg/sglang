@@ -1,4 +1,8 @@
-# SWA KV-cache audit — COVERAGE ROLL-UP (final)
+# SWA/mamba/spec features audit — COVERAGE ROLL-UP
+MERGES on dev: F-4 SWA leak @28acaf2 (MR#14) | replayssm lifecycle @9b15563 (MR#36) | F-1 fix + #69 R-1 fix train @4d0e4fe (agent/dsa-auditor MR#?) + F-1 durable PoC @4e9842c (MR#46) | R-1 durable witness @66d6ede (MR#53).
+HOTFIX PATCHES (v0.5.14/.15p1/.17[.20 F-4]) live in repo-root hotfix/ — F-4 x4, FF-1 x3, all git-apply+compile verified against pristine tags; README with per-tag apply commands, TP=1 no-op note, rollback guidance, HEAD refutation route (unified pool_hits MIN-reduce = hicache-lead C4).
+
+
 
 ## Verdict table
 | Area | Verdict | Evidence | Prod versions affected |
@@ -382,3 +386,219 @@ early-returns before touching buffers); all-true mask -> identical object
 returned (fast path). Combined with the earlier load_cpu_copy chunk-index
 contract analysis: no row/scale desync at chunk boundaries, including
 fp8_e4m3 per-token scales.
+
+
+## CARRY-OVER from mamba-auditor (branch agent/swa-auditor; item #8 now mine)
+
+### CANDIDATE 1 (deferred mamba COW source eviction window) — ALIVE (HiCache mode);
+  my earlier REFUTED verdict was WRONG (valid only for non-HiCache)
+
+CORRECTION (swa-auditor, after features-lead's counter-code review):
+The earlier proof concluded 'when COW is staged, best_match_node ==
+best_match_device_node == req.last_node'. That equality holds only for
+non-HiCache runs (validators == device validators). In HiCache mode the FULL
+component's relaxed validator (components/full.py:113): `value is not None or
+node.backuped` passes at an EVICTED-but-host-backed node. The tree walk
+(unified_tree_core match) can therefore yield:
+
+  best_match_device_node = A (deepest node with ALL device values, FULL evicted
+      at E below A), strictly ANCESTOR of
+  best_match_node = D (relaxed pass through the backuped gap; mamba DEVICE
+      value at D is non-None, e.g. D's own FULL value still on device).
+
+Stage check in finalize_match_result_in_cache (components/mamba.py:193) relies
+ONLY on D's mamba device value being non-None -> the COW IS staged from D.
+Admission lock binds to req.last_node = match_result.last_device_node = A
+(schedule_policy.py:1607 via common.set_prefix_state last_device_node), and
+acquire_component_lock (components/mamba.py:444) locks ONLY that single node;
+D's mamba slot stays lock_ref == 0 in the mamba LRU.
+
+Window: get_new_batch_prefill loops over waiting reqs; each later request's
+finalize/alloc can call evict_for_alloc(mamba_num=1) (dst allocs or KV
+pressure); D's value is freed via evict_component -> mamba_allocator.free and
+reused/donated; req A's deferred COW (_execute_mamba_deferred_ops at the batch
+forward) then copies a rewritten slot into a fresh active slot -> silent
+cross-request mamba-state leak / garbled output.
+
+Production reachability: HiCache on most deployments (page_first_direct,
+host chunks extending past device); mamba on Kimi K3. Whether K3 runs the
+unified radix + hierarchical combo in production determines blast radius
+(needs prod-config confirmation). Non-HiCache unified cache: not reachable
+(validators equal device validators, equality proof stands).
+
+Fix direction (mamba-auditor's sketch stands): in
+finalize_match_result_in_cache, inc_lock_ref(best_match_node, MAMBA-only) when
+staging a COW, dec after _collect_deferred_mamba_cow_and_clear /
+_execute_mamba_deferred_ops; or copy eagerly at match time (slot pair
+memcpy, no deferral).
+
+Status: CANDIDATE -> OPEN (mechanism confirmed at code level; PoC harness
+pending: hicache page_first_direct eviction-gap path with mamba checkpoints
+only below the gap). Independent re-verification requested of F-1's
+opens.
+
+NOTE (04:29, features-lead adjudication in FEATURES_FINDINGS_lead.md on
+agent/features-lead): F-1 confirmed via an even STRONGER mechanism than the
+evicted-gap path above: per-component independent eviction lets node N lose
+its FULL device value to host (host_value set, value None) while MAMBA on
+the SAME node survives device-side. Relaxed validators pass at N
+(best_match_node=N) while the FULL device validator fails
+(best_match_device_node=proper ancestor of N) — no second gap node needed.
+Our HiCache configs (page_first_direct, write_through) evict FULL-to-host
+routinely, making this the production-realizable shape; the gap-path variant
+is a strict special case of it. Plus the undisputed non-prefill windows
+(retract-before-extend; dec between boundary checkpoints; donation-reuse).
+
+
+
+## Mamba #8 deep-dive ledger (continuing)
+
+### Ping-pong / donate / extra_buffer accounting — CLEAN at HEAD
+- donate_mamba_ping_pong_slot: atomic swap (old slot out, new_slot in) + device
+  mapping sync in set_mamba_ping_pong_slot. Ownership: one holder per slot at
+  every step (int8_ckpt path: quantize + free(src_active) once; tree owns the
+  int8 slot; freed-once via _free_mamba_value at evict).
+- Finished donate: keep_idx chosen once in prepare_for_caching_req, recorded
+  into insert_params.mamba_keep_idx; cleanup_after_caching_req reuses the
+  recorded index (cannot pick another) -> free_mamba_cache frees exactly the
+  other slots. spec (buffer size 1) keeps only slot -> frees empty slice.
+- Abort-after-retract: holds_mamba guard (scheduler:5560) + reset_for_retract
+  nulling + mark_kv_released clearing component_evicted_seqlens make the
+  disagg-decode checkpoint=True abort branch is_kv_released-consistent.
+- Lazy-mode alloc failures (mamba_lazy_prealloc_at_boundary,
+  mamba_lazy_spec_prepare): on failure the forward writes in-place into the
+  keep slot and req.kv.mamba_last_track_seqlen is poisoned to None, which
+  gates all later donates (cache_len None -> None checkpoint). No -1 reaches
+  free paths: every free guards '!= -1'.
+- free_mamba_cache resets ALL ping-pong cursors after freeing - the stale-ref
+  reuse bug class is guarded ('double free? mamba_index is None' assert).
+### ReplaySSM write_pos vs donation — CONSISTENT for extra_buffer production path;
+  no_buffer mid-prefill checkpoint relies on 'ring empty at checkpoint' (debug
+  assert in copy_from), production K3 runs extra_buffer whose track slots are
+  fully-scattered at flush boundaries by construction; load_back supersedes
+  replay cursors (finalize_allocation zeroes write_pos for the req slot).
+### Candidates remaining from mamba-auditor worth breaking further:
+- -1 sink writes: caller-side guard evidence assembled; all free/copy sites
+  guard. open: any clear_slots caller passing raw indices (not seen).
+
+### F-1 FIX review residuals (dsa-auditor patch agent/dsa-auditor @ 91e3f20)
+CANDIDATE [leak-of-pin / availability]: dsa's clear_mamba_cow catch-all sits
+INSIDE HybridReqToTokenPool.free_mamba_cache's extra_buffer branch
+(memory_pool.py:1886). release_kv_cache's early-alloc-KV-failure branch
+(common.py:398-408: `if not req.kv.holds_kv: ... mamba_allocator.free(mamba_pool_idx); return`)
+bypasses free_mamba_cache entirely — a request that staged the COW (lock set
+on the src node at match), allocated its mamba dst, then fails KV admission
+and later dies via this branch leaks the SOURCE NODE PIN permanently
+(lock_ref stays elevated → node never evictable in the mamba LRU —
+availability rot; no corruption). Reported to dsa (message stream) with the
+suggested seam (clear in release_kv_cache on every mamba-capable exit — call
+is None-guarded). Spec harness attack deployed to pin it.
+
+### R-1 fix (board #69, merged-shape note)
+dsa-auditor @279eb8a: pad-verify last_row_cap=speculative_num_draft_tokens wired
+into deepseek_v4:1279, trtllm_mha:1149, flashattention:3122. VERSION NOTE
+(features-lead directive): trtllm_mla:1559 ALREADY passed cap=draft_token_num —
+only 3 of 4 consumers were live-risk. Layout semantics: fold=min(leftover,
+cap-len), remainder ghosted via total_verify_tokens=None (pre-existing cap=N
+route); triton sentinel -1 matches policy. 6/6 CPU suite green; pre-fix failure
+is mechanical (kwarg TypeError on 5/6 — semantic anchor = the legacy-compat
+test), independent witness PoC assigned to mamba-poc-author as post-merge task.
+Residual watched: sum(padded)<graph leaves static q-buffer tail unassigned for
+dense consumers; ghost-neutrality is asserted by the total_verify_tokens=None
+flow, pending witness-PoC verification.
+
+### F-1 PoC DELIVERED (board #60 complete)
+Author: mamba-poc-author @4e24639 (branch agent/mamba-poc-author);
+test/registered/unit/mem_cache/test_mamba_cow_evict_window_poc.py (330 lines).
+Architecture: REAL UnifiedRadixCache end-to-end via shared build_fixture —
+FULL+MAMBA components, real MambaSlotAllocator, real state buffers. Sole seam:
+mock.patch of get_device -> "cpu" (the builder's single non-portable call);
+no sgl_kernel dependency, runnable under the mandated queue command (verified
+in the fresh 05:17 shared env by swa-auditor).
+
+Mechanism: mamba_cache_chunk_size=8 + page_size=1 puts a mamba checkpoint at
+depth 8 with FULL at depth 16 -> COW source = proper ancestor of the FULL
+admission-lock anchor = the HiCache divergent-hit shape reproduced w/o HiCache
+(production's relaxed FULL validator yields the same anchor divergence; the
+stage->collect window hole is identical). Triple content-tracking assertions:
+source survival, slot re-let, content snapshot vs new-owner write (fill 999).
+Test 3 pins clear-balance (no permanent freeze after clear_mamba_cow).
+
+Pre-fix verbatim (origin/main, fresh env, exact queue cmd, 2 failed/1 passed):
+  staging_pins_the_source_node: AssertionError: 0 not >= 1 : F-1: a deferred
+    mamba COW is staged on a node whose mamba component is unlocked
+    (lock_ref == 0) -- evictable while the forward-stream copy is pending
+  evict_window_rewrites_staged_source_content: AssertionError: unexpectedly
+    None : the cache evicted the staged node; slot freed while the
+    forward-stream copy is still pending (arena deletion + slot-free witness)
+
+Post-fix: 3 passed in 18.93s against agent/dsa-auditor @3832b59 (c9b4d15
+full-hierarchy lock + c33f4e3 catch-all), re-verified by swa-auditor in a
+fresh worktree.
+
+VERSION SWEEP (author): F-1 staging in ALL production versions — v0.5.14
+(unified_cache_components/mamba_component.py:112), v0.5.15.post1, v0.5.17
+(same pattern), v0.5.20 (unified_cache/components/mamba.py:214, no lock).
+Kimi K3 base era (87dd4596/bd4828e2) pre-unified-cache; staging existed in
+the mamba_radix_cache.py era shape — LIKELY AFFECTED; vendor-branch ref not
+fetchable from origin, flagged for the coverage report / fix-port owner.
+
+Merge gating: PoC ships AFTER dsa's #17 lands on dev (asserts post-fix
+property).
+
+### R-1 WITNESS PoC (board #72, approved)
+Branch agent/mamba-poc-author-r1 @6f3c3e0 (based on dev ac0f192 post-F-1).
+File test/registered/unit/speculative/test_ragged_verify_last_row_inflation.py.
+REAL torso: RaggedVerifyLayout.from_verify_lens -> padded_to_bucket (cap=None
+full-coverage shape) + BuildQoIndptr + build_ragged_target_verify_geometry;
+no mocks/fixtures; adaptive via inspect.signature('last_row_cap').
+
+G1 VERIFIED (content-observation, grade as #66); independently re-run by
+swa-auditor: pre-fix lens [2,2,8] (fold of 4 over draft budget 4), overrun 4,
+sentinel stale slot ids [591000-591003] enter the last real row's verify
+window. Post-fix (dsa @3832b59 carrying #69, exact queue cmd): 3 passed.
+
+G2 REFUTED (numerics-corrupting grade), executable evidence + independent
+verification: accept_index tree-bounded per request (reject_sampling
+speculative_sampling_classic_kernel walks RetriveIndex with NUM_SLOTS =
+num_draft_tokens; eagle_utils accept entry argmax reshapes
+[bs, draft_token_num]); gather_spec_extras row-indexed (req_pool_indices);
+KV writes bounded by live total_verify_tokens (extras have no out_cache_loc).
+Extras' outputs structurally discarded -> grade stays G1; caveat (future
+flat-width consumer reopens G2) pinned in the witness docstring.
+
+MERGE PAUSE: branch parks until dsa's #69 merges to dev (durable-witness
+ordering); poc-author messages swa-auditor to drive the merge then.
+
+### K3 VENDOR-BRANCH DIAGNOSIS (lead directive #1554, 2026-10-16)
+The internal Kimi K3 branch point (base 87dd4596 / bd4828e2, tagged
+'about v0.5.16' in fleet metadata) is NOT reachable as a ref from the public
+sgl-project/sglang remote — git fetch confirms neither SHA exists there.
+Per lead: document as KNOWN-UNVERIFIABLE; record the evidence shape for the
+production hotfix channel instead.
+
+F-1 (mamba COW source lock-gap) on the K3-era shape: F-1 exists in v0.5.14
+v0.5.15.post1 v0.5.17 v0.5.20 (staging in
+unified_cache/components/mamba.py; pre-unified era
+unified_cache_components/mamba_component.py:112 in v0.5.14). The K3-era
+mamba checkpointing machinery predates the modern unified_cache tree: the
+staging site lives in red-black/hi_mamba-era code (mamba_radix_cache.py era).
+K3 runs prod = hybrid mamba + HiCache + PD-disagg (extra_buffer,
+linear-replayssm, hicache mooncake, page 64, fp8e4m3) — the divergent-hit
+precondition (FULL evicted-to-host below the mamba checkpoint node) maps
+directly. Adjudication: LIKELY AFFECTED. Fixing path for production: hotfix
+channel via vendor maintainers, NOT this repo's dev/main (file proprietary
+branch SHA 87dd4596/bd4828e2, affected-file: file_path-at-K3: report
+findings in KB/hotfix tracker with the F-1 PoC + verdict + dsa dev fix
+@mamba_cow.py as the reference patch). Same shape applies to the F-4 SWA
+alloc_decode leak (SWA fix @28acaf2 — leak in swa.py alloc_decode paths:
+K3-era status same-code likely affected — swa_memory_pool internals were
+stable across those versions; hotfix-channel ping recommended too) and the
+spec/iverted claim queue lines where flagged (spec VERSION NOTE in
+FEATURES_FINDINGS_spec.md route to .15/.16 hotfix checks).
+
+HOTFIX-CHANNEL DATA PACKAGE per finding: {branch-point SHA, era file map
+with the line numbers as of the affected production version, PoC evidence
+link = F-1 PoC SHA 4e24639/4e9842c + verbatim pre-fix assertions, verdict
+fixed-on-dev SHA, suggested minimal patch (dsa mamba_cow.py full-hierarchy
+lock + clear funnel)}.

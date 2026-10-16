@@ -73,3 +73,43 @@ _allocatable_token_budgets + SWA variants: reservation-based admission; a mis-es
 - HiSparse direct-to-host path (decode.py:2260-2278 alloc_for_decode_prealloc_hisparse, host pool rows): production runs DSA trtllm on DeepSeek V4, hisparse coordinator is adjacent; only lightly checked.
 - _pre_alloc_host sidecar_pool_specs indices (extra pools from tree_cache.sidecar_pool_specs) reuse the same host_indices — assumed by construction.
 - Who catches kv_receiver.abort() during prealloc queue abort while prefill might already hold destinations: Mooncake conn agent should verify abort_notified semantics (force_arm on partial publish seen at decode.py:2815).
+
+## LANDING (2026-10-16 ~05:0x UTC)
+- **#19 V4 fix MERGED → dev sha 8e731e894a.** Device-destination deferred KV release now holds past the 30s timeout until drain ack or peer-down declaration (prefill_info_table pop); new outcome value "peer_dead". Added hidden_kv_layers registration micro per lead #957.
+- **#44 F12 final union MERGED in the same branch.** Decode-side `_handle_aux_data` (room ∈ request_status gate, per-message buffer_index/aux_index/item_len bounds) + codec exact-equality raise + mooncake-side try/except kept with mooncake's branch (#42 track). Dev-tip verification: test_mooncake_aux_data_bounds.py 10/10, deferred pair 49/49.
+- Shared test file test_deferred_decode_kv_release.py = union of mooncake F4 worker-survive blocks and my V4 hold blocks; pre-submit rebase per wave-2 addendum done cleanly at 3d38a8f.
+- mooncake #33 retry failed on pSwaStateTransfer test cross-drift (unrelated to my content). Their #37-prime rebase should take dev's file version as final.
+- mooncake MR47 (#37+#41+#42+#55) merged → dev ac0f192; my independent second-witness dev-tip sweep green (235 passed, 0 failures) including the F12 final union and shared deferred test file. Disagg decode lane complete.
+
+## FINAL COVERAGE VERDICT (disagg-decode lane, 2026-10-16)
+
+### Production-surface coverage (own files, in-scope configs)
+| Surface | Files | Verdict |
+|---|---|---|
+| Decode prealloc (page-64, fp8, chunked prefill, extra slots, failure/timeout) | decode.py alloc_for_prealloc*, extra_slots handling | COVERED — no freeing-path memory-safety bug beyond V4 (fixed); hisparse prealloc equal-by-construction = LOGICAL-ONLY, creator mapping unreachable on decode (features handoff F-5) |
+| Deferred KV release (device + host-staged) | decode.py:2727-3027, KVPoll.Failed | FIXED (#19/V4, merged 8e731e894a): device path no longer frees at 30s without drain proof; holds for queue-full/agenda-retry and peer-down declaration; peer_dead metric. Host path was already correct. Timeout-hole confirmed live in v0.5.20+; older prod (0.5.14–0.5.17) lacks machinery (backport = release engineering) |
+| AUX_DATA wire-controlled bounds (mooncake decode receiver) | mooncake/conn.py _handle_aux_data + common/utils.py AuxDataCodec | FIXED (#44+F12 union, live on dev ac0f192): codec exact-equality raise + handler room-gate/bounds + mooncake-side catch. 10/10 aux-bounds tests green |
+| Retract with SWA/offload guard | decode.py retract path + offload manager | COVERED — verified guard + drain-before-retraction shipped by decode-offload-audit (#21 lead + #52 osprey 2198b3e8d1/fd9845e233) |
+| Abort races (admission, transfer in flight, grammar double release) | decode.py abort/cleanup + schedule_batch mixin | COVERED — ordered resolve-before-free verified; abort-worker poison-recovery now worker-resilient (mooncake F3 land ac0f192); V4 closed the free-while-RDMA-in-flight device window |
+| Offload manager host/GPU double free + read-after-free | decode_kvcache_offload_manager.py | COVERED — ownership + ongoing_offload gate verified; C6 linker-fail abort PP escape confirmed and fixed upstream lane (#67) |
+| Role-switch / heartbeat / teardown interplay | role_switch.py, common/conn.py | CLEAN — is_fully_idle gates on pending deferred releases + ongoing offload; teardown fully resets per-manager tables; late daemon iteration harmless |
+| Hisparse creator-mapping re-route | decode.py:2260-2278 + hisparse.py | CLEAN — worker-local; cross-worker mapping 'unreachable structurally'; alloc = LOGICAL-ONLY; zero-sentinel safety via buffer zeroing |
+| Prealloc timeout leaves request state | decode.py + transfer worker pump | COVERED — states verified: retract/defer/free/WaitingForInput transitions; deferred + role-switch blocks destructive ops until resolved |
+
+### Non-bug notes reaching dev/other teams
+- hidden_kv_layers registration micro added at decode.py kv_args setup site (lead #957 mirror of prefill #30) — defensive for role-switch D→P with anchor main-V path.
+- V7 ack-generation-register (mooncake receiver reuse rereg sets generation=0) shipped by mooncake (#37).
+
+### Residual (handoffs)
+- v0.5.14–0.5.17 production branches: no deferred-release machinery at all → the V4 fix concept (hold-vs-timeout) does not apply there; any timeout free on those versions is a different (older) code path — release-eng backport decision, not an upstream merge.
+- hisparse host-row semantics question (prealloc device-buffer zeroing vs host pool rows) handed to pools/features (my F-5 answer: structurally unreachable from decode path).
+- Mooncake/NIXL engine internals (batch indices, keep-alive, RDMA slot reuse) belong to their owners; where they touched wire/codec/test files I co-owned, the union was negotiated and verified.
+
+### Deliverables shipped
+- Board #19 (V4 deferred hold) → dev 8e731e894a; regression test_deferred_decode_kv_release.py + test_deferred_release_timeout_hold.py (49 tests).
+- Board #44 (F12 aux-bounds union) → dev 8e731e894a; regression test_mooncake_aux_data_bounds.py (10 tests).
+- Second-witness sweep of mooncake MR47 → dev ac0f192: 235 passed / 0 failed across the full shared suite list.
+- Reviewed+approved: #21 (drs-before-retraction), mooncake F12 codec matrix vote (lead #595 via #587).
+- Version matrix for deferred-release machinery: absent v0.5.14/.15p1/.17; present v0.5.20+ with the timeout hole fixed in dev (this branch).
+
+Disagg decode lane: COMPLETE.

@@ -1,0 +1,123 @@
+diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt/disaggregation/common/conn.py
+index 26ba9c9a00..a130443ca2 100644
+--- a/python/sglang/srt/disaggregation/common/conn.py
++++ b/python/sglang/srt/disaggregation/common/conn.py
+@@ -490,33 +490,66 @@ class CommonKVManager(BaseKVManager):
+     def get_mha_kv_ptrs_with_pp(
+         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
++        """Pair this PP stage's main-model K/V pointers with the peer's.
++
++        Backport of the F15 fix (board #30). Each side's pointer list is
++        [K_main..., V_main...] with any draft entries appended as
++        [draft_K..., draft_V...]. Anchoring the K/V split on half of the
++        TOTAL (the previous modulo heuristic) lands inside the draft block
++        whenever one exists and the counts divide evenly, silently rerouting
++        the V transfer into draft buffers and leaving decode's main V stale
++        (cross-request leak). The split anchors on the main block, whose
++        size is the full model's layer count (plumbed via
++        kv_args.hidden_kv_layers at KV manager init; falls back to the
++        stage count when unset, i.e. assume peer registers exactly this
++        stage's span). Any unresolved geometry now fails loud.
++        """
+         start_layer = self.kv_args.prefill_start_layer
+-        num_kv_layers = len(src_kv_ptrs) // 2
+-        end_layer = start_layer + num_kv_layers
+-        dst_num_total_layers = len(dst_kv_ptrs) // 2
++        num_draft = getattr(self.kv_args, "num_draft_entries", 0) or 0
++        num_kv_layers = (len(src_kv_ptrs) - num_draft) // 2
++        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
++        if end_layer is None:
++            end_layer = start_layer + num_kv_layers
++        num_main_layers_total = getattr(self.kv_args, "hidden_kv_layers", 0) or 0
++        if num_main_layers_total <= 0:
++            # kv_args.hidden_kv_layers not populated in this process (e.g. a
++            # manager built outside scheduler init): assume the peer registers
++            # exactly this stage's span (historically true only for pp == 1
++            # without speculative decoding).
++            num_main_layers_total = num_kv_layers
++        if num_kv_layers <= 0 or (len(src_kv_ptrs) - num_draft) % 2 != 0:
++            raise RuntimeError(
++                f"Bad src KV geometry: entries={len(src_kv_ptrs)}, "
++                f"draft={num_draft}; main block must be an even number of entries"
++            )
+         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
+-        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+-        if num_kv_layers == dst_num_total_layers:
+-            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
+-            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
+-        elif (
+-            num_kv_layers < dst_num_total_layers
+-            and dst_num_total_layers % num_kv_layers != 0
++        src_v_ptrs = src_kv_ptrs[num_kv_layers : 2 * num_kv_layers]
++
++        # The peer's main block is 2 * full-model layer count entries; any
++        # remainder is its draft tail. Same-model peers share the layer count.
++        dst_num_entries = len(dst_kv_ptrs)
++        dst_main_entries = 2 * num_main_layers_total
++        dst_num_draft = dst_num_entries - dst_main_entries
++        if (
++            dst_num_draft < 0
++            or dst_num_draft % 2 != 0
++            or dst_main_entries <= 0
+         ):
+-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
+-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+-            multiplier_ratio = dst_num_total_layers // num_kv_layers
+-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+-            v_ptr_offset = num_kv_layers * multiplier_ratio
+-            dst_v_ptrs = dst_kv_ptrs[
+-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
+-            ]
+-        else:
+-            # Decode pp size should be equal to prefill pp size or 1
+-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+-            dst_v_ptrs = dst_kv_ptrs[
+-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+-            ]
++            raise RuntimeError(
++                f"Bad dst KV geometry: entries={dst_num_entries}, full-model "
++                f"main layers={num_main_layers_total}, stage layers "
++                f"{num_kv_layers}; cannot split main K/V safely"
++            )
++        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
++        dst_v_ptrs = dst_kv_ptrs[
++            num_main_layers_total + start_layer : num_main_layers_total + end_layer
++        ]
++        if num_kv_layers != len(dst_k_ptrs) or num_kv_layers != len(dst_v_ptrs):
++            raise RuntimeError(
++                f"KV pointer pairing mismatch: stage has {num_kv_layers} "
++                f"layers, got dst_k={len(dst_k_ptrs)}, dst_v={len(dst_v_ptrs)}; "
++                "refusing to silently truncate the transfer"
++            )
+         layers_current_pp_stage = len(src_k_ptrs)
+         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
+ 
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index ba7ec90ebb..727b81b5a6 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -394,6 +394,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+ 
+         kv_args.pp_rank = self.pp_rank
++        # F15 backport: full model layer count for MHA ptr splitting
++        # (get_mha_kv_ptrs_with_pp anchoring; pure-local metadata).
++        kv_args.hidden_kv_layers = self.scheduler.model_config.num_hidden_layers
+         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+         transfer_kv_pool = (
+             self.scheduler.hisparse_coordinator.mem_pool_host
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 5f989b24c9..dbf54fbd4c 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -154,6 +154,9 @@ class PrefillBootstrapQueue:
+         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
++        # F15 backport: main-model layer count used by get_mha_kv_ptrs_with_pp
++        # to split the peer pointer list into main/draft blocks.
++        kv_args.hidden_kv_layers = self.scheduler.model_config.num_hidden_layers
+         kv_args.mla_compression_ratios = None
+         kv_data_ptrs, kv_data_lens, kv_item_lens = (
+             self.token_to_kv_pool.get_contiguous_buf_infos()

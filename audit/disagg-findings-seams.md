@@ -38,3 +38,8 @@ Handle: mooncake/conn.py _handle_aux_data (1811-1829) → AuxDataCodec.deseriali
 ## Coverage dot-files (lead-checked, clean-for-memory-safety)
 - pp_consensus_store.py: in-proc dict replication via msgpack; no KV indices/pointers; verified clean (read).
 - role_switch.py: orchestration only; its KV-bearing steps are covered by the teardown item (mooncake FS3) and scheduler pause seam (read in seam pass).
+
+## Wave status (04:05 UTC)
+Merged to dev: #21 V8 drain-wait (2198b3e8d1). Approved, queued behind env rebuild: #37 (V5 fail-loud + V6 fail-fast + V7 worker isolation), #34 (V2/V3 nixl), #19 (V4-decode hold), #41 (F6 1-page drift cap), #42 (F12 codec union: exact-equality + buffer_index + mori guard), #44 (F12 decode handler halves), #30 (F15 draft pairing — review pending w/ pp>1-MHA caveat resolved in favor of fail-loud), #31 (F9 abort notify + ack retry — review pending). #46 demoted to F2-subscriber-prune-only, re-proposes after wave (3-arg register_wm_subscriber must update F4 enqueue call site).
+Clean-verdict additions: role-switch idle-gates incl deferred releases (decode); dsv4-F3 hisparse data_ptrs KILLED (VA-preserving memory saver); dsv4-F2 → defense-in-depth (pools clamp); heartbeat teardown (decode clean); SWA/DSA/DSA_TAIL/BLOCK_SCALE drift silent-truncation was production-live, now capped (F6).
+Policy: codec requires len(data)==item_len (fail-loud); handler short-tolerance unreachable; F18 register-first refusal now, generation-token design later.

@@ -273,3 +273,23 @@ eagle_utils.py verify_tree_greedy_func XPU branch (comment-only, no XPU behavior
   arch only). Draft vs target pool index translation is the crux; mamba2-auditor is TRACING it
   (their #8 candidate); Inkling arch is outside the EAGLE/DSPARK prod spec list for my scope.
   Left to mamba2; rooting for a bounds assert at copy/clear regardless of sizing.
+
+## F-1 (board #17) VERIFICATION COMPLETE — patch 91e3f20 agent/dsa-auditor: APPROVE (attacks)
+- 8/8 real-code attacks green (thin-env safe: test_f1_cow_lock_real_code_attacks.py drives REAL
+  mamba_cow functions against a fake component-lock cache). Attacks 2(retract)/1(collect)/3(abort)/
+  4(evict-retry)/5(restage+double-clear)/9/10(load-back both ways)/admission-reject all balanced.
+- Exit-path sweep: zero raw 'mamba_cow_src_index = None' outside mamba_cow.py and lmcache wrappers
+  (each lmcache raw-clear pairs with _release_mamba_cow_lock_if_any). MAMBA-only skip tuple keeps
+  ordinary KV eviction unblocked.
+- OBSERVATIONS: (a) dsa's own test file needs fat env (sgl_kernel + real UnifiedRadixCache) -> will
+  bounce in queue as submitted (packaging); (b) collect-time dec precedes same-step forward copy —
+  safe under single-scheduler-step ordering (comment-worthy); (c) lmcache-side flow-owned deferred
+  COW staging has NO tree lock (pre-existing, OUT of prod scope — charter excludes lmcache).
+
+### F-1 record correction (features-lead #1507)
+The final da8f44df8f staging locks ALL components of the source node (full hierarchy,
+required by the production sanity check unified_tree_core.py:3006 full_lock >= ct_lock); the
+MAMBA-only skip tuple was an intermediate shape, NOT merged. Component-skip checks in my harness
+targeted the intermediate shape only; all net-zero/no-leak verdicts stand (the all-component
+lock is strictly stronger for the F-1 invariant). Every citation of this file should read:
+'all-components stage lock; hierarchy-compliant; no skip'.
