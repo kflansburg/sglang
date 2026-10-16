@@ -15,6 +15,35 @@ github.com/sgl-project/sglang for archaeology.
 - SUSPECT = strong evidence, needs repro
 - CLEAN = checked, assumptions listed
 
+## Upstream regression-test pinning (per lead directive) — test_mem_pool_host.py
+- Base-pool double-alloc/double-free: pinned by
+  `test_double_alloc`, `test_double_free`, `test_free_unallocated`,
+  `test_free_after_clear` (same file) — BUT only against
+  `MHATokenToKVPoolHost` (which uses the base, guarded, alloc/free).
+- `TestLazyHostPoolRelease` (`test_mamba_pool_lazy_release`,
+  `test_deepseek_v4_pool_lazy_release`, `test_logical_pool_lazy_release`)
+  covers exactly the three UNGUARDED overrides and pins the CURRENT unguarded
+  behavior — it never frees the same index twice. So F1's sibling gap is
+  exactly pinned-as-absent here: mamba/dsv4/logical double-free = 0 tests.
+- Lazy release merge per se: also test_paged_allocator_lazy_release.py
+  (device paged allocator sibling, out of my files).
+- Reclaim order / unified transfer-compaction: test_unified_hicache_regressions.py
+  `TestTransferStreamOrdering`, `TestSwaBackupAfterCompaction`,
+  `TestDirectBackendTranslation`, `TestSwaBackupAfterCompaction` pin the L2
+  lease + event ordering (l2_transfer.py layer). F5 (L3 raw-ptr mooncake IO
+  w/o lease) has NO test — siblings hunted:
+  mooncake_store.py:1075/1139/1152 all use the same unleased meta path.
+- F2 sentinel: no test frees or page-indexes a negative index anywhere.
+  hicache_storage.py `_read_page`/`_write_page`
+  (set_from_flat_data_page/get_data_page) would also alias the last page on
+  a -1 page_offset — sibling of F2 via the storage-key path, not only free().
+
+### K3 branch check
+git fetch of bd4828e2 from public upstream fails (branch not public) —
+K3-version archaeology for F1/F2 is "assume affected": MambaPoolHost
+overrides match the v0.5.17 archetype, which precedes/accompanies the K3
+base (~v0.5.16).
+
 ---
 
 ## Findings (ranked)
