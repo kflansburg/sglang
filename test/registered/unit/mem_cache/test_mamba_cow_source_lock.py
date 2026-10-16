@@ -30,32 +30,16 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
-    InsertParams,
-    MatchPrefixParams,
-)
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.mamba_cow import (
-    clear_mamba_cow,
-)
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-
-# Reuse the real fixture builder (same dir), which constructs a REAL
-# UnifiedRadixCache: real unified tree core, real FULL/MAMBA components, real
-# mamba slot allocator on CPU.
-sys.path.insert(0, os.path.dirname(__file__))
-
 
 def _fixture_env_available() -> bool:
     """The fixture chain needs (a) a resolvable platform device (only with the
-    CPU engine fallback on accelerator-less hosts) and (b) an importable
-    sgl_kernel (present in upstream CI / CPU sgl-kernel builds, absent in the
-    lean merge-queue env). Skip-instead-of-error so the queue records the
-    skip; run upstream CI to exercise.
+    CPU engine fallback on accelerator-less hosts) and (b) importable
+    sgl_kernel + the sglang.srt import chain (present in upstream CI /
+    CPU sgl-kernel builds, absent in the lean merge-queue env).
+    Skip-instead-of-error so the queue records the skip; run upstream CI to
+    exercise. This probe must run BEFORE the module's heavy sglang.srt
+    imports below or collection fails at ModuleNotFoundError on the thin
+    env (spec cross-verify FLAG 1 — fixed by this ordering).
     """
     try:
         import sgl_kernel  # noqa: F401
@@ -71,12 +55,31 @@ _FIXTURE_SKIP_REASON = (
 )
 
 if _FIXTURE_ENV:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        EvictParams,
+        InsertParams,
+        MatchPrefixParams,
+    )
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
+
+    # Reuse the real fixture builder (same dir), which constructs a REAL
+    # UnifiedRadixCache: real unified tree core, real FULL/MAMBA components,
+    # real mamba slot allocator on CPU.
+    sys.path.insert(0, os.path.dirname(__file__))
     from test_unified_radix_cache_unittest import (  # noqa: E402
         CacheConfig,
         build_fixture,
     )
-else:
-    CacheConfig = build_fixture = None  # collection-safe placeholders
+else:  # collection-safe placeholders for the thin queue env
+    ReqKvInfo = EvictParams = InsertParams = MatchPrefixParams = None
+    RadixKey = ComponentType = clear_mamba_cow = None
+    CacheConfig = build_fixture = None
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
