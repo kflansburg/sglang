@@ -134,3 +134,20 @@ Moreover the RISKY FEATURES are version-gated:
 - No new memory-safety bug confirmed in my scope at HEAD. Both known classes (K1, K2) are fixed upstream
   and fixed in every reachable production tag. Two unconfirmed hardening candidates (c128 cleanup kernel
   row-mask; hisparse -1 divergence) + 4 test gaps forwarded to features-lead.
+
+## C128 cleanup kernel candidate (msg #216 follow-on) — VERDICT: not a bug at HEAD, hardening noted
+- `clear_unaccepted_c128_draft_states` (kernels/ops/attention/dsv4/c128_cleanup.py) writes
+  `state + (req_pool_idx*ring_size + slot)*2*half` with no row-bounds mask.
+- Only caller: eagle_worker_common.py:746 with batch.req_pool_indices of the running batch — bounded by
+  the K2-sized pool (ring rows = num_req_slots = req_to_token.shape[0]). Slot = (seq_len+draft_offset)%ring < ring.
+- Order: runs post-verify forward, pre commit; slot algebra matches the draft C128 compressor's ring
+  addressing (pre-verify seq_lens + draft offset). No OOB or stale-write at HEAD.
+- Hardening suggestion (NOT applied; no confirmed bug): a defensive row mask or debug assert on
+  row < pool._size, since the kernel is invariant-dependent.
+
+## Regression tests added
+- test/registered/unit/mem_cache/test_dsv4_request_state_transfer_indices.py (CPU suite):
+  transfer-index bounds for all boundary seq lens; ring-region locality; empty/boundary no-transfer;
+  8<->16 ring positional skew (EAGLE/MTP PD); bad-ring validation; CompressStatePool.transfer_indices
+  dispatch (ratio-2 odd-only, offline matches module fn, page-scoped rejects). numpy logic verified
+  locally; torch-dependent parts follow the shipped CPU-CI pattern.
