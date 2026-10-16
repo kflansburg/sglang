@@ -80,3 +80,10 @@ unified_sub_pool.py Float free (L2352-2395) + _free_lazy (L1339-1375) + free_unb
 4. EAGER MultiEnded free HAS always-on stale-slot assert; LAZY path + Float have NONE (not even debug-gated). free_unbind_inplace also races if a single call carries duplicate v ids (callers must unique at ps==1; contract-only).
 Consequence classes: cross-request KV aliasing/corruption or 8-byte GPU OOB write — both match the audit's target classes. Open gate: caller reachability (radix-lead hunt).
 Fix skeleton (pending reachability): mask `freed_p_pages >= 0` before index_fill_/cat in Float.free + the unique-dedup exists; add debug-mode stale assert to _free_lazy + Float (mirroring EAGER's), production filter (mask-and-count) + counter surfaced in debug_print/verify_byte_accounting. Consistent with the SWA composite's existing `swa_v2p > 0` filter pattern.
+
+## Triage of alloc-auditor candidates (pools-lead)
+- BUG-ALLOC-1 (hisparse guard spurious-None): **REFUTED** (CPU repro): need_sort staged pages are whole pages counted exactly in available_size()//ps; guard==inner capacity. No divergence. Residual note: hisparse internal asserts leave nothing uncommitted (sub-allocs pre-guarded) — assert-crash leak only theoretical.
+- BUG-ALLOC-2: same refutation as 1 for the spurious-None direction.
+- BUG-ALLOC-4 (Triton alloc_extend_kernel part-3 unmasked load OOB): **REFUTED** — reaching Part 3 implies num_part3>0 which implies num_page_start_loc_self>=1 ⇒ load address in-bounds; dead lanes never evaluate the load thanks to Triton per-program early returns. Modeled + swept (test_pools_fuzz/test_kernel_hardning_regressions.py::test_alloc_extend_kernel_part3_unreachable_on_dead_lanes). Kernel change REVERTED (keeping the tree clean of non-bugs).
+- BUG-ALLOC-5 (ps==1 host/kernel formula desync): latent only (no prod reachability: ps==1 uses TokenToKVPoolAllocator; SWA asserts ps>1). Landed defense: `assert page_size > 1` in PagedTokenToKVPoolAllocator.alloc_decode + regression test. KEPT.
+- BUG-ALLOC-3 (hisparse alloc_device_buffer page-split free): aliasing question routed to features (DSA window policy). Mechanics stand by.
