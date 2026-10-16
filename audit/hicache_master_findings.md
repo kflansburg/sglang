@@ -48,7 +48,19 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
 - [ ] decode offload interplay with retract/aborted requests
 
 ## Confirmed bugs
-(none yet)
+1. **Mooncake store short reads treated as success** — FIXED @ e766366a
+   (agent/hicache-lead). get paths judged success by sign of returned byte
+   count; short read = valid page with stale tail. Affects HEAD + v0.5.14 /
+   v0.5.15.post1 / v0.5.17 / v0.5.20 (all get APIs: _batch_postprocess res>0,
+   batch_get <0, get >=0 incl. zero-byte = success). Fix: exact-byte equality
+   on all get paths. Regression: test_mooncake_short_read.py 6 CPU cases
+   (5 fail pre-fix). Independent verification: mooncake-audit (in flight).
+   Siblings: storage/simm/hicache_simm.py, storage/npu_memcache/ have the
+   same leniency (out of prod scope, noted).
+2. **Host pool free-list double free** — version matrix only so far: v0.5.14
+   unguarded free() (silent aliasing); v0.5.15.post1+/HEAD crash-guarded via
+   slot_used asserts. Reachable double-free paths at HEAD: hostpool-audit
+   tracing.
 
 ## Suspects under verification
 (none yet)
