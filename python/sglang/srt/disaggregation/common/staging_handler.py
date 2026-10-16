@@ -892,7 +892,19 @@ def handle_staging_req(
             bytes_per_head_per_token,
             num_kv_layers,
         )
-        result = staging_allocator.assign(required)
+        try:
+            result = staging_allocator.assign(required)
+        except ValueError:
+            # Non-positive layout (unreachable via the wire guard above;
+            # kept as defense-in-depth against future layout inputs).
+            logger.exception(
+                "STAGING_REQ dropped: non-positive layout room=%s chunk=%s "
+                "num_pages=%s",
+                room,
+                chunk_idx,
+                chunk_num_pages,
+            )
+            return
         if result is None:
             logger.error(
                 "[STAGING_REQ] alloc failed room=%s chunk=%d (need %d bytes, "
