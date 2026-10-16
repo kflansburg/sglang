@@ -148,11 +148,42 @@ Gaps: alloc_decode failure pairing (now covered by my fix test); full
 retract->offload->resume->decode conservation; maybe_evict_swa under
 overlap scheduler; spec-decode (EAGLE/draft KV) SWA eviction interplay.
 
+## Coverage summary (scope = board #9)
+- allocator/swa.py SWATokenToKVPoolAllocator: all alloc entries (alloc,
+  alloc_extend, alloc_extend_swa_tail, alloc_decode) and all free entries
+  (free, free_swa, free_swa_segment, free_full, free_full_segment,
+  free_segment, free groups, clear/resize) traced; CPU harness sweeps
+  alloc/decode/free cycles with conservation+mapping invariants. 1 bug
+  (F-4), fix + tests on agent/swa-auditor.
+- allocator/swa.py PureSWATokenToKVPoolAllocator: single-pool semantics;
+  free_segment overridden to avoid double release; page-0 filter present.
+  No issues found.
+- swa_memory_pool.py SWAKVPool: set_kv_buffer / get/load_cpu_copy mask
+  logic traced (retract offload) — consistent. Mapping tensor bounds
+  (size+ps pad + trailing -1 sentinel) cover last_loc=-1 and padded reads.
+- pure_swa_radix_cache.py: thin RadixCache subclass; evict param routing
+  (max of num/swa tokens); no state of its own. Clean.
+- spec-decode (EAGLE) SWA interplay: alloc_for_spec_decode over-reserve is
+  tracked via kv_allocated_len and released through the standard
+  free_kv_row/overallocated path; maybe_evict_swa frontier pre_len=seqlen-1
+  cannot touch draft slots (they live beyond seqlen). Row-width fail-fast
+  assert for page>1 topk>1 present. No leak found in the SWA-relevant part
+  (deeper spec-internal logic belongs to spec-auditor).
+- scheduler maybe_evict_swa / _swa_eviction_trigger / _evict_swa: trigger
+  math and overlap gating reviewed (see REFUTED section).
+- SWAPrefillBudget: admission estimates have fences (< remaining, +page
+  headroom); transient vs permanent shortfall handling reviewed; budget
+  over-commit would surface as alloc failure (supported by fences) not as
+  corruption. Clean.
+- retract+offload guard (known class): release_req -> backup_kv_cache
+  (cpu_tensor: get_cpu_copy incl. swa mask) -> release_kv_cache ->
+  mark_kv_released clears cursors -> resume: _pre_alloc re-stamps
+  evicted_seqlen via alloc_extend_swa_tail, restore writes only
+  old-mapped AND new-mapped positions. Consistent; see REFUTED.
+
 ## In progress / open
-- Pure-python harness (test/swa_audit/) driving the real allocator classes
-  on CPU to sweep alloc/evict/free/retract sequences for double-free /
-  page-0 / leak. Blocked on env (no torch in sandbox yet; shared env
-  building by lead — will pip install minimal deps or wait).
-- `maybe_evict_swa` overlap `decode_batch_idx == 0` skip and
-  `SGLANG_OPT_RELEASE_PREFILL_SWA` `release_swa_prefix_lock` gating review.
-- `SWAPrefillBudget` admission math vs allocator charges (prefill side).
+- Awaiting features-lead review of F-4 fix (board #26).
+- Open delegated item for pools-lead/radix-lead: unified tree-action level
+  proof that FreeDeviceKVFullOnly is only emitted after the SWA tier is
+  tombstoned (my trace covered the allocator's external callers; the tree
+  action generation is unified-cache internals).
