@@ -78,8 +78,14 @@ class TestPrefetchWedgeLeak(unittest.TestCase):
         # The same content hash can never be re-driven: prefetch and
         # store_to_pool_async both dedup onto the stuck FILLING entry.
         ctrl.prefetch("req2", ["h1"], [3], Modality.IMAGE)
+        # store_to_pool_async hard-requires CUDA tensors; on this CPU-only rig
+        # fake the device so the dedup branch (the thing under test) is reached.
+        fake_cuda_tensor = MagicMock()
+        fake_cuda_tensor.device.type = "cuda"
+        fake_cuda_tensor.ndim = 2
+        fake_cuda_tensor.shape = (3, 4)
         handles = ctrl.store_to_pool_async(
-            ["h1"], [torch.zeros((3, 4), dtype=torch.float32)], Modality.IMAGE
+            ["h1"], [fake_cuda_tensor], Modality.IMAGE
         )
         self.assertEqual(handles, [], "FILLING dedup silently skips the store")
         self.assertFalse(ctrl.has_local_embedding("h1"))
