@@ -99,15 +99,21 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        # room -> watermark subscriber key, so unregister_decode_req can prune
+        # the subscriber once no remaining room talks to that prefill session.
+        self._wm_key_by_room: dict = {}
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
 
-    def register_wm_subscriber(self, receiver, session_id: str) -> None:
+    def register_wm_subscriber(
+        self, room: int, receiver, session_id: str
+    ) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
+        self._wm_key_by_room[room] = key
         if key in self._wm_subscribers:
             return
 
@@ -200,6 +206,21 @@ class DecodeStagingHandler:
             self.release_room(room, decode_req, receiver)
         self.kv_manager._staging_ctx.room_receivers.pop(room, None)
         self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        self._prune_wm_subscriber(room)
+
+    def _prune_wm_subscriber(self, room: int) -> None:
+        """Drop the room's watermark subscription once no room needs it.
+
+        Without this, _wm_subscribers grows by one prefill-session entry per
+        staging request forever, and every staging free broadcasts ZMQ
+        watermarks to long-dead peers (handled exceptions per send).
+        """
+        key = self._wm_key_by_room.pop(room, None)
+        if key is None:
+            return
+        if key in self._wm_key_by_room.values():
+            return
+        self._wm_subscribers.pop(key, None)
 
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
@@ -925,7 +946,7 @@ class StagingManagerMixin:
 
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
-            handler.register_wm_subscriber(receiver, session_id)
+            handler.register_wm_subscriber(room, receiver, session_id)
 
 
 def prefetch_staging_reqs(
