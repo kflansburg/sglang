@@ -186,3 +186,16 @@ ACTUAL ALLOCATION:
 - moe_hook.py:593 uses max(1, user//dp); fine.
 SUGGESTION to mamba-auditor: make replay_req_slots == actual spec_state_size basis
 (get req_to_token row count or size+pre_alloc), and add a boot-vs-reservation assertion.
+
+## BUG-HISPARSE-Q1 (board #51): radix-hit prefix NONZERO C4 mapping -> alloc_device_buffer clobber
+Decisive code evidence (2026-10-16):
+- V4 alloc_extend writes mapping only for extension slots (hisparse.py:560-616; paged alloc_extend
+  is extension-only, allocator/paged.py:204-280). Prefix compressed slots retain creator's values.
+- Tree-owned compressed-slot mapping cleared only at eviction (hisparse.py:629-635 free_compressed).
+- alloc_device_buffer input covers req_to_token[..., :allocated_len] incl. prefix
+  (hisparse_coordinator.py:940-946); :497 zeroes ALL; surplus frees recycle shared pages.
+- Remaining narrow Q: worker context where device-mapped radix-hit prefix meets alloc_device_buffer
+  (non-disagg hisparse, or decode-side radix reuse). Disagg host-staged admit may be all-zero.
+- Guard-port decision: PORT V4 pure_surplus to non-V4 (pools-lead coordinates, alloc-auditor
+  implements, dsa-auditor reviews).
+- Merge queue: #16 submitted by features-lead for #27/#28; local queue-venv run: 21 passed, 0 failed.
