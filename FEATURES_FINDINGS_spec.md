@@ -163,3 +163,113 @@ deployments). Confirm via git tag diff before filing.
 - dspark planner verify budget: local_verify_tier_num_tokens caps total at bs*verify_num_draft_tokens;
   RaggedVerifyLayout.__post_init__ validates per-row cap + sum bounds; cap-accept consistency enforced;
   SGLANG_SIMULATE_ACC misuse guarded by explicit raise. CLEAN.
+
+## Turn-5 (lead-priority order)
+1. (3) _compact_accept_to_front + accept_index clamping (topk>1) — VERDICT SAFE:
+   CPU-validated valid-position preservation; padded clamp-0 touches only slots >= accept_len
+   which downstream never reads (select_index = i*nd + accept_lens-1; committed range [0..accept_len)).
+   Mid-gap -1 in accept_index is impossible: the sgl-kernel tree_speculative_sampling_target_only
+   writes accepted nodes ordered at columns [0..accept_len), and prepare_draft_extend's
+   (accept_index/num_draft, %num_draft) retrive coords rely on that same ordered contract
+   (a mid-gap -1 would index -1 and break everything, tested surfaces would fail loudly).
+2. (2) dspark verify budget cutoff — VERDICT SAFE (earlier trace + planner read):
+   per-req cap = verify_num_draft_tokens enforced by RaggedVerifyLayout.__post_init__ chain;
+   tier totals capped at bs*verify_num_draft_tokens; cap-accept consistency constraint
+   (is_cap_accept == predicts.size(1)-1==verify_w) enforced in planner; SIMULATE_ACC misuse
+   guarded by explicit raise.
+3. (1) tail files spec_tp_sync.py / spec_sampling_mask.py / adaptive_spec_params.py — no KV
+   lifecycle; CLEAN. (spec_tp_sync prevents TP divergence in spec decisions.)
+
+## G2 close-out (kvpool-auditor handoff: set_kv_buffer_prefix_valid input validation)
+- memory_pool.set_kv_buffer_prefix_valid (memory_pool.py:3226) validates: loc_2d rank-2,
+  commit_lens shape == batch, cache_k/cache_v rows == loc_2d.numel (raises otherwise),
+  normalizes dtype/device, contiguous.
+- Kernel set_kv_buffer_prefix_valid_tiled (kernels/ops/kvcache/cache_move.py:14): per-row
+  clamp `row >= commit_len -> return`; byte-mask bounded by ROW_BYTES. commit_len > shape[1]
+  is a no-op (bounded by grid dim = shape[1]); commit_len smaller = partial commit (silent
+  truncation, NOT corruption; spec caller's kv_committed_len uses the same commit inputs).
+- Spec caller side: kv_index_translator.commit computes commit_i = min(plan target commit_lens,
+  verify staging verify_lens) (kv_index_translator.py:1213-1218) and pcl plan commit_lens <= seq
+  bounds validated (pcl/target_planner.py:206-229) — invariant handed to spec callers holds.
+- VERDICT: no memory-unsafe window; the API contracts on the spec callers hold at HEAD.
+
+## Sim hardening: accept_index compact/clamp (board #11 lead ask)
+- test/registered/unit/spec/test_accept_index_coord_safety.py: 200 randomized (bs,nd,s1,lens)
+  trials verify valid-position preservation of _compact_accept_to_front; padded -1 floor-divides
+  to a negative row under torch-style floor div; degenerate full/empty accept cases. Also verified
+  at kernel level: spec_tree.verify_tree_greedy_kernel_triton writes accept_index successive-ordered
+  (num_accept_tokens+1 slots) over a -1-initialized buffer (eagle_utils.py:853), so mid-gap -1
+  structurally impossible; consumers mask valid j or use last-accepted select_index. CLAIM HARDENED.
+
+## F-1 (board #17) VERIFIER ATTACK PLAN (written pre-patch; execute when dsa-auditor pushes)
+Fix contract: lock the MAMBA COW source node at finalize_match_result_in_cache staging; release
+strictly after _collect_deferred_mamba_cow_and_clear hands the src to the batch.
+COW lifecycle sites (HEAD line @3420baea):
+  staging: components/mamba.py:192-222 finalize_match_result_in_cache (req.kv.mamba_cow_src_index=)
+  collect:  schedule_batch.py:3154-3176 _collect_deferred_mamba_cow_and_clear (clears req fields:3163)
+  execute:  model_runner.py:1920+ _execute_mamba_deferred_ops
+  clear sites that DROP the staged COW without collecting:
+    A. schedule_batch.py:2023 (retract reset / reset_for_retract: kv.mamba_cow_src_index=None)
+    B. scheduler.py:4210 (admission rejected after init_next_round_input staged; also frees mamba_pool_idx)
+    C. memory_pool.py:1884 (lazy free_mamba_state on release_req)
+  not de-coupled from collecting: lmcache_unified_radix_cache (4 sites, OUT OF PROD SCOPE - lmcache storage)
+ATTACK LIST (each: does the fix leak a lock (permanent un-evictable tree node) or double-dec (underflow)?)
+  1. RETRACT-BEFORE-EXTEND: req staged (lock held), retracted in the same get_new_batch_prefill round
+     BEFORE prepare_for_extend collects -> reset clears cow_src without dec. Lock must be dec'd at
+     reset_for_retract/retract point. If fix only decs at collect: residual +1 lock on src forever.
+  2. ADMISSION REJECT AFTER STAGING: init_next_round_input stages; add_one_req declines (sched mem
+     pressure / can_run_list empty). scheduler.py:4210 clears req fields + frees pool slot. Lock leak
+     unless the reject branch also decs. NB: fix must not double-free dst pool slot here (existing free).
+  3. WAITING-QUEUE ABORT: staged req sits in waiting queue; client aborts before admission second pass;
+     release_req -> memory_pool:1884 clear. Lock leak unless dec at release_req/abort path.
+  4. EXCEPTION MID-ROUND: exception after staging (tokenizer/alloc assert) aborts the loop iteration;
+     try/finally anywhere? Probably none - lock + staged slot both leak; level with pre-patch behavior?
+     (pre-patch leaked the staged dst slot too? - check finalize's alloc path on raise: no alloc-before-
+     raise in the cow branch; dst alloc'd before staging so raise between -> slot leak pre-existing).
+  5. ALLOC-RETRY INTERACTION: finalize's own inc/dec_lock_ref around evict_for_alloc (components/
+     mamba.py:210-217) PLUS the fix's COW lock on the same best_match_node - two independent receipts;
+     ensure dec pairing uses to_dec_params() correctly (delta vs absolute) so the evict-window dec
+     can't cancel the COW lock. inc/dec must be REFCOUNTED (check unified_tree_core inc_lock_ref
+     returns counts not booleans).
+  6. DECODE-PHASE REUSE: after collection, req fields cleared; decode loops reuse req.kv.mamba_pool_idx
+     as ACTIVE slot (holds_mamba). Path must NOT dec again at collect-2 (there is none; only 1 collect/req).
+  7. MIXED/mtp adaptive swap req indices: swap_full_runtime_state_on_finished swaps per-req state hooks;
+     verify the swapped state hooks don't carry cow src metadata (cow only at extend admission - no).
+  8. Repro replay: their repro harness must FAIL on HEAD baseline (evict X between staging and forward).
+     After fix: X survives (lock), COW copies correct state; and node returns to evictable after collect.
+Method: reproduce via their test; for attacks 1-3/5 drive a CPU harness of unified tree + allocator with
+locks counted per node (fake of inc/dec_lock_ref + evict_for_alloc), simulate admission/reject/retract/
+abort interleavings, assert net lock delta == 0 for the src node on every terminal path.
+
+## Tripwire (requested by features-lead, #780)
+accept_index consumers (_compact_accept_to_front clamp; draft-extend retrive coord math) rely on
+the verify kernel writing accepted nodes ORDERED at columns [0..accept_len) over a -1-initialized
+buffer. If any backend's verify kernel changes (esp. the XPU triton fallback), the ordered-write
+contract MUST hold or the clamp(min=0) defense silently mis-compacts cross-request data.
+Regression pin: test/registered/unit/spec/test_accept_index_coord_safety.py; comment added at
+eagle_utils.py verify_tree_greedy_func XPU branch (comment-only, no XPU behavior change).
+  9. H2D LOAD-BACK SUPERSEDE (6th clear site = components/mamba.py:1044-46, _MambaBufferLoadBackContext.
+     finalize_allocation(success=True)): when a request goes through HiCache load-back, the deferred COW
+     is superseded (replay write_pos + clears cow_src_metadata). If fix locks src at staging, this path
+     MUST dec-lock as well, else permanent tree lock leak for reqs that get load-backed. NOTE the
+     load-back prepare path may re-alloc mamba_pool_idx for !holds_mamba REQS — check req.kv.holds_mamba
+     was set at staging so prepare_buffer_load_back's alloc is skipped consistently (it sets holds via
+     dst_index assignment staging? staging sets req.kv.mamba_pool_idx but does it set holds_mamba=True? —
+     check Req.kv.holds_mamba semantics vs unified path): DST slot ownership confusion if both paths
+     allocate. Verify under attack run #9.
+  10. finalize_load_back(success=False) (components/mamba.py:728-735): frees allocated slot + clears
+     pool idx but does NOT clear cow_src_metadata — if COW was staged AND load-back failed, req carries
+     stale cow_src into later phases + fix's lock still held with no dec on this path.
+
+## Challenge rotation (features-lead #1022): mamba2's #8 item 3-5 clean verdicts
+- Item 3 (replayssm ring fresh-alloc-on-reuse): COULD NOT BREAK (30m). Fresh-row reset
+  (memory_pool.py:1588-1600) covers all reuse paths (only 2 req_pool_idx=None writes, both
+  before realloc); retract-between-draft-append-and-verify defeated by scheduler step atomicity.
+  3b/3c gating legs read-correct in prod config. Verdicts HOLD.
+- Item 4 (v2p sentinel + undraft checks), item 5 (int8 ckpt asymmetry): not re-attacked deeply;
+  consistent with my earlier reads of mamba_checkpoint_pool.
+- Related open item flagged: multi_layer_eagle_worker_v2.py:594-598 _apply_deferred_mamba_init_
+  to_draft_pools applies TARGET-batch mamba indices (clear/copy) to DRAFT runner pools (Inkling
+  arch only). Draft vs target pool index translation is the crux; mamba2-auditor is TRACING it
+  (their #8 candidate); Inkling arch is outside the EAGLE/DSPARK prod spec list for my scope.
+  Left to mamba2; rooting for a bounds assert at copy/clear regardless of sizing.
