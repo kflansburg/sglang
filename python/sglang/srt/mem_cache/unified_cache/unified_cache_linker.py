@@ -92,7 +92,12 @@ class LayerWiseLoadCounter:
         self.consumer_index = index
 
     def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
+        futures = self.futures.get(index)
+        if futures is None or futures[layer].done():
+            # A prior fail() may have already resolved this future; do not mask
+            # the original exception with an InvalidStateError.
+            return
+        futures[layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
         for future in self.futures.get(index, ()):
@@ -531,26 +536,35 @@ class UnifiedCacheLinkerWrapper:
 
     def finish_loads(self) -> list[str]:
         """Wait for the loads of the batch that just ran; return the rids whose
-        KV did not land, identically on every rank.
+        KV did not land, identically on every rank (including PP stages).
 
         Runs after that batch's forward, so no slot it wrote to has been freed
         or inserted yet. Every rank holds the same ``inflight_load_rids``
         because ``match`` reduces the hit across ranks, so either all ranks or
         none enter the reduction. The verdict is reduced because an MLA dedup
         peer only receives the broadcast and never sees the source's error.
+
+        PP stages share the verdict too: a middle-stage failure emits garbage
+        hidden states into the pipeline, so later stages must see the same
+        failure even though their own layers landed. The PP MIN is entered on
+        EVERY rank for EVERY batch (ranks without linkered loads contribute
+        landed=1), both to keep the collective uniformly ordered and to be
+        robust against any latent per-stage rid divergence.
         """
         rids, self.inflight_load_rids = self.inflight_load_rids, []
-        if not rids:
-            return []
-        index, self.inflight_load_index = self.inflight_load_index, -1
-        landed = torch.tensor(
-            [int(self.cache_linker.finish_layer_wise_loading(index))],
-            dtype=torch.int,
-        )
-        self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        # Verdict order: PP-consensus every batch; attn consensus only when this
+        # rank's group loaded (identical across the group by construction).
+        landed = torch.tensor([1], dtype=torch.int)
+        if rids:
+            index, self.inflight_load_index = self.inflight_load_index, -1
+            landed[0] = int(self.cache_linker.finish_layer_wise_loading(index))
+            self.cache._all_reduce_attn_groups(
+                landed, torch.distributed.ReduceOp.MIN
+            )
+        self.cache._all_reduce_pp_group(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
-        if landed.item():
+        if not rids or landed.item():
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
