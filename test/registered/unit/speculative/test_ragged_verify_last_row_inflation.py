@@ -64,12 +64,19 @@ G2 (numerics-corrupting / accepted-token reachability): whether the
         sum(live verify_lens) (compute_ragged_extend_lengths:
         num_tokens = total_verify_tokens of the UNPADDED layout), so the
         extras receive no out_cache_loc rows and cannot write KV.
-   => read-side exposure only: foreign KV content flows INTO this request's
-   verify logits (can flip accept/reject of its REAL drafts = silent
-   corruption of ITS OWN output), never OUT into another request's KV or
-   into accepted-token buffers. G1 confirmed, G2 refuted for the current
-   accept paths. Recheck if a consumer ever indexes logits/accept flat
-   across the row's PADDED width.
+   => read-side exposure only: stale prior-owner KV content enters the
+   VICTIM request's verify prelogits (corrupts its OWN accept/reject
+   scoring of its real drafts -- silent garbled-output class for the
+   victim); cross-request OUT propagation is pinned to NO: no extras'
+   output reaches accepted-token buffers, another request's KV, or
+   committed lens. G1 confirmed, G2 refuted for the current accept paths.
+   Consumers walked (independent kernel-level spot-check): reject_sampling
+   (speculative_sampling_classic_kernel: per-request tree traversal bounded
+   by speculative_num_draft_tokens), gather_spec_extras (indexed by
+   per-request row via req_pool_indices/future_indices), dspark_accept +
+   eagle_tree vestigials => ALL tree-bound per request; none bounds by
+   graph_num_tokens / flat q width. Recheck if a consumer ever indexes
+   logits/accept flat across the row's PADDED width.
 
 PRE-FIX shape: pad WITHOUT last_row_cap (legacy branch, callable on all
 versions incl. post-#69 which keeps it for legacy callers). POST-FIX:
