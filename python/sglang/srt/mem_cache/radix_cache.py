@@ -589,11 +589,16 @@ class RadixCache(BasePrefixCache):
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
+            parent = x.parent
             self._delete_leaf(x)
+            # Sever the stale node's link: inc/dec_lock_ref on a node whose branch
+            # was evicted must fail loudly (its release would decrement live
+            # ancestors the caller never locked).
+            x.parent = None
 
-            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            if len(parent.children) == 0 and parent.lock_ref == 0:
+                new_priority = self.eviction_strategy.get_priority(parent)
+                heapq.heappush(eviction_heap, (new_priority, parent))
 
             self.kv_events.record_remove(x)
 
@@ -606,6 +611,12 @@ class RadixCache(BasePrefixCache):
 
         delta = 0
         while node != self.root_node:
+            assert node.parent is not None, (
+                "inc_lock_ref on a detached node: the caller holds a stale tree "
+                "handle (e.g. a last_node whose branch was evicted after the "
+                "match); the release would decrement live ancestors it never "
+                "locked, underflowing their lock_ref"
+            )
             if node.lock_ref == 0:
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
@@ -633,10 +644,11 @@ class RadixCache(BasePrefixCache):
                 delta += len(node.key)
             node.lock_ref -= 1
             self._update_leaf_status(node)
-            if node.parent is None:
-                assert node is self.root_node, (
-                    "This request holds the node from another tree"
-                )
+            assert node.parent is not None, (
+                "dec_lock_ref reached a detached node: the caller holds a stale "
+                "tree handle (its branch was evicted); releasing would decrement "
+                "live ancestors it never locked"
+            )
             node = node.parent
         return DecLockRefResult(delta=delta)
 

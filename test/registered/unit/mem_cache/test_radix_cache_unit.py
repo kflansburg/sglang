@@ -618,6 +618,33 @@ class TestRadixCache(CustomTestCase):
         with self.assertRaises(AssertionError):
             cache.dec_lock_ref(match.last_device_node)
 
+    def test_lock_on_evicted_node_is_rejected(self):
+        """Locking a node whose branch was evicted must raise: the release
+        would decrement live ancestors the caller never locked (lock_ref
+        underflow). Stale tree handles are a caller bug; fail loudly."""
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4]))))
+        stale_node = match.last_device_node
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertIsNone(stale_node.parent)  # evict severs stale handles
+        with self.assertRaises(AssertionError):
+            cache.inc_lock_ref(stale_node)
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(stale_node)
+
     def _checkpoint_split_request(self, priority):
         """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
 
