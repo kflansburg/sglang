@@ -1547,8 +1547,9 @@ class TestStagingWatermark(unittest.TestCase):
         handler.staging_allocator = Mock()
         handler.staging_allocator.get_watermark.return_value = (3, 0)
         handler._wm_subscribers = {}
+        handler._wm_key_by_room = {}
 
-        handler.register_wm_subscriber(receiver, "session-new")
+        handler.register_wm_subscriber(0, receiver, "session-new")
 
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
