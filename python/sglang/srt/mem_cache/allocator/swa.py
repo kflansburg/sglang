@@ -435,6 +435,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
+        # Both pools must serve the same page crossings. Pre-flight the exact
+        # count, as alloc_extend does: the pair below is not transactional -
+        # if the SWA side fails after the full side popped pages, the freed
+        # full pages would be gone for good (rollback-by-free() would be
+        # wrong: a non-boundary request's returned index points into its
+        # still-live page).
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+        )
+        if not self.new_pages_available(num_new_pages, num_new_pages):
+            return None
+
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
