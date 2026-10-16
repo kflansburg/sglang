@@ -43,19 +43,17 @@ def test_double_free_is_fail_closed_by_accounting_guard():
 
 
 def test_debug_mode_sweeps_duplicate_slots():
-    """DEBUG sweep also rejects duplicate slots when debug_mode is enabled,
-    branched on whichever failure mode fires first."""
+    """DEBUG sweep also rejects duplicate slots when debug_mode is enabled.
+    Full-coverage pin for the SGLANG_DEBUG_MEMORY_POOL route: whichever
+    contract fires first, a duplicate free must raise, never create a dup
+    free-list entry."""
     m = MambaSlotAllocator(8, "cpu")
     m.debug_mode = True
     s = m.alloc(1)
     m.free(s)
-    if hasattr(m, "debug_mode"):
-        try:
-            m._free_slots_overflow_guard = True
-        except AttributeError:
-            pass
     with pytest.raises(AssertionError):
-        m.free(s)  # either the accounting guard or the dup sweep fails closed
+        m.free(s)  # accounting guard and/or dup sweep fails closed
+    assert m.available_size() <= m.size
 
 
 def test_group_free_of_unconsumed_remainder_is_clean():
