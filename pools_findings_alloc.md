@@ -19,6 +19,49 @@ Method note: allocators are pure-python + torch tensor ops driving Triton kernel
 - CLEAN: one-slot-per-request free list, no page math; group pre-alloc amortization (`alloc_group_begin/_end`) is structurally single-threaded (one scheduler call site, scheduler.py:4118/4220) and `_do_alloc` pops disjoint ranges.
 - Minor notes (not bugs in the crash-on-error scheduler model): if the scheduler ever survives an exception between alloc_group_begin and alloc_group_end, the unconsumed pre-allocated slots are silently dropped on the next alloc_group_begin (`self._alloc_iter = None`) = slot leak; and begin-during-open-group discards the previous group's remainder. Both are defense-in-depth items only — today a scheduler exception is fatal anyway, so nothing leaks at runtime. Double free of a slot is caller discipline (no dedup anywhere), consistent with the rest of the allocator layer.
 
+## TRANCHE 2 UPDATE (fuzz completion + mamba probe + adversarial group probes)
+
+Fuzz totals at HEAD: `test_paged_allocator_fuzz.py` (lead's base, 20 configs) +
+`test_paged_allocator_adversarial.py` (my extension: free_segment/free_segments,
+adversarial free_group double-release, boundary prefix-multiple extends,
+decode-to-exactly-full-page) + `test_alloc_kernels_equiv.py` +
+`test_paged_invariants.py` + `test_mamba_allocator_probe.py`: **66 tests passing**
+(PYTHONPATH=python/, CPU venv). Plus fuzz_allocators.py standalone:
+60 seeds x 20k steps WIDE: ALL OK.
+
+### MAMBA-1 (real-code probe; caller-contract violation required — severity set by callers)
+`MambaSlotAllocator.free()` has no dedup and no debug sweep: freeing the same slot
+twice inserts the slot twice; two later `alloc(1)` calls return the SAME slot id for
+TWO live requests → mamba state shared across requests. Sibling of the paged
+free-list double-free but with NO SGLANG_DEBUG_MEMORY_POOL equivalent at all.
+In-tree callers at HEAD do not double-free (scheduler frees once via holds_mamba /
+notadded guards in scheduler.py:4205-4217).
+Repro: test/srt/pools_fuzz/test_mamba_allocator_probe.py::test_double_free_hands_slot_to_two_requests.
+
+### MAMBA-2 (defense-in-depth; no runtime exposure today)
+`MambaSlotAllocator.alloc_group_begin()` while a group is open drops the previous
+group's unconsumed pre-allocated slots silently (available_size never recovers them
+short of clear()). Only caller (scheduler.get_new_batch_prefill) pairs begin/end on
+one path and scheduler exceptions are fatal, so no exposure at HEAD.
+Repro: test_mamba_allocator_probe.py::test_group_begin_during_open_group_leaks.
+
+### Free-group adversarial results (pools-lead's probe list, all real-code on HEAD):
+- double release of the same pages via token-vector free() inside ONE group:
+  SAFE — group_end's `torch.unique(free_index // ps)` dedups across the deferred
+  piles. Regression-pinned in test_paged_allocator_adversarial.py.
+- double release via free_page_ids in ONE group: CORRUPT (duplicates enter the
+  free list; later allocs hand the page to two owners). Caller contract 'no page
+  twice' violated; internal seam only: NO in-tree production caller of
+  free_page_ids outside allocator/ at HEAD; SGLANG_DEBUG_MEMORY_POOL catches it.
+- mixed free()+free_page_ids of same pages in ONE group: CORRUPT (dedup is
+  per-path; the page-id pile and the token pile are released separately).
+  Same internal-seam status.
+- valid free_segment/free_segments + grouped segment frees: CLEAN (conservation
+  fuzz 16 configs green).
+- harness lesson recorded: on alloc failure the caller must NOT advance its own
+  seq model: alloc_extend/alloc_decode's `(last_loc + 1) % ps == prefix % ps`
+  debug invariant exists exactly to catch that caller desync class.
+
 ## CONFIRMED / HIGH-CONFIDENCE BUGS
 
 ### BUG-ALLOC-1. HiSparse capacity check measures unmerged free tokens as new pages → spurious allocation failure (liveness; can wedge cache), and near-miss vs a real over-allocation (page OOB / -1-slot write)
