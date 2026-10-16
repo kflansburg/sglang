@@ -19,6 +19,32 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
 
+def _free_surplus_device_pages(
+    hisparse_attn_allocator: BaseTokenToKVPoolAllocator,
+    buffer_indices: torch.Tensor,
+    surplus: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Release the surplus device pages, keeping every page the buffer still uses.
+
+    ``buffer_indices`` and ``surplus`` are one request's hisparse device token
+    indices, kept part first. The kept cut is page-aligned in token count but
+    the request's device indices need NOT be dense within one page run (a
+    retract-resume or spec re-derivation can interleave another page's tokens
+    between kept and surplus members), so a page may hold both. Freeing tokens
+    directly would release (``unique(//page)``) such a shared page from under
+    the live buffer. Free only pages that hold no kept token; shared pages stay
+    with the buffer and leave with its own free.
+    """
+    if surplus.numel() == 0:
+        return
+    buffer_pages = torch.unique(buffer_indices // page_size)
+    surplus_pages = torch.unique(surplus // page_size)
+    pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
+    if pure_surplus.numel() > 0:
+        hisparse_attn_allocator.free(pure_surplus * page_size)
+
+
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
@@ -166,7 +192,14 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
+            # Free whole pages that hold no kept token; a page shared with the
+            # buffer must stay with it (non-dense device-index safe).
+            _free_surplus_device_pages(
+                self.hisparse_attn_allocator,
+                buffer_indices,
+                hisparse_indices[need_size:],
+                self.page_size,
+            )
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
@@ -507,15 +540,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
-            surplus = hisparse_indices[need_size:]
-            if surplus.numel() > 0:
-                buffer_pages = torch.unique(buffer_indices // self.hisparse_page_size)
-                surplus_pages = torch.unique(surplus // self.hisparse_page_size)
-                pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
-                if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.free(
-                        pure_surplus * self.hisparse_page_size
-                    )
+            _free_surplus_device_pages(
+                self.hisparse_attn_allocator,
+                buffer_indices,
+                hisparse_indices[need_size:],
+                self.hisparse_page_size,
+            )
         else:
             page_residual_length = len(hisparse_indices) % self.hisparse_page_size
             if page_residual_length != 0:
