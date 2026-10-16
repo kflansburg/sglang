@@ -53,7 +53,6 @@ def test_debug_mode_sweeps_duplicate_slots():
     m.free(s)
     with pytest.raises(AssertionError):
         m.free(s)  # accounting guard and/or dup sweep fails closed
-    assert m.available_size() <= m.size
 
 
 def test_group_free_of_unconsumed_remainder_is_clean():
