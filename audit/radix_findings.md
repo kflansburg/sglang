@@ -50,6 +50,7 @@ Production lens: disaggregated prefill/decode everywhere, page-size 64, fp8 e4m3
    shrinks + frees tree-owned rows (exact #38 mechanism, unified flavor). Fixed: skip insert when
    page_aligned_len <= cache_protected_len; components get documented 'no insert happened' cleanup.
    Regression: test_unified_checkpoint_shrink.py (baseline: exact AssertionError fires).
+   VERSIONS: affected v0.5.20/HEAD only — unified checkpoint_into_tree absent in v0.5.14/.15p1/.17/K3 (verified by unified-auditor).
    PREVIOUS VERDICT "NOT VULNERABLE" WAS WRONG (challenger radix-sched, msgs #721/#981).
 - **lock_sever hardening** (agent/radix-lead d966186): evict() severs evicted nodes; inc/dec_lock_ref
   assert attachedness — stale-handle underflow becomes a loud crash, not silent corruption.
