@@ -4,24 +4,24 @@ Branch: agent/spec-auditor (off origin/main 3420bae)
 ## Scope files covered
 - [ ] python/sglang/srt/mem_cache/unified_draft_pool.py (read: binds draft lanes in unified pool; move_kv_cache raises; no alloc/free of its own)
 - [ ] python/sglang/srt/mem_cache/ple_state_pool.py (read: ShortConvPool/NGramPool slot-indexed states; reset_slots/copy_slots null-safe)
-- [ ] python/sglang/srt/speculative/draft_checkpoint.py
-- [ ] python/sglang/srt/speculative/draft_utils.py
-- [ ] python/sglang/srt/speculative/draft_worker_common.py
-- [ ] python/sglang/srt/speculative/eagle_worker_v2.py (partial: draft(), verify(), draft_forward)
+- [x] python/sglang/srt/speculative/draft_checkpoint.py (27-line track-index buffer helper; null-safe; CLEAN)
+- [x] python/sglang/srt/speculative/draft_utils.py (backend factory only; no KV lifecycle; CLEAN)
+- [x] python/sglang/srt/speculative/draft_worker_common.py (build_draft_tp_worker/make_draft_input_v2; no KV lifecycle; CLEAN)
+- [x] python/sglang/srt/speculative/eagle_worker_v2.py (draft/verify/_draft_extend_for_decode/_draft_extend_for_prefill/adaptive state; CLEAN)
 - [ ] python/sglang/srt/speculative/eagle_worker_common.py (read: prepare_for_draft, run_eagle_verify, move_accept)
-- [ ] python/sglang/srt/speculative/eagle_info.py (partial: EagleDraftInput filter/merge)
+- [x] python/sglang/srt/speculative/eagle_info.py (EagleDraftInput/VerifyInput/DraftExtendInput filter/merge; no KV ownership in spec_info; CLEAN)
 - [ ] python/sglang/srt/speculative/eagle_utils.py (eagle_prepare_for_decode)
 - [ ] python/sglang/srt/speculative/eagle_disaggregation.py (read)
 - [ ] python/sglang/srt/speculative/dspark_disaggregation.py (read)
-- [ ] python/sglang/srt/speculative/dspark_components/* 
-- [ ] python/sglang/srt/speculative/dflash_disaggregation.py
+- [x] python/sglang/srt/speculative/dspark_components/* (worker/verify/planner/draft/kv_inject read; commit-gated KV inject; CLEAN)
+- [x] python/sglang/srt/speculative/dflash_disaggregation.py (32 lines, draft-input assembly only; CLEAN)
 - [ ] python/sglang/srt/mem_cache/allocation.py (alloc_for_spec_decode)
 - [ ] python/sglang/srt/mem_cache/common.py (release_kv_cache, _release_overallocated_kv_indices)
-- [ ] python/sglang/srt/mem_cache/multimodal_cache.py
-- [ ] python/sglang/srt/mem_cache/embedding_cache_controller.py (co-owned with radix-lead)
-- [ ] python/sglang/srt/mem_cache/embedding_store.py (co-owned with radix-lead)
-- [ ] retract/abort path during speculation
-- [ ] pd_first_draft_proposal / first-verify-after-handoff lifecycle
+- [x] python/sglang/srt/mem_cache/multimodal_cache.py (refcount-free LRU, idempotent free; CLEAN)
+- [x] python/sglang/srt/mem_cache/embedding_cache_controller.py (C1 CONFIRMED -> radix-emb #16-pending fix w/ my PoC; I verify)
+- [x] python/sglang/srt/mem_cache/embedding_store.py (abstract base; mooncake subclass short-read F-3 CONFIRMED -> radix-emb #14 shipped)
+- [x] retract/abort path during speculation (retract_decode->release_req->release_kv_cache trace + reset_for_retract; CPU harness test_spec_retract_free_roundtrip.py PINS invariant; CLEAN)
+- [x] pd_first_draft_proposal / first-verify-after-handoff lifecycle (verified decode prealloc seeds committed=allocated=fill_len; CLEAN)
 
 ## Draft KV lifecycle model (traced)
 - eagle_prepare_for_decode (eagle_utils.py:1112): page_aligned_decode_alloc_lens(reserve=2*alloc_len_per_decode,
@@ -147,3 +147,10 @@ deployments). Confirm via git tag diff before filing.
 - test_pd_eagle_draft_proposal.py (registered/spec/): PD first-verify proposal distribution correctness.
 - NO shipped test pins: draft KV verify/FAIL free paths, disagg+spec both-sides release, retract during spec,
   embedding prefetch timeout (the four gaps features-lead named). My two new tests cover retract + timeout.
+
+## Extra files covered turn-3
+- multi_layer_eagle_worker_v2.py + kernels/ops/speculative/multi_layer_eagle.py widened-window kernel:
+  pos bounds clamped (max(pos,0) low; pos<=seq_len+draft_token-1 < row width high); padded rows -> req_pool slot 0 dummy; CLEAN.
+- eagle_draft_extend/frozen_kv_mtp cuda graph runners: padded rows write reserved req_pool slot 0 / out_cache_loc zeroed (dummy slot), seq_lens fill; consistent with pool's +1 dummy slot; CLEAN.
+- decoupled_spec_io.py + pp_spec_relay.py: NOT in production surface (decoupled_spec_role=null, PP not deployed); skipped with reason.
+- draft_utils.py has NO alloc/free/kv mentions (grep-verified).
