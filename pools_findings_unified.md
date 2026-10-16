@@ -45,8 +45,13 @@ sync-free contract applies specifically to the page-reps/`free_*_segment` hot pa
   assert-loud; beam rows distinct). Historical triggers: pre-fix #38 checkpoint-shrink
   (double-frees tree-owned rows INTO the allocator; containment tested) and #59 unified-cache
   multi-page shrink under -O (containment tested at k=4). Verdict: CONTRACT-DEFENSE with
-  documented historical triggers; current-HEAD live reachability: none found. Version matrix
-  for #38/#59 owed by radix-lead, cross-linked in final report.
+  documented historical triggers; current-HEAD live reachability: none found.
+- VERSION MATRIX (probed upstream tags): F0 allocator-side mechanism = unified pools
+  .15p1/.17 (precursor multi_ended_allocator.py), .20/HEAD (unified_sub_pool.py); absent .14.
+  #59 caller-side unified checkpoint shrink = checkpoint_into_tree PRESENT ONLY at v0.5.20/HEAD
+  (absent in .14/.15p1/.17 and the K3 base 87dd4596). #38 = base RadixCache, all tags
+  (radix-lead triage). Cross-link: F0/#59 overlap = v0.5.20/HEAD; F0/#38 overlap = .15p1+.
+  #59 fix reviewed+approved by me (board #59, fcdd7d5).
 - allocplan fp8 non-aiter seam (forward_mha.py:691): REJECTED by dsa-auditor with
   single-producer trace (page_table_1_flattened from raw req_to_token rows; widened variant
   applied only to page_table_1); debug-mode max_idx probe noted as follow-up.
