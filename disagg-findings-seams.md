@@ -34,3 +34,7 @@ get_mha_kv_ptrs_with_pp (common/conn.py:1549-1582): draft-branch dispatch via di
 
 ## F12 verdict (VERIFIED, trust-boundary write primitive)
 Handle: mooncake/conn.py _handle_aux_data (1811-1829) → AuxDataCodec.deserialize_data_to_buffer (common/utils.py:101-109). Wire-controlled room/buffer_index/aux_index/len: no room-membership check, no buffer_index range check, no aux_index capacity check, no len(data)==item_len check → write into arbitrary slot (OOB heap or another request's aux/metadata region). Same site exists in mori/conn.py:1950 (out of prod scope). Intra-cluster trust, but stale-message generation mixups make it reachable without an attacker. Fix: validate room ∈ transfer_infos, buffer_index < len(aux_data_ptrs), aux_index < capacity (plumb aux capacity into kv_args/manager), len(data) == item_len else reject. Owner: disagg-prefill (after F15). Pair with wire-integ K-classes.
+
+## Coverage dot-files (lead-checked, clean-for-memory-safety)
+- pp_consensus_store.py: in-proc dict replication via msgpack; no KV indices/pointers; verified clean (read).
+- role_switch.py: orchestration only; its KV-bearing steps are covered by the teardown item (mooncake FS3) and scheduler pause seam (read in seam pass).
