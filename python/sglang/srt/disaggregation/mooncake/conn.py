@@ -2555,25 +2555,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
-                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                            if len(chunked_dst_kv_indice) < len(
-                                kv_chunk.prefill_kv_indices
+                            # The decode destination page list must cover this
+                            # chunk exactly. A short list used to be silently
+                            # truncated: the tail pages were never written yet
+                            # the room could still conclude Success, so decode
+                            # read stale KV left by previous owners of those
+                            # pages. The chunk object must also never be mutated
+                            # here: sibling reqs of a multi-destination room
+                            # iterate over the same kv_chunk, and an in-place
+                            # truncation poisons the next req's length pairing.
+                            chunk_prefill_kv_indices = kv_chunk.prefill_kv_indices
+                            if len(chunked_dst_kv_indice) != len(
+                                chunk_prefill_kv_indices
                             ):
-                                logger.warning(
-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "Destination KV index count mismatch for "
+                                        f"room {kv_chunk.room}: "
+                                        f"dst={len(chunked_dst_kv_indice)} vs "
+                                        f"prefill={len(chunk_prefill_kv_indices)}; "
+                                        "refusing to transfer (some pages would "
+                                        "be left unwritten or misaligned)"
+                                    ),
                                 )
-                                kv_chunk.prefill_kv_indices = (
-                                    kv_chunk.prefill_kv_indices[
-                                        : len(chunked_dst_kv_indice)
-                                    ]
+                                break
+                            if chunked_dst_device_kv_indice is not None and len(
+                                chunked_dst_device_kv_indice
+                            ) != len(chunk_prefill_kv_indices):
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "Destination device KV index count mismatch "
+                                        f"for room {kv_chunk.room}: dst_device="
+                                        f"{len(chunked_dst_device_kv_indice)} vs "
+                                        f"prefill={len(chunk_prefill_kv_indices)}; "
+                                        "refusing to transfer"
+                                    ),
                                 )
-                            if chunked_dst_device_kv_indice is not None:
-                                chunked_dst_device_kv_indice = (
-                                    chunked_dst_device_kv_indice[
-                                        : len(kv_chunk.prefill_kv_indices)
-                                    ]
-                                )
+                                break
 
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
@@ -2596,7 +2616,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 dcp_token_item_lens=dcp_token_item_lens,
@@ -2622,7 +2642,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
@@ -2656,7 +2676,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
