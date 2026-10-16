@@ -1628,33 +1628,66 @@ class CommonKVManager(BaseKVManager):
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+        """Pair this PP stage's main-model K/V pointers with the peer's.
+
+        Each side's pointer list is [K_main..., V_main...] with any draft
+        entries appended as [draft_K..., draft_V...]. Anchoring the K/V split
+        on half of the TOTAL (the previous modulo heuristic) lands inside the
+        draft block whenever one exists and silently reroutes the V transfer
+        into draft buffers, leaving decode's main V stale (cross-request
+        leak). The split must anchor on the main block of each side.
+        """
         start_layer = self.kv_args.prefill_start_layer
-        num_kv_layers = len(src_kv_ptrs) // 2
-        end_layer = start_layer + num_kv_layers
-        dst_num_total_layers = len(dst_kv_ptrs) // 2
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0) or 0
+        num_kv_layers = (len(src_kv_ptrs) - num_draft) // 2
+        end_layer = self.kv_args.prefill_end_layer
+        if end_layer is None:
+            end_layer = start_layer + num_kv_layers
+        # Full-model main layer count, used to locate the peer's main V block:
+        # the peer's pointer list is [K_main(All), V_main(All), draft...] and
+        # its main half is only derivable from the model's layer count, not
+        # from the pointer list alone (a trailing draft block and a PP stage
+        # window are indistinguishable positionally).
+        num_main_layers_total = getattr(self.kv_args, "hidden_kv_layers", 0) or 0
+        if num_main_layers_total <= 0:
+            # Setup paths that never populated the field: fall back to the
+            # stage count, i.e. assume the peer registers exactly this stage's
+            # span (historically true only for pp == 1 without speculation).
+            num_main_layers_total = num_kv_layers
+        if num_kv_layers <= 0 or (len(src_kv_ptrs) - num_draft) % 2 != 0:
+            raise RuntimeError(
+                f"Bad src KV geometry: entries={len(src_kv_ptrs)}, "
+                f"draft={num_draft}; main block must be an even number of entries"
+            )
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
-        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        if num_kv_layers == dst_num_total_layers:
-            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
-            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-        elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
+        src_v_ptrs = src_kv_ptrs[num_kv_layers : 2 * num_kv_layers]
+
+        # The peer's main block is 2 * full-model layer count entries; the
+        # rest is its draft tail. Same-model peers share the layer count.
+        dst_num_entries = len(dst_kv_ptrs)
+        dst_main_entries = 2 * num_main_layers_total
+        dst_num_draft = dst_num_entries - dst_main_entries
+        if (
+            dst_num_draft < 0
+            or dst_num_draft % 2 != 0
+            or dst_main_entries <= 0
         ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
-            dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
-            ]
-        else:
-            # Decode pp size should be equal to prefill pp size or 1
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
-            ]
+            raise RuntimeError(
+                f"Bad dst KV geometry: entries={dst_num_entries}, full-model "
+                f"main layers={num_main_layers_total}, stage layers "
+                f"{num_kv_layers}; cannot split main K/V safely"
+            )
+        dst_num_total_layers = num_main_layers_total
+        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        dst_v_ptrs = dst_kv_ptrs[
+            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+        ]
+        if num_kv_layers != len(dst_k_ptrs) or num_kv_layers != len(dst_v_ptrs):
+            raise RuntimeError(
+                f"KV pointer pairing mismatch: stage has {num_kv_layers} "
+                f"layers, got dst_k={len(dst_k_ptrs)}, dst_v={len(dst_v_ptrs)}; "
+                "refusing to silently truncate the transfer"
+            )
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
