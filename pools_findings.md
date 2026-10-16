@@ -67,3 +67,7 @@ Status legend: CONFIRMED (repro or exact counterexample), CANDIDATE (code argume
 
 ## Version check queue (for version-triage)
 - (pending confirmed bugs)
+
+## Harness results (pools-lead, CPU, torch 2.14.1)
+- test/srt/pools_fuzz/test_paged_allocator_fuzz.py: conservation + no-double-alloc + drain, 20 configs (need_sort x seeds), 400 mixed ops each: ALL PASS — stock allocator sound under contract-abiding callers.
+- ADVERSARIAL-1 (CONFIRMED consequence statement, production debug=off): caller double-free of one page via free() → free list holds the page twice (21 entries/20 unique) → subsequent two allocs hand page 1 to two requests → cross-request KV aliasing. No assert fires with SGLANG_DEBUG_MEMORY_POOL unset. This is the concrete production consequence motivating caller-side invariant fixes (radix-lead's abort/retract hunt) + an allocator hardening option.
