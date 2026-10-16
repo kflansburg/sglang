@@ -108,9 +108,113 @@ TODO: check whether each subclass is reachable in prod configs and whether
 any caller can double-free (ownership trace); DSv4StateHostPool check;
 check K3 branch mamba free.
 
-### F2. page_first_direct layout index math at page_size 64 — TODO
-Plan: read mla.py / mha.py get_flat_data_page / set_from_flat_data_page /
-transfer index math; verify against sgl_kernel direct kernels' strides.
+### F2. [CONFIRMED] free() accepts -1 sentinel indices: ownership theft + -1 issued as a live slot
+`HostKVCache.free` (base.py:555) asserts `slot_used[indices_cpu].all()` but
+NEVER checks `indices >= 0`. Negative indices wrap: `slot_used[-1]` is
+`slot_used[logical_size-1]`.
+
+Repro (verbatim base.py methods, HEAD):
+```
+f.size=128; f.alloc(128)            # live owner of 0..127
+bad = full(64,-1); bad[0]=5
+f.free(bad)                         # NO assert raised!
+# slot_used[127] is now False (a LIVE slot marked free),
+# release_slots holds 63 copies of -1 + slot 5
+f.alloc(64)  ->  returns tensor containing 63x -1 and slot 5
+```
+Consequences downstream:
+- slot 127 silently freed while live -> a later alloc hands it to a second
+  owner (double-alloc without any double-free!).
+- alloc() issues `-1` as a slot id -> every indexing site
+  (`kv_buffer[-1]`, `get_data_page(-1)`, kernel index loads) aliases row
+  `logical_size-1` / `page_num-1` -> cross-request KV corruption.
+- The -1 sentinels live FOREVER in the free list (never allocatable
+  legitimately; when re-issued they corrupt repeatedly).
+
+Vectors: per-request host slot tables in the HiSparse / DSv4 C4 paths are
+padded with -1 (`req_to_host_pool`; hisparse.py:59 filters `>= 0` in
+`allocated_host_indices`, proving -1 padding exists in these tables). Any
+free path that forgets the filter (evict, abort, retract, prefetch-cancel)
+hits this. DeepSeekV4StateHostPool "reuses SWA transfer indices" -> its
+host_indices flow through DSv4 paged pools' free.
+Subclass overrides (mamba/DSv4/logical) do NO checks at all.
+Versions: ALL (v0.5.14 -> HEAD), all pools.
+Suggested fix: in every free(), assert `(indices >= 0).all()` and
+`(indices < logical_size).all()` (or filter -1s explicitly if a caller
+contract legitimately passes them). Cheap: one reduction on CPU tensor.
+
+### F3. [CLEAN under assumptions] page_first_direct layout index math at page_size 64
+Checked MLA (mla.py) & MHA (mha.py):
+- Buffer dims page_first_direct MLA: (page_num, layer_num, page_size, 1,
+  kv_cache_dim); MHA: (2, page_num, layer_num, page_size, head_num,
+  head_dim). get_page_buffer_meta computes k_ptr = base +
+  indices[page_start]*layer_stride... Verified: pages are page_size-aligned
+  contiguous (host allocator carves page_size multiples out of arange), so
+  page_start_token*L*D == page_id*page_bytes/elem. v_ptr = k_ptr + v_offset
+  with v_offset == kv_buffer[0].nbytes (MHA) == correct v slice base.
+  get_data_page/set_from_flat_data_page use index//page_size consistently.
+- QSA/mha_mxfp8 `_page_ids` use indices[::page_size]//page_size -- same
+  alignment assumption.
+ASSUMPTIONS (challenge points): (1) every indices tensor handed to these
+functions consists of page-contiguous, page-aligned blocks of page_size --
+the only guard is `len % page_size == 0`; a token-granular or misaligned
+caller would silently read the wrong page (DSv4 C4 token-granular host
+indices DO exist but go through transfer_cache_dsv4_mla, not
+get_page_buffer_meta). (2) Direct-kernel per-token addressing (sgl_kernel
+transfer_kv_*_direct_*) is kernel-side, not auditable here -- page stride
+spacing matches layout_dim defs passed in.
+
+### F4. [CLEAN] DeepSeekV4PagedHostPool.alloc rounds UP to slot_page_size
+(mph:434-447): alloc returns a rounded-up set; free() accepts arbitrary
+lengths. Callers must free the RETURNED tensor, not the requested count.
+ASSUMPTION: all callers free transfer.host_indices / allocated tensors as
+returned (release_transfers in group.py does exactly this). A caller freeing
+only need_size elements would leak the rounded tail permanently (capacity
+leak, not corruption). Not found in-scope.
+
+### F5. [SUSPECT -> handed to controller-owner] Unified page-envelope pool:
+mooncake store L3 IO uses raw physical ptrs WITHOUT layout lease.
+UnifiedPageEnvelopeHostPool.get_page_buffer_meta (unified.py:1065) resolves
+physical addrs under lock but returns raw ptrs; the mooncake store
+(mooncake_store.py:1075,1139,1152) then issues RDMA set/get on those ptrs
+with NO acquire_layout(). If _compact() runs while that IO is in flight,
+physical pages move -> RDMA reads/writes the wrong host page (cross-request
+leak / corruption). Mitigant: compaction is allocator-thread (scheduler)
+synchronous; mooncake batch_set/get must be ASYNC for overlap to exist.
+Needs controller-side verdict: is storage IO synchronous on the scheduler
+thread, or deferred? (cache_controller/storage op queues - outside my
+scope; hicache-lead to route.)
+The L2 device-side transfer path DOES lease correctly
+(l2_transfer.py:103-128 + per-release finish events; event overwrite for
+same transfer_key is SAVED by same-stream ordering: the last recorded
+finish event on a stream subsumes all earlier DMA on that stream. CLEAN
+under the one-stream-per-direction-per-engine invariant).
+
+### F6. [CLEAN] HostPoolGroup.resolve/release_transfers (group.py:175-260)
+derived transfers alias source indices and are skipped in release -> single
+owner; rollback frees only fresh allocs. ASSUMPTION: callers never double
+invoke release_transfers on one list nor free host_indices independently.
+
+### F7. [CLEAN] host_memory.py, pool_host/common.py alloc/register/unregister:
+registration chunking records per-range bases for unregister; destroy()
+idempotent; HIP frombuffer finalize ties free to tensor lifetime; rollback
+of partial registration ok. ASSUMPTION: destroy() only runs at shutdown (no
+in-flight IO).
+
+### F8. [CLEAN] DeepSeekV4StateHostPool: no allocator/no free list by design
+(free raises). Its host_indices alias SWA pool rows; protection depends on
+group release_transfers skipping derived transfers (F6 assumption).
+
+### F9. [CLEAN] LogicalHostPool page-aligned alloc/free arithmetic itself
+(rounding, merge) matches base semantics.
+
+### Remaining minor notes
+- hisparse.alloc_paged_token_slots: writes page-aligned slots into request
+  table; table overflow raises (loud via shape mismatch), not silent. OK.
+- v0.5.14 base free() also was NOT synchronized (race between concurrent
+  free/free and alloc -> lost updates/dup indices). v0.5.15+ has RLock.
+- mem_state tensor (base.py clear()) is written but never read anywhere in
+  pool_host; dead state (vestigial), not a bug.
 
 ### F3. Reclaim order: free of host slots referenced by in-flight direct IO —
 TODO (boundary with cache controller; check how eviction vs io_uring/direct
