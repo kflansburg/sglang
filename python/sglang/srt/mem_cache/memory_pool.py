@@ -67,6 +67,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -1811,14 +1812,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.kv.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        if _MAMBA_DEBUG_ASSERTS:
-            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
-            assert mamba_value_donated.item() != -1, (
-                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-                f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
-                f"next_track_idx={req.kv.mamba_next_track_idx}, "
-                f"rid={req.rid}"
-            )
+        # Always-on (restored from v0.5.14): a donated -1 would silently map
+        # the tree pointer at slot -1 -> cross-request mamba state exposure.
+        # Donations are per-checkpoint (not per-token), so the .item() sync is
+        # amortized; features-lead request to drop the debug gate.
+        assert mamba_value_donated.item() != -1, (
+            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+            f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.kv.mamba_next_track_idx}, "
+            f"rid={req.rid}"
+        )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
@@ -1881,8 +1884,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
             req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
+            # Also release the deferred-COW source lock (F-1); a free is a
+            # full ownership reset, so the staged copy will never read it.
+            clear_mamba_cow(req)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -5213,6 +5217,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 if dcp_replicated
                 else (size + self.page_size) * dcp_size - self.page_size
             )
+        # The index buffer (and req_to_token, int32) address these ids: beyond
+        # 2^31 they wrap negative and alias with no loud error.
+        assert index_buf_size < 2**31, (
+            f"DSA index buffer id space {index_buf_size} exceeds the int32 bound "
+            f"(2^31): size={size}, page_size={self.page_size}, "
+            f"dcp_replicated={dcp_replicated}. Reduce token capacity or DCP size."
+        )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128

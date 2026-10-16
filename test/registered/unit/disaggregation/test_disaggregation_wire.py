@@ -1404,7 +1404,10 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             # SWA state has no layer ids, so a later PP stage would land on the
             # decode peer's first SWA layers.
             (2, "nhd", [16, 16], [8, 8], "pipeline parallelism"),
-            (1, "nhd", [64], [32], "per-layer K/V"),
+            # A single SWA-ring entry cannot be K/V-paired: post-F15 the
+            # geometry guard rejects odd source entropy BEFORE the outer
+            # per-layer-K/V check runs; either way this layout is rejected.
+            (1, "nhd", [64], [32], "Bad src KV geometry"),
             # One SWA head per rank on both sides, against 8 total KV heads.
             (1, "nhd", [8, 8], [8, 8], "do not split"),
             # Item lengths that are valid NHD, so only the layout can reject.

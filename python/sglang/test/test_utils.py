@@ -35,7 +35,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.benchmark.serving import run_benchmark
 from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -52,6 +51,18 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
 
 # General test models
+def run_benchmark(*args, **kwargs):
+    """Lazy proxy for sglang.benchmark.serving.run_benchmark.
+
+    Imported on first call so pure unit tests (which never benchmark) can
+    import this module without benchmark-only dependencies such as
+    `datasets`.
+    """
+    from sglang.benchmark.serving import run_benchmark as _serving_run_benchmark
+
+    return _serving_run_benchmark(*args, **kwargs)
+
+
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"

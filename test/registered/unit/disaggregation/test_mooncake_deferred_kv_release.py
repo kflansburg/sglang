@@ -99,6 +99,10 @@ class TestMooncakeAbortNotification(
     def _make_abort_manager(self, status: KVPoll | None):
         return _manager(status=status)
 
+    # Mooncake F4: the fault handler balances the dequeue-time outstanding
+    # increment (0 remaining) while still poisoning the ack.
+    expected_staging_outstanding = 0
+
     def _provoke_worker_failure(self, manager) -> None:
         # Post-F4 contract: a chunk-level fault no longer kills the worker;
         # it poisons the deferred ack, fails the room, and keeps serving.
