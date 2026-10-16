@@ -260,3 +260,16 @@ eagle_utils.py verify_tree_greedy_func XPU branch (comment-only, no XPU behavior
   10. finalize_load_back(success=False) (components/mamba.py:728-735): frees allocated slot + clears
      pool idx but does NOT clear cow_src_metadata — if COW was staged AND load-back failed, req carries
      stale cow_src into later phases + fix's lock still held with no dec on this path.
+
+## Challenge rotation (features-lead #1022): mamba2's #8 item 3-5 clean verdicts
+- Item 3 (replayssm ring fresh-alloc-on-reuse): COULD NOT BREAK (30m). Fresh-row reset
+  (memory_pool.py:1588-1600) covers all reuse paths (only 2 req_pool_idx=None writes, both
+  before realloc); retract-between-draft-append-and-verify defeated by scheduler step atomicity.
+  3b/3c gating legs read-correct in prod config. Verdicts HOLD.
+- Item 4 (v2p sentinel + undraft checks), item 5 (int8 ckpt asymmetry): not re-attacked deeply;
+  consistent with my earlier reads of mamba_checkpoint_pool.
+- Related open item flagged: multi_layer_eagle_worker_v2.py:594-598 _apply_deferred_mamba_init_
+  to_draft_pools applies TARGET-batch mamba indices (clear/copy) to DRAFT runner pools (Inkling
+  arch only). Draft vs target pool index translation is the crux; mamba2-auditor is TRACING it
+  (their #8 candidate); Inkling arch is outside the EAGLE/DSPARK prod spec list for my scope.
+  Left to mamba2; rooting for a bounds assert at copy/clear regardless of sizing.
