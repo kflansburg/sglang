@@ -1,5 +1,8 @@
 # Decode-side disaggregation audit findings (disagg-decode)
 
+## FIXED (shipped)
+- V4-decode FIX on agent/disagg-decode @be5bd52, board #19: device-destination deferred release no longer frees at 30s timeout; holds until drain ack or prefill-down (prefill_info_table pop). 'peer_dead' metric outcome. Supersedes CAND-1 below for device path on HEAD. Older prod versions (v0.5.14/.15.post1/.17) have NO deferred release at all and free immediately on failure — confirmed via fetched tags; the local-patch backport story for those belongs to release engineering.
+
 Scope: decode.py, decode_schedule_batch_mixin.py, decode_kvcache_offload_manager.py, decode_hicache_mixin.py (+ scheduler seams). Repo: latest upstream main.
 
 Status legend: [CAND] candidate, [CONF] confirmed against code, [CLEAN] checked, no bug.
@@ -45,6 +48,12 @@ Status legend: [CAND] candidate, [CONF] confirmed against code, [CLEAN] checked,
 - grammar double release: fixed upstream via to_FINISH single-path. [CLEAN]
 - retract with SWA offload guard: fixed upstream (drain + synchronous backup). [CLEAN, but CAND-3 crash-on-guard]
 - prefill abort cache leak (decode side of the seam): transfer-queue failure always releases prealloc'd KV via _release_request or deferred release. [CLEAN]
+
+## Pass 4 — siblings of V4 (free-on-timeout-assumption, decode side)
+Swept decode.py + common/conn.py for other "free on timeout" decode-side frees: none remain. All other timeouts (Bootstrapping/WaitingForInput prefill-wait, transfer failure) route through the Failed path → deferred release (with force_arm when metadata was partially published). Non-deferred backends (fake, opted-out) release immediately by design (no remote RDMA writer). Verdict: sibling sweep CLEAN.
+
+## Admission arithmetic verdict (decode.py:1962-2156)
+_allocatable_token_budgets + SWA variants: reservation-based admission; a mis-estimate shows up as the hard assert in _pre_alloc (scheduler crash), NOT silent corruption — the allocator itself enforces capacity. Budget arithmetic errors are thus availability bugs; flagged but not chased further (radix-sched owns the sibling capacity-check class on the running-batch side, board #16).
 
 ## Not deeply covered (handoff notes)
 - HiSparse direct-to-host path (decode.py:2260-2278 alloc_for_decode_prealloc_hisparse, host pool rows): production runs DSA trtllm on DeepSeek V4, hisparse coordinator is adjacent; only lightly checked.
