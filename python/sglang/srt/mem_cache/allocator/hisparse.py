@@ -240,11 +240,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # tree/creator-owned: read its device indices for the buffer but never
         # zero its mapping and never free its pages here (F-5, board #51).
         # Zero means unmapped; after alloc_logical_only the mapping is all zeros.
-        prefix_vals, hisparse_indices = _harvest_device_indices(
+        prefix_vals, fresh_vals = _harvest_device_indices(
             self.full_to_hisparse_device_index_mapping, allocated_indices, prefix_len
         )
+        hisparse_indices = fresh_vals
         if prefix_vals is not None and prefix_vals.numel() > 0:
-            hisparse_indices = torch.cat([prefix_vals, hisparse_indices])
+            hisparse_indices = torch.cat([prefix_vals, fresh_vals])
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             # Free whole pages that hold no kept token; a page shared with the
@@ -261,19 +262,36 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # page alignment, claiming the residual space of an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
             if page_residual_length != 0 and len(hisparse_indices) > 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
+                pad_len = self.page_size - (len(hisparse_indices) % self.page_size)
+                if fresh_vals.numel() > 0:
+                    # Dense continuation of the request's OWN last fresh device
+                    # page; that page is request-owned, fabricating the rest is
+                    # safe (it is released once with the buffer's whole-page free).
+                    hisparse_indices = torch.cat(
+                        [
+                            hisparse_indices,
+                            torch.arange(
+                                hisparse_indices[-1] + 1,
+                                hisparse_indices[-1] + pad_len + 1,
+                                device=self.device,
+                            ),
+                        ]
+                    )
+                else:
+                    # Q3: the kept run's tail is a prefix/shared value; fabricating
+                    # continuation ids would claim slots INSIDE a tree-owned page,
+                    # which the request's later whole-page free would then release
+                    # from under the tree (F-5 sibling, fresh-tail-empty trigger).
+                    # Fall back to a whole-page alloc and take its front ids; the
+                    # tail ids of the allocated page stay request-owned and are
+                    # reclaimed with the buffer's own free via whole-page dedup.
+                    pad_page = self.hisparse_attn_allocator.alloc(self.page_size)
+                    assert pad_page is not None, (
+                        "Hisparse allocation failed in alloc_device_buffer padding"
+                    )
+                    hisparse_indices = torch.cat(
+                        [hisparse_indices, pad_page[:pad_len]]
+                    )
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
@@ -586,11 +604,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # The radix-hit prefix region (first ``prefix_len`` compressed slots) is
         # tree/creator-owned: read its device indices for the buffer but never
         # zero its mapping and never free its pages here (F-5, board #51).
-        prefix_vals, hisparse_indices = _harvest_device_indices(
+        prefix_vals, fresh_vals = _harvest_device_indices(
             self.full_to_hisparse_device_index_mapping, allocated_indices, prefix_len
         )
+        hisparse_indices = fresh_vals
         if prefix_vals is not None and prefix_vals.numel() > 0:
-            hisparse_indices = torch.cat([prefix_vals, hisparse_indices])
+            hisparse_indices = torch.cat([prefix_vals, fresh_vals])
 
         device_buffer_size = need_size - self.hisparse_page_size
         P = len(hisparse_indices)
@@ -612,19 +631,38 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             page_residual_length = len(hisparse_indices) % self.hisparse_page_size
             if page_residual_length != 0 and len(hisparse_indices) > 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.hisparse_page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
+                pad_len = self.hisparse_page_size - (
+                    len(hisparse_indices) % self.hisparse_page_size
                 )
+                if fresh_vals.numel() > 0:
+                    # Dense continuation of the request's OWN last fresh device
+                    # page (request-owned; released once with the buffer's
+                    # whole-page free).
+                    hisparse_indices = torch.cat(
+                        [
+                            hisparse_indices,
+                            torch.arange(
+                                hisparse_indices[-1] + 1,
+                                hisparse_indices[-1] + pad_len + 1,
+                                device=self.device,
+                            ),
+                        ]
+                    )
+                else:
+                    # Q3: kept run's tail is prefix/shared; fabricated ids would
+                    # live inside a tree-owned page and be double-freed on the
+                    # request's whole-page release (F-5 sibling). Allocate a
+                    # real pad page and use its front ids; its tail ids stay
+                    # request-owned and are reclaimed via whole-page dedup.
+                    pad_page = self.hisparse_attn_allocator.alloc(
+                        self.hisparse_page_size
+                    )
+                    assert pad_page is not None, (
+                        "Hisparse allocation failed in alloc_device_buffer padding"
+                    )
+                    hisparse_indices = torch.cat(
+                        [hisparse_indices, pad_page[:pad_len]]
+                    )
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
