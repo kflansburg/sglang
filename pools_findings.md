@@ -99,3 +99,12 @@ Fix skeleton (pending reachability): mask `freed_p_pages >= 0` before index_fill
 - memory_pool.DSATokenToKVPool: same bound on derived DSA index_buf_size.
 - Version surface (allocplan): v0.5.17/v0.5.20+/latest affected class; v0.5.14/.15 lack attn-DCP (class absent) unless a plain pool hits 2^31 (unrealistic).
 - Trigger bound: max_total_num_tokens * attn_dcp_size >= 2^31 — latent today (no prod deployment near), would be silent corruption if ever configured.
+
+## VERSION TRIAGE (pools fixes on agent/pools-lead + agent/unified-auditor)
+Fetched tags v0.5.14, v0.5.15.post1, v0.5.17, v0.5.20 (+ K3 base commits 87dd4596/bd4828e2 reachable).
+1. paged.py alloc_decode ps==1 desync (BUG-ALLOC-5, latent): class present in ALL (alloc_decode exists all tags); trigger = any paged pool at ps=1 — no prod caller today. Fix = defense assert.
+2. allocator/mamba.py free() no-dedup: present in ALL tags (MambaSlotAllocator with plain free list); reachability = caller double-free only (see F0/F1 gate). Fix = accounting bound + debug unique sweep.
+3. kv_cache_configurator.logical_token_capacity int32/DCP widen: file exists in v0.5.17+ only; DCP absent in .14/.15 (allocplan-auditor version check: affected v0.5.17, v0.5.20, HEAD; class impossible on .14/.15 unless a plain pool hits 2^31, unrealistic).
+4. memory_pool DSATokenToKVPool DCP-widen: same as 3 (DSA/v4 pools only in .17+).
+5. deepseek_v4_compress_state transfer-index helpers: HEAD-only code line (helpers introduced after v0.5.20; tags have _lcm-only module tops and the transfer logic inline elsewhere / not extracted). No backport needed to prod tags.
+6. unified F0 stale-free (unified_sub_pool free_unbind kernel + Float.free): unified pools present v0.5.20+HEAD (multi_ended_allocator precursor in .15p1/.17 — verify before report; the Float/kernel names are HEAD+. Confirm in final coverage table).
