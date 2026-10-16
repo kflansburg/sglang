@@ -274,3 +274,28 @@ Q3 suite green in my sandbox (test_hisparse_q3_pad_guard.py).
   drives flat MambaRadixCache family on older tags; unified arrives with the newer class).
 - severity: cross-request mamba state corruption window = staging → next forward collect; reachable
   under any concurrent admission/retraction (mamba evict pressure) — live in K3 prod shapes.
+
+## F-1 vendor-branch backport README (flat caches; product hotfix channel)
+HEAD/main: NO flat mamba caches (removed; unified is the only staging site; fixed in c33f4e3).
+Prod carrier branches, staging site (all equivalent):
+- v0.5.14/.15.post1/.17: hi_mamba_radix_cache.py :1013-1070 (v0.5.14+15) / :1026-1083 (.17)
+- v0.5.20: mamba_radix_cache.py :1200-1210 (_match_post_processor); hi_mamba_radix_cache.py
+  also present with 1 cow site (v0.5.20 count above is for mamba_radix alone = 0 on hi_)
+BACKPORT PATCH SHAPE per branch:
+  (1) STAGING: at `<cache>._match_post_processor`, BEFORE the `if cow_mamba and ...` staging block,
+      take inc_lock_ref(last_node); store the IncLockRefResult receipt on req.kv.mamba_cow_lock
+      (new field on ReqKvInfo, field-named per branch). Flat tree's inc_lock_ref/dec_lock_ref(node)
+      semantics are per-node (no hierarchy; the retry branch's existing inc/dec pair stays).
+  (2) CLEAR ALL SITES (branch-specific counts from grep):
+      v0.5.14:   schedule_batch.py:1916 (reset_for_retract), schedule_batch.py:2998 (collect)
+                 (pool free no clear site at all today — ADD one at the pool free sibling)
+      v0.5.15p1/.17: + scheduler.py:1 (not-admitted revert variant)
+      v0.5.20:  both schedbatch sites (:1916/:2998), scheduler.py:1, memory_pool.py:1709
+  (3) SEMANTICS at each site: if req.kv.mamba_cow_lock is not None:
+      tree_cache.dec_lock_ref(<node>, receipt.to_dec_params()); receipt=None; THEN clear
+      mamba_cow_src_index/needs_clear exactly as today.
+  (4) TEST port: mini sim per branch of the 2-request interleaving (stage cow on node; evict;
+      source slot must survive while receipt held). Local pytest per vendor branch.
+NOTE: carry alongside the same release_kv_cache early-no-KV branch shape check per branch
+  (v0.5.14's common.py likely needs the catch-all too — first clear sites already cover pools;
+  verify during backport whether release_kv_cache has the early mamba_alloc branch on that tag).
