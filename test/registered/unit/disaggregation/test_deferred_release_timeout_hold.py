@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -59,7 +59,7 @@ def _make_queue(prefill_alive=True):
     return queue, decode_req, receiver
 
 
-class TestDeferredReleaseTimeoutHold(CustomTestCase):
+class TestDeferredReleaseTimeoutHold(unittest.TestCase):
     def test_undrained_past_deadline_is_held_not_freed(self):
         queue, decode_req, receiver = _make_queue(prefill_alive=True)
 
