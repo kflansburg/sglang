@@ -9,6 +9,7 @@ def _clear_unaccepted_c128_draft_states_kernel(
     req_pool_indices,
     seq_lens,
     accept_lens,
+    num_rows: tl.constexpr,
     ring_size: tl.constexpr,
     half: tl.constexpr,
     num_draft_tokens: tl.constexpr,
@@ -26,6 +27,13 @@ def _clear_unaccepted_c128_draft_states_kernel(
     seq_len = tl.load(seq_lens + bid).to(tl.int64)
     slot = (seq_len + draft_offset) % ring_size
     row = req_pool_idx * ring_size + slot
+
+    # Defensive bound: the C128 ring rows are a shared flat buffer and the
+    # caller's req_pool_idx bounds are an invariant of the (PD-prealloc-aware)
+    # pool sizing, not something the kernel can assume. A bad row would
+    # otherwise silently clobber a neighbor request's compress state.
+    if row < 0 or row >= num_rows:
+        return
 
     offsets = block_id * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = offsets < half
@@ -54,5 +62,6 @@ def clear_unaccepted_c128_draft_states(
         ring_size,
         half,
         num_draft_tokens,
+        num_rows=state.shape[0],
         BLOCK_D=256,
     )

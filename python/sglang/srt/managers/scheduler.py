@@ -298,6 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -4206,9 +4207,10 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
+                    # metadata before add_one_req() rejects the request. Also
+                    # release the staged COW source lock; the request leaves
+                    # this round without its copy (F-1).
+                    clear_mamba_cow(req)
                     if req.kv.holds_mamba and not getattr(req, "session", None):
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
