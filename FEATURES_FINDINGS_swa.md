@@ -320,3 +320,17 @@ carries the ring back-port; check for `_swa_req_ring` to pick the variant.
 `SWATokenToKVPoolAllocator._swa_req_ring`; if present use the v0.5.20
 variant else the v0.5.14/.15p1/.17 variant. Same bug shape confirmed via
 git tags spanning the era.
+
+## _filter_swa_cpu_copy chunk-boundary stress (fp8 approved deep-dive) — CLEAN
+Method: exec() of the exact source of _filter_swa_cpu_copy from
+swa_memory_pool.py (zero transcription drift) against synthetic per-layer
+chunk lists mimicking a quantized pool (4 tensors per chunk: k, v, k_scale,
+v_scale), across (nrows, chunk) in {(7,4),(8,4),(9,4),(1,4),(3,1),
+(16,8192),(8193,8192),(3,8192)} x masks {all, none, sparse, tail}.
+Invariants held: per-chunk tensor row-count alignment; re-chunk emits
+chunk-sized pieces except the last; total filtered rows == mask.sum();
+empty mask -> all chunks empty/[] (load path's `swa_indices.numel()==0`
+early-returns before touching buffers); all-true mask -> identical object
+returned (fast path). Combined with the earlier load_cpu_copy chunk-index
+contract analysis: no row/scale desync at chunk boundaries, including
+fp8_e4m3 per-token scales.
