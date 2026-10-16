@@ -439,6 +439,15 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _is_xpu:
+        # NOTE (spec-audit, memory-safety contract): consumers of accept_index
+        # (e.g. eagle_worker_common._compact_accept_to_front and the draft-extend
+        # retrive-coordinate math) rely on the accept kernel writing accepted
+        # nodes ORDERED at columns [0..accept_len) over a -1-initialized buffer.
+        # A mid-gap -1 would index -1 downstream (cross-request garbage) and
+        # _compact_accept_to_front's clamp(min=0) only defends -1 padding.
+        # The triton XPU variant MUST uphold the same ordered-write contract as
+        # the CUDA/CPU/NPU kernels (spec_tree.verify_tree_greedy_kernel_triton
+        # does; regression: test/registered/unit/spec/test_accept_index_coord_safety.py).
         verify_tree_greedy_triton(
             predicts=predicts,
             accept_index=accept_index,

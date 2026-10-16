@@ -403,6 +403,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # CPU mirror of `_pending_reuse` for O(1) membership in the survivor walk.
         self._pending_reuse_pages_cpu: Set[int] = set()
         # Cumulative observability counters (NOT reset at clear()).
+        self._stats_n_stale_frees: int = 0
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
         self._stats_n_drain_calls: int = 0
@@ -610,6 +611,26 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] span {wm_span} != live "
                     f"{self.live_page_count} + holes {holes} + pending {pending}"
                 )
+            # VALUE checks: a stale free slips PAST the count identity above
+            # (double-free: live-1, holes+1, span unchanged) -- it shows up only
+            # as a negative/duplicate hole or an underflowed live counter.
+            if self.live_page_count < 0:
+                out.append(
+                    f"[{self.sub_pool_name}] live_page_count "
+                    f"{self.live_page_count} < 0 (double-free underflow)"
+                )
+            if holes:
+                h = self._free_phys_pages.tolist()
+                if len(set(h)) != len(h):
+                    out.append(
+                        f"[{self.sub_pool_name}] duplicate pages in free list "
+                        f"(double-free): {sorted(x for x in set(h) if h.count(x) > 1)[:5]}"
+                    )
+                bad = [p for p in h if p < 0 or p >= self.num_pages]
+                if bad:
+                    out.append(
+                        f"[{self.sub_pool_name}] out-of-range hole pages: {bad[:5]}"
+                    )
         out.extend(self._capacity_memo_violations())
         return out
 
@@ -1361,10 +1382,68 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             freed_p_pages = free_unbind_inplace(
                 free_v_pages, self.virtual_to_physical, self.physical_to_virtual
             )
+            free_v_pages, freed_p_pages = self._filter_stale_frees(
+                free_v_pages, freed_p_pages
+            )
+            if free_v_pages.numel() == 0:
+                return
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
             self.live_page_count -= int(freed_p_pages.shape[0])
+
+    def _filter_stale_frees(
+        self,
+        free_v_pages: torch.Tensor,
+        freed_p_pages: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Drop stale frees (double-free / never-allocated v -> freed p == -1).
+
+        The EAGER free path asserts on this; the lazy and float paths must not
+        silently admit a -1 into the free list: it would later be handed out as
+        physical page -1 (cross-request aliasing) and shrink live_page_count
+        below zero.
+
+        SYNC POLICY: the free paths are host-sync-free zones (asserted by
+        test_unified_free_no_host_sync), so in production this installs only
+        the no-sync ``SGLANG_ENABLE_ASYNC_ASSERT`` tripwire (fires at the next
+        sync point) and relies on the store guards in virtual_slot.py. The
+        guards guarantee: NO OOB write into the p2v table at p=-1 (was a raw
+        8B-below-table store on Triton / index_fill_ -1 wrap on CPU), and NO
+        tombstone wrap of p2v[last]; a later handout of a stale hole makes
+        ``bind`` a no-op with ``v2p[v]`` left -1.
+
+        RESIDUAL (default prod config, probes env-gated): that request's
+        translate still yields physical -1 for its virtual id, and WRITE
+        kernels (``write_cache/update_cache_legacy`` and the sink-clamped
+        ``write_cache_virtual``) take unmasked phys ids from ``req_to_token``
+        raw -1 / sink-clamped 0 -- a wrap/-0 write can corrupt a neighbor row
+        until a probe (``SGLANG_ENABLE_ASYNC_ASSERT``, idle verifiers) or the
+        caller stops it. So a double-free in default config is still a
+        wrong-site WRITE risk via the consuming request, unchanged by this
+        filter; the guaranteed wins are the table-write ones above. Under
+        ``SGLANG_DEBUG_MEMORY_POOL`` this filter pays one ``.any()`` sync and
+        raises exactly like the eager path; the idle byte-accounting
+        verifiers catch the hole/live values regardless of mode.
+        """
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            torch._assert_async(
+                (freed_p_pages >= 0).all(),
+                f"stale page free (double/never-allocated) in "
+                f"MultiEndedAllocator({self.sub_pool_name!r})",
+            )
+        if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            return free_v_pages, freed_p_pages
+        if not bool((freed_p_pages < 0).any().item()):
+            return free_v_pages, freed_p_pages
+        n_stale = int((freed_p_pages < 0).sum().item())
+        self._stats_n_stale_frees += n_stale
+        self._raise_stale_slot_assertion(
+            free_v=free_v_pages, freed_p=freed_p_pages
+        )
+        # unreachable: _raise_stale_slot_assertion raises
+        live_mask = freed_p_pages >= 0
+        return free_v_pages[live_mask], freed_p_pages[live_mask]
 
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
         """Cat `pages` onto `_free_phys_pages`. `_flush` calls it only AFTER its
@@ -2385,6 +2464,11 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             freed_p_pages = self.virtual_to_physical[free_v_pages]
             # `index_fill_`, never `t[idx] = -1`: see the END free path.
             self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
+            free_v_pages, freed_p_pages = self._filter_stale_frees(
+                free_v_pages, freed_p_pages
+            )
+            if free_v_pages.numel() == 0:
+                return
             self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
@@ -2633,6 +2717,21 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 out.append(
                     f"[{self.sub_pool_name}] float span {self._span_pages()} != "
                     f"p2v-bound {bound} + holes {self._hole_pages()}"
+                )
+        # VALUE checks (same rationale as the END pool's: count identities miss
+        # double-frees; only the values expose them).
+        holes = self._free_phys_pages.tolist()
+        if holes:
+            if len(set(holes)) != len(holes):
+                out.append(
+                    f"[{self.sub_pool_name}] duplicate pages in float hole list "
+                    f"(double-free): "
+                    f"{sorted(x for x in set(holes) if holes.count(x) > 1)[:5]}"
+                )
+            bad = [p for p in holes if p < 0 or p >= self.num_pages]
+            if bad:
+                out.append(
+                    f"[{self.sub_pool_name}] out-of-range hole pages: {bad[:5]}"
                 )
         out.extend(self._capacity_memo_violations())
         return out

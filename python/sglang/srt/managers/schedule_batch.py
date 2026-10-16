@@ -117,6 +117,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -958,6 +959,11 @@ class ReqKvInfo:
     mamba_prev_track_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
+    # Receipt pinning the COW source node's mamba slot for the deferred window
+    # (see mem_cache.unified_cache.components.mamba.MambaCowLock). Held from
+    # staging until the copy is handed to the forward stream; released by
+    # clear_mamba_cow on every exit path (finish/retract/revert/abort/collect).
+    mamba_cow_lock: Optional[Any] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
 
@@ -2020,8 +2026,10 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_seqlen = None
         self.kv.mamba_prev_track_seqlen = None
         self.mamba_branching_seqlen = None
-        self.kv.mamba_cow_src_index = None
-        self.kv.mamba_needs_clear = False
+        # Release the deferred-COW source lock too: retract resumes this
+        # request via a fresh match, and a leaked lock would pin the old
+        # source node permanently (F-1).
+        clear_mamba_cow(self)
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
@@ -3158,10 +3166,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         for req in reqs:
             if req.kv.mamba_cow_src_index is not None:
+                # Gather the COW indices FIRST, then drop the source lock: the
+                # source slot must stay pinned while its index is fed to the
+                # forward-stream copy launch (F-1).
                 cow_src_tensors.append(req.kv.mamba_cow_src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
-                req.kv.mamba_cow_src_index = None
-                req.kv.mamba_needs_clear = False
+                clear_mamba_cow(req)
             elif req.kv.mamba_needs_clear:
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_needs_clear = False
@@ -3296,8 +3306,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
+            # Under overlap one decode token is in flight but not yet in
+            # kv_committed_len, while prepare_for_decode allocates for
+            # seq_lens + 1 with seq_lens already counting that token. The
+            # pending-inclusive condition for a fresh page is therefore
+            # (committed + pending) % page_size == 0. Counting pending=1 is
+            # exact when a result is in flight and only conservatively
+            # over-estimates by one page per boundary-adjacent request when
+            # nothing is in flight (under-estimation retraction skips and
+            # alloc_decode later fails).
+            pending = 1 if self.enable_overlap else 0
             new_pages = sum(
-                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+                1
+                for r in requests
+                if (r.kv.kv_committed_len + pending) % page_size == 0
             )
             return new_pages * page_size + num_beam_member_rows(requests)
 
