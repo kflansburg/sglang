@@ -222,3 +222,18 @@ Reference commit: 3420bae (origin/main at audit time).
   dequeue-time _staging_outstanding increment, then conclude_failure. The
   Failed status carries no freeing power; safety invariant is the poison.
 - Merge: MR 11 queued for V5+V6+V7 (board #37, reviewed/approved).
+
+## Update 3 (lead-confirmed semantics + F12 union)
+- V7 settle-order CONFIRMED by disagg-lead (#558): poison-first makes pages
+  unfreeable before any Failed status goes out; that IS the settle property.
+  CAVEAT (per lead, recorded here): on production versions < v0.5.20 (and
+  < v0.5.14 w/o any deferred machinery) decode frees immediately on
+  failure/timeout regardless; the poison only protects at HEAD once V4
+  lands. Unpatched-version exposure belongs to the version matrix, not this
+  fix.
+- F12 UNION: codec half aligned with board #46 (disagg-prefill-common):
+  strict payload == item_len + buffer_index guard + geometry sanity; strictest
+  wins since the codec is only used by mooncake+mori handlers. disagg-decode
+  RETRACTED their _handle_aux_data edit (#44 now tests-only on
+  agent/disagg-decode, 10 tests verified green against this branch).
+  Merge order: #42 first, then #44 tests.
