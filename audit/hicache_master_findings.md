@@ -112,8 +112,11 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   (l.1869-1917) — all same shape. Unified SWA path on 0.5.15+ IS guarded
   (packed MIN unified_radix_cache.py:2021-2033). v0.5.20 removed
   hi_mamba_radix_cache.py (resolved by rewrite); HEAD guarded by override.
-  K3 (~v0.5.16, mamba production!) assumed affected if its hi_mamba matches
-  0.5.15/17 → K3 owners flagged. Fix analogue for backports: pack the mamba
+  K(v0.5.16): VERIFIED affected directly from the public tag by
+  version-triage (rank-local .get(PoolName.MAMBA,0) after MIN-on-tokens
+  ~:1843). K3 internal fork: recheck flagged to lead/K3 owners (fork-heavy
+  surface). Exposure note: .14 is technically affected but no .14 prod fleet
+  runs mamba models → practical exposure is K3/mamba only. Fix analogue for backports: pack the mamba
   hit into the existing terminate-time MIN all_reduce (mirror unified:2021).
 - ~~storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
   fails at clean HEAD~~ — ENV ARTIFACT (prefetch-ctl-audit root-caused):
