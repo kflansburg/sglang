@@ -67,6 +67,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.unified_cache.mamba_cow import clear_mamba_cow
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -1881,8 +1882,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
             req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
+            # Also release the deferred-COW source lock (F-1); a free is a
+            # full ownership reset, so the staged copy will never read it.
+            clear_mamba_cow(req)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
