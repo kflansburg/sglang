@@ -202,9 +202,29 @@ overlap scheduler; spec-decode (EAGLE/draft KV) SWA eviction interplay.
   evicted_seqlen via alloc_extend_swa_tail, restore writes only
   old-mapped AND new-mapped positions. Consistent; see REFUTED.
 
-## In progress / open
-- Awaiting features-lead review of F-4 fix (board #26).
-- Open delegated item for pools-lead/radix-lead: unified tree-action level
-  proof that FreeDeviceKVFullOnly is only emitted after the SWA tier is
-  tombstoned (my trace covered the allocator's external callers; the tree
-  action generation is unified-cache internals).
+## Unified tombstone-once trace (board #9 follow-up, msg #301)
+FreeDeviceKVFullOnly (full-only free; SWA side assumed already released)
+is generated in exactly three places, and each is consistent:
+1. unified_tree_core.py _insert_dup handling (~:1337-1349): the dup slice
+   straddling the request's SWA eviction ratchet is SPLIT at
+   get_evicted_seqlen(SWA) - abs_start; below -> FreeDeviceKVFullOnly (SWA
+   was window-freed for this row), above -> FreeDeviceKV (both). The
+   ratchet is advanced only when free_swa_out_of_window_slots actually
+   frees, so by construction SWA is gone exactly below it.
+2. components/swa.py _recover_from_incoming (~:469): frees the OLD node's
+   full value full-only; the old SWA pages stay bound to the node whose
+   component SWA value is deliberately kept (_publish_window rebuilds the
+   window's SWA from the adopted incoming full value). Freeing both sides
+   would double-free pages the node still references.
+3. components/swa.py RecoverSWAWithLockedFull (~:1560): _set_swa moves the
+   incoming mapping to kept_full (static: clear+set; unified: page
+   transfer), then free_full_segment(incoming_full) — SWA side already
+   claimed, mapping cleared first.
+Post-retract consistency: restore re-stamps the ratchet to
+fill_len - swa_tail_len (alloc_extend_swa_tail) and the row below it has
+mapping==0, so a later insert's FullOnly/FreedeviceKV split again matches
+reality.
+Tripwires that would catch a violation anyway: _SWA_PEER_RELEASED expect
+(GUARD) on the static free_full*, v2p>0 tombstone filters on the unified
+free paths. Verdict: invariant holds by construction at all three sites;
+no leak/double-free found.
