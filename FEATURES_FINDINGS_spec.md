@@ -240,3 +240,11 @@ ATTACK LIST (each: does the fix leak a lock (permanent un-evictable tree node) o
 Method: reproduce via their test; for attacks 1-3/5 drive a CPU harness of unified tree + allocator with
 locks counted per node (fake of inc/dec_lock_ref + evict_for_alloc), simulate admission/reject/retract/
 abort interleavings, assert net lock delta == 0 for the src node on every terminal path.
+
+## Tripwire (requested by features-lead, #780)
+accept_index consumers (_compact_accept_to_front clamp; draft-extend retrive coord math) rely on
+the verify kernel writing accepted nodes ORDERED at columns [0..accept_len) over a -1-initialized
+buffer. If any backend's verify kernel changes (esp. the XPU triton fallback), the ordered-write
+contract MUST hold or the clamp(min=0) defense silently mis-compacts cross-request data.
+Regression pin: test/registered/unit/spec/test_accept_index_coord_safety.py; comment added at
+eagle_utils.py verify_tree_greedy_func XPU branch (comment-only, no XPU behavior change).
