@@ -152,3 +152,29 @@ Reference commit: 3420bae (origin/main at audit time).
   the only guard. Any path that returns ret without poison is a hole; I
   verified kv/state/aux send paths in transfer_worker all call
   _poison_unsettled_send on failure. OK.
+
+### F6. SWA/DSA state page-list length mismatch silently truncated (stale-state read)
+- conn.py:~2065-2084 (`maybe_send_extra`, generic-kvcache state branch): when
+  `len(src_indices) != len(dst_indices)` for paged SWA/DSA state the code logs
+  a warning and truncates the LONGER list. Comment says "Paged SWA/DSA
+  tolerate a 1-page drift" but arbitrary drift is accepted identically. If the
+  decode page list is short, the unmatched prefill pages are never written,
+  yet the room still concludes Success -> attention runs over stale SWA state
+  pages (prior-request tokens) without any failure signal. Same hazard class
+  as F2; exact-match types (QSA/SWA_RING/DSV4_REQUEST_STATE) raise instead —
+  SWA and DSA do not. With SWA production config (--swa-full-tokens-ratio
+  0.075-0.1) a drift >1 page means a real accounting bug upstream, masked here.
+
+### Additional race reviewed: peer re-registration mid-transfer
+- transfer_worker reads `decode_kv_args_table[session]` and
+  `state_strides_validated` unlocked while the bootstrap thread replaces them
+  in `_publish_peer_registration` under session_lock. Field order inside the
+  lock (discard validated -> set rejection -> assign table) plus GIL atomicity
+  means the worker can never observe (new table + stale validated-present);
+  the unsafe combination is excluded by construction. Sound, fragile but OK.
+
+### Wire-format dtype check
+- Receiver `send_metadata` ships `kv_indices.tobytes()`; prefill parses
+  np.int32. Caller (_send_kv_metadata in decode.py) converts via
+  `_transfer_page_indices(...).astype(np.int32)` at decode.py:2177. Safe as
+  long as every caller goes through that helper — noted for the decode agent.
