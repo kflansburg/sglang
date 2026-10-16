@@ -188,3 +188,54 @@ all pass locally: mha 7, abort-retry 4, aux-codec 5.
   (non-checksum backends/health checks indistinguishable — acceptable).
 - F18 verdict: LOW/by-design (see #disagg post) — tombstone-before-open is
   intentional; wire-generation token is the real fix; deferred to hardening list.
+
+## Coverage report (prefill-side, final unless further waves)
+
+FILES OWNED & STATUS
+- prefill.py (1747): bootstrap queue (add/create_sender/pop_bootstrapped),
+  waiting-queue resolve, inflight queue, all abort chains (C1-C3), chunked relay
+  (process_prefill_chunk, send_kv_chunk incl. staging grid + SWA/mamba/DSA/QSA
+  state payloads), optimistic prefill retry, checkpoint ordering, metadata
+  buffer lifecycle. VERDICT: no new bug found in prefill.py itself after
+  tracing; known classes verified fixed with regression tests present.
+  FIXED here: hidden_kv_layers population for the F15 anchor.
+- utils.py (1885): ReqToMetadataIdxAllocator (guarded), MetadataBuffers
+  (set_buf bounds ok; top-logprobs len check present), get_dsa_tail_state_indices
+  (bounded), get_qsa_pending_state_indices (validated), is_aborted/is_unadmitted_reject
+  (verified across abort chains), unified_memory_disagg_move_gate (all retire
+  paths clear pending-chunk gate — C3). VERDICT: clean.
+- checksum.py (117): compute symmetry prefill/decode verified (ranges, SWA
+  translation identity, state coverage); health-check skip; hashing over full
+  context incl. cached prefix = catches transport+cache corruption. VERDICT: clean.
+- kv_events.py (768): event publisher machinery only, not KV data path;
+  no memory-safety relevance to KV. VERDICT: clean-by-role.
+- common/conn.py: F15 FIXED (verified; in review #30), F9/V4-prefill FIXED
+  (in review #31; review round 2 done), _clear/update_status lifecycle,
+  deferred bootstrap register/open state machine (F18 LOW/by-design →
+  hardening list), drain-ack generation scheme (sound), pp>1 double-finish
+  cosmetic issue logged.
+- common/utils.py: FastQueue fine; AuxDataCodec bounds = F12 → shipped by
+  disagg-mooncake #42 (mine reverted); group_concurrent_contiguous equal-length
+  guard present (verified); dcp plan bounds present.
+- common/bootstrap.py: DeferredBootstrap audited (register-first ABORT refusal
+  = F18 hardening; disagg-prefill-common has a fix queued post-wave).
+- Integration seams: scheduler.abort_request PREFILL branches (CLOSED x2 by
+  lead+me), grammar abort intake (C8, clean), pp>1 abort (cosmetic only).
+
+PRODUCTION-SURFACE notes for my scope:
+- Mooncake 8x mlx5: transfer internals audited by disagg-mooncake; prefill-side
+  sender semantics verified (poll conclude-state, failed-terminal).
+- page-size 64 + fp8: page arithmetic in send paths verified (page-aligned
+  chunk boundaries, ::page_size page picking).
+- chunked 12288-32768: middle-chunk sends gated on !pending_bootstrap; partial
+  last page deferred correctly; start_send_idx monotonicity verified.
+- SWA: payload windows + eviction-floor interplay verified; no mid-request
+  free of transferred pages (full-pool pages only).
+- Mamba: mamba index payload via req_index_to_mamba_index_mapping; req holds
+  mamba until release (verified).
+- DSA tail/QSA pending: bounded by construction; req_pool_idx validated.
+- Checksum: enabled config adds full-context integrity check; no gap found.
+- pp>1: only cosmetic double-finish noted.
+
+ENVIRONMENT list for lead's rebuild (hit during my sweeps): datasets,
+prometheus_client, loguru; merge-queue system-python still needs pytest itself.
