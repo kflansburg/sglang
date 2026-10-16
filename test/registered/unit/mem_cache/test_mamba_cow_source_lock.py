@@ -48,11 +48,43 @@ from sglang.test.test_utils import CustomTestCase
 # UnifiedRadixCache: real unified tree core, real FULL/MAMBA components, real
 # mamba slot allocator on CPU.
 sys.path.insert(0, os.path.dirname(__file__))
-from test_unified_radix_cache_unittest import CacheConfig, build_fixture  # noqa: E402
+
+
+def _fixture_env_available() -> bool:
+    """The fixture chain needs (a) a resolvable platform device (only with the
+    CPU engine fallback on accelerator-less hosts) and (b) an importable
+    sgl_kernel (present in upstream CI / CPU sgl-kernel builds, absent in the
+    lean merge-queue env). Skip-instead-of-error so the queue records the
+    skip; run upstream CI to exercise.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_FIXTURE_ENV = _fixture_env_available()
+_FIXTURE_SKIP_REASON = (
+    "requires CPU engine + sgl_kernel (absent on merge queue env; "
+    "run upstream CI/env)"
+)
+
+if _FIXTURE_ENV:
+    from test_unified_radix_cache_unittest import (  # noqa: E402
+        CacheConfig,
+        build_fixture,
+    )
+else:
+    CacheConfig = build_fixture = None  # collection-safe placeholders
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-_CFG = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
+_CFG = (
+    CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
+    if _FIXTURE_ENV
+    else None
+)
 
 SOURCE_TOKENS = [1, 2, 3, 4]
 OTHER_TOKENS = [7, 8, 9, 10]
@@ -67,6 +99,7 @@ def _make_req():
     return SimpleNamespace(kv=ReqKvInfo(), session=None)
 
 
+@unittest.skipUnless(_FIXTURE_ENV, _FIXTURE_SKIP_REASON)
 class TestMambaCowSourceLock(CustomTestCase):
     def setUp(self):
         self.cache, self.allocator, self.req_to_token_pool = build_fixture(_CFG)

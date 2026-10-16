@@ -262,3 +262,15 @@ page release), but only when a request has ZERO fresh compressed slots at alloc_
 
 ## #68 Q3 pad fix reviewed+approved: fabricate only from fresh tail, else whole-page alloc pad; 4/4
 Q3 suite green in my sandbox (test_hisparse_q3_pad_guard.py).
+
+## F-1 VERSION TRIAGE — wider than unified: flat mamba caches affected at ALL prod tags
+- Staging without source lock exists at:
+  v0.5.14/.15.post1: hi_mamba_radix_cache.py:1060-1070 (cow_mamba, req.mamba_cow_src_index, no lock)
+  v0.5.17:          hi_mamba_radix_cache.py:1073-1083 (same)
+  v0.5.20:          mamba_radix_cache.py:1200-1210 (_match_post_processor, same window)
+  HEAD:             mamba_radix_cache.py (flat) + hi_mamba_radix_cache.py (hi) +
+                    unified_cache/components/mamba.py:217 (FIXED on agent/dsa-auditor c33f4e3)
+- Flat mamba caches are the PRODUCTION carriers for Kimi K3 (--mamba-radix-cache-strategy extra_buffer
+  drives flat MambaRadixCache family on older tags; unified arrives with the newer class).
+- severity: cross-request mamba state corruption window = staging → next forward collect; reachable
+  under any concurrent admission/retraction (mamba evict pressure) — live in K3 prod shapes.
