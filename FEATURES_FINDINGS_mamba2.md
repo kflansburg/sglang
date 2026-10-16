@@ -436,3 +436,79 @@ retract/abort) are CLOSED as clean at HEAD.
   always-on guard I suggest as defense-in-depth actually RESTORES the v0.5.14
   behavior — a regression in guard strength, though no reachable trigger found
   at any version. Worth the 1-line restore.
+
+---
+
+## PROD LOCAL PATCH README: hi_mamba prefetch TP MIN asymmetry (.14-.17/K3)
+
+**Where the fix belongs: prod patch stack, NOT dev** (dev's legacy path is gone;
+HEAD needs the hicache-lead C4 fix in the new unified code). This README is the
+exact patch spec for the legacy hi_mamba_radix_cache.py in v0.5.14, v0.5.15.post1,
+v0.5.16 (K3 base), v0.5.17.
+
+### Bug, one paragraph
+In `check_prefetch_progress`, only the scalar KV `completed_tokens` is
+MIN-reduced across TP ranks. The mamba (extra-pool) storage-hit result
+(`operation.pool_storage_result.extra_pool_hit_pages[PoolName.MAMBA]`) is read
+per-rank and decides both (a) `mamba_loaded` → whether the node attached to the
+tree carries a valid mamba host slot, and (b) whether
+`mamba_pool_host.free(mamba_host_indices)` runs (:1911-1915 in v0.5.16). With a
+shared Mooncake store (enable_group_semantics=true) hit results legitimately
+differ across ranks → one rank frees while another attaches ⇒ per-rank
+`mamba_pool_host` free lists permanently diverge ⇒ later
+`mamba_restore_transfers` builds H→D ops with rank-divergent host slot ids
+against symmetric device ids ⇒ another request's mamba state loads into this
+request's device slot ⇒ cross-request context leakage / garbled output.
+
+### Patch (same shape at .14/.15p1/.16/.17)
+File: `python/sglang/srt/mem_cache/hi_mamba_radix_cache.py`,
+function `check_prefetch_progress`.
+1. Add `mamba_loaded_raw = (operation.pool_storage_result.
+   extra_pool_hit_pages.get(PoolName.MAMBA, 0) >= 1)`.
+2. When `self.tp_world_size > 1`, fold it into the existing all_reduce right
+   after the KV `min_completed_tokens` reduce: extend that tensor to
+   `[min_completed_tokens, int(mamba_loaded_raw)]`, ReduceOp.MIN on the same
+   tp_group, then
+   `mamba_loaded = bool(reduced[1].item()) and mamba_loaded_raw_if_tp1`.
+   Rationale for MIN: a mamba host slot is VALID only if every rank loaded it
+   (any rank missing the hit must not serve the state); a rank that did not
+   load must not skip the free locally unless every rank also keeps it. MIN on
+   the boolean makes attach/free symmetric across ranks.
+3. Keep the existing free conditional `if not inserted_new or not mamba_loaded:
+   self.mamba_pool_host.free(mamba_host_indices)` — with the reduced
+   `mamba_loaded` this is now rank-symmetric PROVIDED `inserted_new`
+   (`matched_length < min_completed_tokens`) is also rank-symmetric. It derives
+   from `_insert_helper_host` over the same (already MIN-reduced)
+   `min_completed_tokens` and the same tree contents; tree contents stay
+   symmetric only if every prior prefetch attached identically, which this
+   patch enforces. Note in a code comment that the invariant is self-enforcing
+   once this reduce is in place.
+4. Defensive alignment check (cheap, recommended): after computing
+   `matched_length`, `assert` under a debug env that
+   `bool(matched_length < min_completed_tokens) ==
+   bool(matched_length < min_completed_tokens)` reduced via
+   ReduceOp.MIN/MAX pair on `matched_length`, so any residual structural
+   divergence fails loud instead of corrupting. Not required for correctness
+   of the MIN fix itself.
+5. Also apply the same reduced-boolean to the not-inserted path that feeds
+   `mamba_backuped` node fields if the deployment uses mamba host backup
+   (v0.5.16 `mamba_restore_transfers` reads per-node `mamba_host_value`).
+
+### Version/variant notes
+- v0.5.14 (49e384ce): same function shape; the free site is
+  `if not inserted_new or not mamba_loaded: self.mamba_pool_host.free(
+  mamba_host_indices)` — same patch applies (line numbers differ).
+- v0.5.15.post1 (0b3bb0cb), v0.5.17 (29481685): same.
+- TP=1 deployments: the reduce is skipped (`tp_world_size > 1` guard) and no
+  peer exists, so unpatched TP=1 is safe; the patch is a no-op there.
+- K3 vendor branch: base≈.16 per charter; verify the identical free-site shape
+  before applying (grep `mamba_pool_host.free` in check_prefetch_progress).
+- v0.5.20/HEAD: legacy file removed; do NOT patch. HEAD's unified
+  `_reduce_prefetch_ack` needs the per-pool `pool_hits` MIN-reduce —
+  hicache-lead's C4 item owns that.
+
+### Risk
+Low: one extra all_reduce (already on this path per req — same group, piggyback
+the KV reduce, +4 bytes). Semantics for mamba-only batches unchanged when
+storage hits agree (the steady state). Rollback: revert to per-rank read —
+NOT recommended (that's the bug).
