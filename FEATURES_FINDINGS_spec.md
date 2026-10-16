@@ -163,3 +163,19 @@ deployments). Confirm via git tag diff before filing.
 - dspark planner verify budget: local_verify_tier_num_tokens caps total at bs*verify_num_draft_tokens;
   RaggedVerifyLayout.__post_init__ validates per-row cap + sum bounds; cap-accept consistency enforced;
   SGLANG_SIMULATE_ACC misuse guarded by explicit raise. CLEAN.
+
+## Turn-5 (lead-priority order)
+1. (3) _compact_accept_to_front + accept_index clamping (topk>1) — VERDICT SAFE:
+   CPU-validated valid-position preservation; padded clamp-0 touches only slots >= accept_len
+   which downstream never reads (select_index = i*nd + accept_lens-1; committed range [0..accept_len)).
+   Mid-gap -1 in accept_index is impossible: the sgl-kernel tree_speculative_sampling_target_only
+   writes accepted nodes ordered at columns [0..accept_len), and prepare_draft_extend's
+   (accept_index/num_draft, %num_draft) retrive coords rely on that same ordered contract
+   (a mid-gap -1 would index -1 and break everything, tested surfaces would fail loudly).
+2. (2) dspark verify budget cutoff — VERDICT SAFE (earlier trace + planner read):
+   per-req cap = verify_num_draft_tokens enforced by RaggedVerifyLayout.__post_init__ chain;
+   tier totals capped at bs*verify_num_draft_tokens; cap-accept consistency constraint
+   (is_cap_accept == predicts.size(1)-1==verify_w) enforced in planner; SIMULATE_ACC misuse
+   guarded by explicit raise.
+3. (1) tail files spec_tp_sync.py / spec_sampling_mask.py / adaptive_spec_params.py — no KV
+   lifecycle; CLEAN. (spec_tp_sync prevents TP divergence in spec decisions.)
