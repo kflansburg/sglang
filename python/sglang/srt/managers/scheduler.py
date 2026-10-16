@@ -4396,7 +4396,19 @@ class Scheduler(
         ):
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
-                self.decode_offload_manager.drain_before_retraction()
+                # The drain already waited (bounded) for them; reaching RuntimeError
+                # means a copy is wedged past the timeout. Do not crash the engine:
+                # skip retraction this iteration — in-flight pages stay allocated,
+                # and the next loop retries the drain before retracting.
+                try:
+                    self.decode_offload_manager.drain_before_retraction()
+                except RuntimeError as e:
+                    logger.error(
+                        "Decode offload copies still pending; deferring retraction "
+                        f"one iteration: {e}"
+                    )
+                    batch.batch_is_full = False
+                    return None
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -5724,7 +5736,19 @@ class Scheduler(
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
-            self.decode_offload_manager.drain_before_retraction()
+            # The drain already waited (bounded); RuntimeError means a copy is wedged
+            # past the timeout. Do not crash the engine and do NOT proceed to retract
+            # (the freed rows would be read by the wedged copy). Refuse the pause:
+            # keep the engine serving; the operator may retry PauseGeneration.
+            try:
+                self.decode_offload_manager.drain_before_retraction()
+            except RuntimeError as e:
+                self._engine_paused = False
+                logger.error(
+                    "Refusing retract-mode pause: decode offload copies still "
+                    f"pending after the drain timeout: {e}"
+                )
+                return
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
