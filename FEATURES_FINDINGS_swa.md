@@ -50,6 +50,11 @@ HEAD. All heap alloc/free bookkeeping is logical; the leak is a slow
 capacity bleed (full-pool pages vanish without mapping or owner) until
 disagg decode admission trips its "KV cache is full! Bug in memory
 estimation" assert in `_pre_alloc`.
+Backport: the same pre-flight applies textually to all four tags — in
+each, alloc_decode sits next to an identical new_pages_available helper
+and get_num_new_pages import (v0.5.14:157/278, v0.5.15.post1:166/287,
+v0.5.17:166/287, v0.5.20:234/376). v0.5.20 keeps the HEAD _swa_req_ring
+guard; insert the pre-flight after it (same as HEAD).
 
 Regression tests (CPU, no GPU): test/swa_audit/test_swa_allocator_cpu.py
 - test_alloc_decode_one_sided_leak_FIXED (fails without the fix)
