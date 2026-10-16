@@ -764,9 +764,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 return True, any_failed
             if not any_failed:
                 if time.monotonic() >= healthy_deadline:
+                    self._last_settle_note = "healthy-settle timeout"
                     logger.error(
-                        "NIXL transfer batch with no failed handle did not settle "
-                        "within %ss; treating it as wedged",
+                        "NIXL healthy-settle timeout: transfer batch with no "
+                        "failed handle did not settle within %ss; treating it "
+                        "as wedged",
                         _healthy_settle_timeout_s(),
                     )
                     return False, True
@@ -1529,12 +1531,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
+                self._last_settle_note = None
                 settled, any_failed = self._await_handles(handles, failure_seen=False)
                 if not settled:
                     settle_timed_out = True
+                    note = getattr(self, "_last_settle_note", None) or (
+                        f"handle still running {NIXL_ERR_SETTLE_TIMEOUT_S}s after "
+                        "a peer handle failed"
+                    )
                     raise RuntimeError(
-                        f"NIXL transfer for room {room} left a handle running "
-                        f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
+                        f"NIXL transfer for room {room} failed to settle: {note}"
                     )
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
@@ -1709,8 +1715,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "NIXL invalidated remote agent %s; reloading its metadata",
                         agent_name,
                     )
-                    # No other thread holds these dlists: every room with this
-                    # peer has the same peer set, so all shard to this worker.
+                    # No other thread holds these dlists. Sharding key is the
+                    # room's FULL port sum, and a room's peer set is the decode
+                    # instance's complete rank set (gated by
+                    # required_dst_info_num before any chunk is enqueued); peer
+                    # names are process-unique, so every room containing this
+                    # agent sums the same ports and therefore shards to this
+                    # worker. Only worker threads read prep_handles on the hot
+                    # path, so the pops below cannot race a reader.
                     self.prep_handles.pop(agent_name, None)
                     self.prep_handles_slice_dst.pop(agent_name, None)
                     peer_info.kv_xfer_segments = None
