@@ -593,7 +593,10 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
             # Sever the stale node's link: inc/dec_lock_ref on a node whose branch
             # was evicted must fail loudly (its release would decrement live
-            # ancestors the caller never locked).
+            # ancestors the caller never locked). Held locks are sever-safe by
+            # construction: locked nodes never enter evictable_leaves, and only
+            # unlocked leaves / newly-childless unlocked parents are popped, so
+            # no live lock's parent chain is ever severed.
             x.parent = None
 
             if len(parent.children) == 0 and parent.lock_ref == 0:
