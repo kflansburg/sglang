@@ -236,3 +236,90 @@ test_decode_hicache_tree_core 3/3. CPU venv, torch 2.14.1+cpu.
   logs PAUSE REFUSED critically; do not proceed to weight update without a
   fresh successful pause (no programmatic ack exists today). Follow-up fix
   needs a pause ack/negative-ack channel — out of B1 scope.
+
+---
+
+## C6: MooncakeDirectLinker layer-wise load failure — abort-before-output timing audit
+(assigned by hicache-lead, scheduler-timing half; root-cause side: mooncake-audit)
+
+Scope: whether any output can escape for a request whose L3→GPU layer load failed
+on one rank, before finish()/finish_loads → abort lands.
+
+### TP path (incl. dp-attn): AIRTIGHT for the failing request — CLEAN (with one noted degradation).
+Evidence chain (all on dev):
+1. Forward waits per layer via LayerWiseLoadCounter.wait_until
+   (unified_cache_linker.py:102-112): `futures[threshold].exception()` returns
+   the error WITHOUT raising — forward proceeds on garbage slot content
+   (docstring :66-73 admits this).
+2. Post-forward, same run_batch call: scheduler.py:4843 →
+   tree_cache.finish_external_linker_loads → UnifiedCacheLinkerWrapper.finish_loads
+   (unified_cache_linker.py:532-556): blocks on finish() (:114-124, futures ->
+   exception()) then MIN-reduces `landed` over attn groups
+   (unified_radix_cache._all_reduce_attn_groups covers attn_cp + attn_tp groups).
+   Verdict IDENTICAL on all TP ranks ("Every rank holds the same
+   inflight_load_rids because match reduces the hit across ranks" :536-540).
+3. Failing reqs get discard_output_reason=FINISH_ABORT (unified_radix_cache.py:3497-3507).
+4. Output commit gated FIRST on discard: batch_result_processor.py:316
+   (`discard_finish_reason = req.discard_output_reason if should_commit_output
+   else None` computed before committing next_token_id) and :473-478
+   (embedding/retract path: to_finish + release, no commit). The garbage token
+   is never appended/streamed; the abort finish is streamed instead.
+5. Overlap mode: results of batch N are processed only after run_batch(N)
+   returned; finish_loads runs at :4843 inside run_batch → discard always set
+   before any processing of that batch's outputs. Natural-order N+1 forwards of
+   the still-unfinished req read its still-private garbage slots → also dropped
+   later (no pollution of OTHER requests: linker-loaded slots are request-owned
+   until success — unified_radix_cache.py:3490-3496, load_back_is_cache_owned
+   False → slots private, skipped from tree on failure via skip_radix_cache_insert).
+6. TP shard contamination: garbage-KV logits on the failing shard are
+   all-gathered into every rank's sample for THAT request only; all ranks agree
+   on the MIN verdict and drop → no escape.
+Residual degradation (not a leak): the whole forward batch's compute for that
+req was wasted (garbage in = garbage out), and the failing rank ran attention
+over uninitialized/stale page content — no cross-request read since slots are
+private, but on a TRUE UAF-class failure (slot freed+reused mid-load) the
+garbage could CONTAIN another request's KV content, and it feeds only this
+req's (dropped) logits. Confidentiality surface: dropped, never emitted. OK.
+
+### PP path (pp_size > 1): NOT PP-reduced → OUTPUT ESCAPE — CONFIRMED BY TRACE (no runtime repro).
+finish_loads' `landed` MIN covers ONLY attn groups (unified_radix_cache.py:328-335:
+attn_cp_group, attn_tp_group, fallback tp_group — no pp_group). External-linker
+loads run per PP stage over that stage's OWN layers.
+Counterexample:
+1. PP rank 1 (middle stage) fails a layer load for req R. Its forward emits
+   garbage hidden states for R into the pipeline.
+2. Ranks 2..N-1 loaded fine; their `landed` reduces within THEIR attn groups to
+   True → finish_external_linker_loads returns [] → R is NOT marked for
+   discard on the last stage.
+3. Last PP stage samples R's next token from garbage-propagated hidden states;
+   batch_result_processor commits and streams it (its
+   discard_output_reason is None on that rank).
+4. Rank 1 aborts R locally (discard + release next tick); the cross-PP req-state
+   reconciliation arrives at the last stage at best NEXT iteration → ≥1 garbage
+   token streamed, plus the trailing stages' slots freed vs. the last stage's
+   still-scheduled batch → potential follow-on inconsistencies until state
+   converges.
+No args-level block between --enable-unified-cache-external-linker and pp_size
+> 1 found (checked hicache_hook.py / kv_cache_hook.py; linker file has no pp
+assert). Production exposure: external linker is opt-in and DeepSeek-V4-hook
+adjacent; no known PP>1+linker deployment — but nothing prevents the config
+today, and the mamba/DirectLinker path explicitly supports being layer-wise
+(the failure mode exists per-rank by construction).
+
+### Fix shapes (for design ACK — hicache-lead + disagg-lead + mooncake-audit)
+A. MIN-reduce the landed verdict over the PP group too (verdict identical on
+   every rank incl. PP) — smallest change, keeps post-hoc abort, kills the
+   escape. Cost: one extra collective per linkered batch (already doing one
+   per attn group).
+B. Pre-forward gate: wait_until raises on failure and run_batch refuses to run
+   failed reqs (needs per-req fallible forward — intrusive).
+C. Args-level guard: reject --enable-unified-cache-external-linker with PP>1
+   until (A)/(B) lands. Cheapest stopgap; consistent with other linker guards
+   already in hicache_hook.py.
+Recommend A (+C as immediate stopgap if A needs discussion).
+
+### Version mapping
+HEAD/dev: affected (both air-tightness holes exist at :328-335 coverage and
+:4843 single call site). v0.5.14-v0.5.20: external linker/MooncakeDirectLinker
+not present (introduced after) — N/A on public prod tags. K3: to check if it
+carries the linker.
