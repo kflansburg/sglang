@@ -716,6 +716,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    # Bound (seconds) a prefill transfer worker waits on a NIXL handle batch in
+    # which no handle has failed; a permanently-PROC handle would otherwise
+    # wedge the worker and starve every room sharded to its queue.
+    SGLANG_DISAGGREGATION_NIXL_HEALTHY_SETTLE_TIMEOUT_S = EnvFloat(300.0)
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
