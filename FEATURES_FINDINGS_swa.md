@@ -228,3 +228,20 @@ Tripwires that would catch a violation anyway: _SWA_PEER_RELEASED expect
 (GUARD) on the static free_full*, v2p>0 tombstone filters on the unified
 free paths. Verdict: invariant holds by construction at all three sites;
 no leak/double-free found.
+
+## _filter_swa_cpu_copy / quantized-pool CPU copies (fp8_e4m3 production)
+SWAKVPool.get_cpu_copy/load_cpu_copy re-chunking verified shape-consistent:
+_filter_swa_cpu_copy flattens per-layer chunks, applies the per-token
+row_mask to every tensor the chunk carries (k, v, plus per-token fp8 k/v
+scales — memory_pool.py quantized get_cpu_copy emits PER-TOKEN scales via
+_read_scales(layer_id, chunk_indices), so the mask aligns; a per-BLOCK
+scale layout would misalign but no such pool exists), then re-chunks with
+the same cpu_offloading_chunk_size the loader uses, so load_cpu_copy's
+chunk indexing aligns (it also asserts per-chunk row counts). No fp8-scale
+garbling found. SGLANG_USE_HND_KVCACHE + CPU offload is assert-rejected
+(we don't use HND).
+
+## In progress / open
+- MR #7 (F-4) in merge queue.
+- Backport patches for v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 (awaiting
+  features-lead's preference: findings-file reference diffs vs branches).
