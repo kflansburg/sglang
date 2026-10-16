@@ -118,8 +118,38 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
 - B2 (note): flush_cache idle-gate misses ongoing_backup; reset() 10s raise
   uncaught — operator-triggered only.
 
-## Clean areas (with assumptions)
-(none yet)
+## Version matrix for confirmed bugs
+| Bug | v0.5.14 | v0.5.15.post1 | K3 (~v0.5.16) | v0.5.17 | v0.5.20 | HEAD/lat est |
+|---|---|---|---|---|---|---|
+| Mooncake short-read-as-success (all get paths) | YES | YES | assumed YES | YES | YES | YES → FIXED (MR #15) |
+| Host-pool double-free, no guard | YES (base free unguarded+unlocked) | partial: base guarded, overrides unguarded | assumed | partial | partial | partial → FIXED (MR #13) |
+| free() -1 sentinel wrap | YES | YES | YES | YES | YES | YES → FIXED (MR #13) |
+| Retract-vs-offload UAF (no drain) | YES | YES | assumed | YES | YES | guarded by drain (main) |
+| B1 drain raise → SIGQUIT | n/a (no drain) | n/a | ? | n/a | n/a | YES → fixed twice (V8 merged dev + call-site catch #52 in review) |
+| C4 prefetch sidecar TP divergence | no pool_hits field — OPEN archaeology | no pool_hits — OPEN | OPEN | no pool_hits — OPEN | guarded (override) | guarded (override); REFUTED as described |
+| C5 PP-ticket alloc-error leak | ? (pending) | ? | ? | ? | ? | pre-existing failure → fix in progress (prefetch-ctl) |
+Upstream fixed-in version for short-read: NONE (still live upstream HEAD; our fix is the delta we carry).
+
+## Clean areas (challenged, with assumptions)
+- Prefetch timeout/abort host-page lifetime at HEAD: guarded via completed-prefix
+  free + ack-deferred tail release (pinned by shipped tests incl. SWA variant).
+- write_through double-write/ownership: commit marking + set-if-absent; evict-
+  during-backup guarded by inc_lock_ref/dec at ack-drain.
+- Direct-linker layer-wise loads: exact byte-count validation + session checks.
+- L2 device transfers (l2_transfer.py): layout lease + same-stream ordering.
+- Embedding-store buffer lifetime (controller side): FILLING not evictable; PUT pinned.
+- Set paths (res==0 checks) + exists-error conservatism: correct.
+- Group-id construction from tagged keys (no cross-tenant group collision);
+  pp_rank rsplit rewrite correct for all suffix layouts.
+- page_first_direct pointer/stride math (MLA+MHA) at page 64: correct GIVEN
+  page-aligned contiguous indices (flagged assumption recorded).
+- Unified host-pool backing free(): own duplicate/ownership detection.
+- HostPoolGroup resolve/rollback/release: single-owner discipline verified.
+- common.py register/unregister ranges + destroy ordering: clean.
+- mla_host_dedup: inert in production (dedup compat excludes mooncake store).
+- lmcache_unified min-clamp: historical invariant violator, out of prod scope.
+- unified checkpoint cache_protected_len shrink: fail-stop assert protocol
+  (decoded-offload-audit trace; closes earlier-audit "unified checkpoint" item).
 
 ## Coverage log
 - 2026-10-16 hicache-lead: orient — file inventory, API surface of HiCacheStorage
