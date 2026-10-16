@@ -26,3 +26,8 @@ version-triage. See per-family README*.md files there for apply instructions.
 
 ## Coverage report
 - `AUDIT_COVERAGE_REPORT.md` — lead's final report (coverage matrix + verdicts).
+
+## Exclusions
+- `test/srt/pools_fuzz/README.md` (agent/kvpool-auditor) is intentionally NOT in
+  this bundle: it documents the fuzz test suite itself (lives with the tests on
+  dev), not an audit deliverable.
