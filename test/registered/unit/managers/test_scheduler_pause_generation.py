@@ -701,9 +701,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual(frees, [("run", True)])
 
-    def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
-        """Retraction must be refused on every rank, before any KV is freed, while any
-        rank still tracks a device-to-host offload copy after the drain."""
+    def test_retraction_deferred_while_any_rank_tracks_an_offload_copy(self):
+        """A wedged offload copy (never completes past the drain timeout) must not
+        crash the decode scheduler: both retraction entrypoints catch the drain's
+        RuntimeError and defer (retry next iteration), freeing no KV."""
         min_op, max_op = torch.distributed.ReduceOp.MIN, torch.distributed.ReduceOp.MAX
         for case, entrypoint, tp_size, offload, peer_acks, peer_pending in (
             # Nothing is tracked here at the call site; only the peer has a copy.
@@ -733,13 +734,62 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                         manager.check_offload_progress()
                         self.assertEqual(ops, [min_op])
                         ops.clear()
-                    with self.assertRaisesRegex(RuntimeError, "refusing to retract"):
-                        entrypoint(scheduler, req)
+                    from sglang.srt.environ import envs
 
+                    # Shrink the drain wait: the wedge (copy never completes) raises
+                    # RuntimeError inside drain_before_retraction, and the scheduler
+                    # call sites must catch it and DEFER rather than crash the loop.
+                    with envs.SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S.override(0.05):
+                        entrypoint(scheduler, req)  # must NOT raise
+
+                # Wedge deferral: no KV freed under a live (wedged) copy, and the
+                # scheduler state says "retry next iteration", not crashed/paused.
                 self.assertEqual(frees, [])
+                if entrypoint == self._retract_by_pause:
+                    # Pause refused: engine keeps serving (not left half-paused).
+                    self.assertFalse(scheduler._engine_paused)
+                    self.assertFalse(scheduler.running_batch.is_empty())
                 if tp_size > 1:
                     # A rank that skips the MAX leaves the other ranks waiting in it.
                     self.assertIn(max_op, ops)
+
+    def test_kv_full_wedge_defers_and_retries_after_copy_completes(self):
+        """update_running_batch under a wedged offload copy: first call defers
+        (returns None, batch intact, no free); once the copy's ack lands the
+        next call proceeds and frees AFTER the copy was done (no SIGQUIT path)."""
+        from sglang.srt.environ import envs
+
+        scheduler = self._new_scheduler()
+        req, frees = self._decode_req_with_pending_offload(scheduler)
+        batch = self._make_batch(
+            scheduler, reqs=[req], forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
+        scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.ipc_channels = MagicMock()
+        scheduler.beam_coordinator = MagicMock()
+
+        manager = scheduler.decode_offload_manager
+        # Wedge: drop the ack so the copy can never drain.
+        wedged_ack = manager.cache_controller.ack_write_queue.pop()
+
+        with envs.SGLANG_DECODE_OFFLOAD_DRAIN_TIMEOUT_S.override(0.05):
+            result = scheduler.update_running_batch(batch)
+
+        self.assertIsNone(result)
+        self.assertFalse(batch.batch_is_full)
+        self.assertEqual(frees, [])
+        self.assertEqual(batch.reqs, [req])
+
+        # The copy finally completes (ack requeued); the natural retry in the next
+        # iteration drains, retracts, and frees rows only after copy.done is True.
+        manager.cache_controller.ack_write_queue.append(wedged_ack)
+        batch.batch_is_full = True
+        result = scheduler.update_running_batch(batch)
+        self.assertEqual(frees, [("run", True)])
 
     def test_pending_storage_backup_ack_does_not_block_retraction(self):
         """A storage-backup ack left queued by the MIN drain must not block retraction:

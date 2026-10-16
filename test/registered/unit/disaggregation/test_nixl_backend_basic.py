@@ -1647,5 +1647,86 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
 
+class TestNixlAwaitHandlesHealthyBound(CustomTestCase):
+    """Regression: a batch whose handles never report ERR must not wedge the
+    transfer worker forever (F3)."""
+
+    def _make_manager(self, agent):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = agent
+        return mgr
+
+    def test_healthy_batch_settles_normally(self):
+        agent = SimpleNamespace(check_xfer_state=MagicMock(return_value="DONE"))
+        mgr = self._make_manager(agent)
+
+        settled, any_failed = mgr._await_handles(["h1"], failure_seen=False)
+
+        self.assertTrue(settled)
+        self.assertFalse(any_failed)
+
+    def test_healthy_batch_empty_handles_is_noop(self):
+        agent = SimpleNamespace(check_xfer_state=MagicMock(return_value="PROC"))
+        mgr = self._make_manager(agent)
+
+        settled, any_failed = mgr._await_handles([], failure_seen=False)
+
+        self.assertTrue(settled)
+        self.assertFalse(any_failed)
+        agent.check_xfer_state.assert_not_called()
+
+    def test_wedged_healthy_batch_gives_up_after_bound(self):
+        agent = SimpleNamespace(check_xfer_state=MagicMock(return_value="PROC"))
+        mgr = self._make_manager(agent)
+
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn._healthy_settle_timeout_s",
+            return_value=0.0,
+        ):
+            settled, any_failed = mgr._await_handles(["h1"], failure_seen=False)
+
+        self.assertFalse(settled)
+        self.assertTrue(any_failed)
+
+
+class TestNixlSendAuxGeometry(CustomTestCase):
+    """Regression: send_aux must reject a peer whose aux entry count does not
+    match prefill's aux geometry instead of indexing out of range mid-loop."""
+
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.kv_args = SimpleNamespace(
+            aux_data_ptrs=[1000, 2000], aux_item_lens=[16, 32]
+        )
+        mgr.agent = SimpleNamespace(
+            get_xfer_descs=MagicMock(side_effect=lambda reqs, kind: (reqs, kind)),
+            initialize_xfer=MagicMock(return_value="handle"),
+            transfer=MagicMock(return_value="DONE"),
+        )
+        return mgr
+
+    def test_mismatched_aux_entry_count_raises_before_descriptors(self):
+        mgr = self._make_manager()
+
+        with self.assertRaises(ValueError):
+            mgr.send_aux("peer", 0, [3000], 0, "1_aux")
+
+        mgr.agent.get_xfer_descs.assert_not_called()
+
+    def test_matching_aux_entry_count_transfers(self):
+        mgr = self._make_manager()
+
+        handle = mgr.send_aux("peer", 0, [3000, 4000], 1, "1_aux")
+
+        self.assertEqual(handle, "handle")
+        (src_descs, src_kind), _ = mgr.agent.get_xfer_descs.call_args_list[0]
+        (dst_descs, dst_kind), _ = mgr.agent.get_xfer_descs.call_args_list[1]
+        self.assertEqual(src_kind, "DRAM")
+        self.assertEqual(dst_kind, "DRAM")
+        self.assertEqual([a for a, _, _ in src_descs], [1000, 2000])
+        # dst entries are offset by one aux slot of item_len each.
+        self.assertEqual([a for a, _, _ in dst_descs], [3016, 4032])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -159,6 +159,29 @@ def synchronized(func):
     return wrapper
 
 
+def assert_valid_host_slot_indices(
+    indices: torch.Tensor, logical_size: int, *, context: str = "free"
+) -> None:
+    """Reject sentinel (-1) and out-of-range host slot indices.
+
+    Host slot tables in some HiCache paths are -1-padded. A negative index
+    silently wraps on torch (slot_used[-1] is the LAST slot: an in-use slot
+    gets marked free, and -1 later enters the free list and is handed out as
+    a valid slot id, aliasing the final host row). An index >= logical_size
+    raises IndexError deep inside torch — crash-loud either way, but the
+    message should name the caller.
+    """
+    assert bool((indices >= 0).all()), (
+        f"Host-pool {context}: negative (sentinel) slot indices are not valid: "
+        f"{indices[indices < 0].tolist()}. Filter -1-padded table entries before "
+        "freeing/indexing the host pool."
+    )
+    assert bool((indices < logical_size).all()), (
+        f"Host-pool {context}: slot indices out of range [0, {logical_size}): "
+        f"{indices[indices >= logical_size].tolist()}"
+    )
+
+
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
@@ -557,6 +580,7 @@ class HostKVCache(abc.ABC):
         if indices_cpu.numel() == 0:
             return 0
 
+        assert_valid_host_slot_indices(indices_cpu, self.logical_size)
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."

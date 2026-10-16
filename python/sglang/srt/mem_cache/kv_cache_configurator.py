@@ -123,6 +123,33 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _assert_dcp_widened_ids_fit_int32(
+    *,
+    max_total_num_tokens: int,
+    attn_dcp_size: int,
+    page_size: int,
+    loc_space_scale: int = 1,
+) -> None:
+    """DCP-WIDENED virtual KV ids must fit int32.
+
+    The widest virtual id space is (max_total + page pad) * attn_dcp_size:
+    target rows widen in the allocator; draft sizes already carry loc_scale.
+    req_to_token and the read-index buffers are int32 (memory_pool.py); a
+    wrap makes ids go negative -> bounded garbage reads and, on the HiCache
+    offload index path, wrong-request KV copied across requests (silent
+    cross-request context leakage). Failing at config time turns that latent
+    corruption into a loud sizing error.
+    """
+    widened_id_bound = max_total_num_tokens * attn_dcp_size // loc_space_scale
+    assert widened_id_bound < 2**31, (
+        f"DCP-widened virtual KV id bound {widened_id_bound} exceeds the "
+        f"int32 read-index/req_to_token limit (2^31): reduce "
+        f"max_total_num_tokens (incl. page pad: {max_total_num_tokens}) or "
+        f"attn_dcp_size ({attn_dcp_size}) at page_size {page_size} "
+        f"(loc_space_scale={loc_space_scale})."
+    )
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
@@ -370,9 +397,21 @@ class KVCacheConfigurator:
             return max_total_num_tokens
         # Target rows widen into attn_dcp_size ids; draft sizes already carry
         # loc_space_scale.
-        return (
+        widened = (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
+        # req_to_token stores these widened virtual ids in int32: a wrap to
+        # negative ids silently aliases requests' KV (sink clamp hides it, and
+        # torch negative indexing restores the WRONG rows on offload) with no
+        # earlier failure. Mirror unified_memory_pool's _assert_physical_id_bound.
+        assert widened < 2**31, (
+            f"DCP-widened virtual loc space {widened} exceeds the int32 bound "
+            f"(2^31) req_to_token assumes: max_total_num_tokens="
+            f"{max_total_num_tokens} * attn_dcp_size="
+            f"{get_parallel().attn_dcp_size} / loc_space_scale={self.loc_space_scale}. "
+            "Reduce the token capacity or the DCP size."
+        )
+        return widened
 
     def _resolve_kv_shard(self) -> None:
         """Resolve the logical-page KV sharding identity: ``(rank, size)`` of
@@ -502,6 +541,13 @@ class KVCacheConfigurator:
             full_max_total_num_tokens *= loc_scale
         if swa_max_total_num_tokens is not None:
             swa_max_total_num_tokens *= loc_scale
+
+        # DCP-WIDENED virtual id-space bound: ENFORCED at
+        # `logical_token_capacity` (assert widened < 2**31) and at
+        # DSATokenToKVPool's index_buf_size (pools-lead, board #32). The pure
+        # threshold math they assert is pinned in `_assert_dcp_widened_ids_fit_int32`
+        # (below) and test/srt/pools_fuzz/test_dcp_int32_bound.py.
+
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
