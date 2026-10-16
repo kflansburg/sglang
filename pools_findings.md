@@ -87,3 +87,9 @@ Fix skeleton (pending reachability): mask `freed_p_pages >= 0` before index_fill
 - BUG-ALLOC-4 (Triton alloc_extend_kernel part-3 unmasked load OOB): **REFUTED** — reaching Part 3 implies num_part3>0 which implies num_page_start_loc_self>=1 ⇒ load address in-bounds; dead lanes never evaluate the load thanks to Triton per-program early returns. Modeled + swept (test_pools_fuzz/test_kernel_hardning_regressions.py::test_alloc_extend_kernel_part3_unreachable_on_dead_lanes). Kernel change REVERTED (keeping the tree clean of non-bugs).
 - BUG-ALLOC-5 (ps==1 host/kernel formula desync): latent only (no prod reachability: ps==1 uses TokenToKVPoolAllocator; SWA asserts ps>1). Landed defense: `assert page_size > 1` in PagedTokenToKVPoolAllocator.alloc_decode + regression test. KEPT.
 - BUG-ALLOC-3 (hisparse alloc_device_buffer page-split free): aliasing question routed to features (DSA window policy). Mechanics stand by.
+
+## FIX LANDED (agent/pools-lead): MambaSlotAllocator double-free hardening (features C1, routed)
+- Mechanics CONFIRMED: caller double-free of a slot → free list holds it twice → handed to TWO requests → shared mamba state tensor (cross-request state corruption). Repro: pools_findings + test_mamba_slot_allocator.py::test_double_free_consequence_documented.
+- Fix: (a) always-on integer accounting assert `available_size() <= size` on free() (no sync: python ints; catches accounting overflow AND the later overfill symptom of a corrupt list); (b) SGLANG_DEBUG_MEMORY_POOL-gated unique sweep mirroring paged `_debug_check_no_duplicate_pages`; (c) documented caller contract in free().
+- Tests (4, CPU, all pass): group roundtrip; overflow assert on dup; debug unique sweep; documented dup-handout consequence.
+## FIX LANDED: paged alloc_decode ps==1 assert (BUG-ALLOC-5) — see board #32 in review.

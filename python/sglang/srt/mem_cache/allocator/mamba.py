@@ -36,6 +36,9 @@ class MambaSlotAllocator:
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
+        from sglang.srt.utils import get_bool_env_var
+
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.clear()
 
     def available_size(self) -> int:
@@ -80,6 +83,21 @@ class MambaSlotAllocator:
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
+        # Caller contract: every slot is freed at most once. A duplicated slot
+        # in the free list is later handed to two requests, which then share one
+        # mamba state tensor (cross-request state corruption). The debug sweep
+        # mirrors PagedTokenToKVPoolAllocator._debug_check_no_duplicate_pages;
+        # the always-on bound below costs no sync (python ints).
+        assert self.available_size() <= self.size, (
+            f"mamba free-slot accounting overflow: {self.available_size()} > {self.size}"
+        )
+        if self.debug_mode:
+            self._debug_check_no_duplicate_slots()
+
+    def _debug_check_no_duplicate_slots(self):
+        assert len(torch.unique(self.free_slots)) == len(self.free_slots), (
+            "double free: duplicate slots in mamba free list"
+        )
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
