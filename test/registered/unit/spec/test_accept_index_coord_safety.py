@@ -102,11 +102,14 @@ class TestAcceptIndexCoordSafety(unittest.TestCase):
                         f"trial {trial}: valid entry escaped its request row"
                     )
                     assert 0 <= cid[b, j] < nd
-                # padded entries: -1 // nd floors to -1; -1 % nd == nd-1; the
-                # consuming kernel masks j >= accept_len (seq_lens-derived) -
-                # if it did not and also lacked a nid>=0 guard, (-1, nd-1)
-                # would alias the LAST node of row... floor(-1/nd) == -1 in
-                # triton/C division semantics torch matches.
+                # torch floor-division: -1 // nd == -1 here. CAUTION: this is a
+                # torch-semantics property ONLY; triton `//` truncates toward
+                # zero (C-style), where -1 // nd == 0 would alias row 0. The
+                # safety of the real consuming kernels therefore CANNOT rest on
+                # this guard property; it rests on valid-j masking
+                # (seq_lens-derived) plus clamp(min=0) - as documented in the
+                # eagle_utils.py XPU tripwire comment. The rid<0 assertion below
+                # pins only the torch mirror's behavior.
                 for j in range(lens[b], min(s1, accept_index.shape[1])):
                     assert rid[b, j] < 0, (
                         "padded -1 must still divide to a negative row so a "
