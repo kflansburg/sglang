@@ -11,6 +11,7 @@ import torch
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
+    assert_valid_host_slot_indices,
     host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
@@ -366,6 +367,9 @@ class MambaPoolHost(HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        # Per-slot flag used to detect double-free/double-alloc, mirroring
+        # HostKVCache.clear: slot_used[k] is true if slot k is allocated.
+        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -383,6 +387,12 @@ class MambaPoolHost(HostKVCache):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+
+        assert not self.slot_used[select_index].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{select_index[self.slot_used[select_index]].tolist()}."
+        )
+        self.slot_used[select_index] = True
         return select_index
 
     @synchronized
@@ -391,6 +401,12 @@ class MambaPoolHost(HostKVCache):
         if indices_cpu.numel() == 0:
             return 0
 
+        assert_valid_host_slot_indices(indices_cpu, self.size)
+        assert self.slot_used[indices_cpu].all(), (
+            f"Double-free detected: slots not currently allocated: "
+            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+        )
+        self.slot_used[indices_cpu] = False
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
         return len(indices)

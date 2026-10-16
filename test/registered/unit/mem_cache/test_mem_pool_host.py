@@ -261,6 +261,29 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn("Double-free", msg)
         self.assertIn(str(indices.tolist()), msg)
 
+    def test_free_rejects_negative_sentinel_indices(self):
+        # HiSparse/DSv4 request host tables are -1-padded; a -1 slipping into
+        # free() must fail loudly instead of wrapping to the LAST slot
+        # (slot_used[-1]) and later being issued as a valid slot id.
+        indices = self.host_pool.alloc(4)
+        tail = self.host_pool.alloc(2)
+        bad = torch.cat([indices[:2], torch.tensor([-1, -1])])
+        with self.assertRaisesRegex(AssertionError, "negative"):
+            self.host_pool.free(bad)
+        # The live tail slots must still be owned.
+        with self.assertRaises(AssertionError):
+            self.host_pool.free_slots = torch.cat(
+                [tail, self.host_pool.free_slots]
+            )
+            self.host_pool.alloc(2)
+
+    def test_free_rejects_out_of_range_indices(self):
+        self.host_pool.alloc(2)
+        with self.assertRaisesRegex(AssertionError, "out of range"):
+            self.host_pool.free(
+                torch.tensor([self.host_pool.logical_size], dtype=torch.int64)
+            )
+
     def test_shm_allocator(self):
         shm_host_pool = MHATokenToKVPoolHost(
             device_pool=self.device_pool,
@@ -431,6 +454,41 @@ class TestLazyHostPoolRelease(CustomTestCase):
             pool.alloc(1)
         with self.assertRaises(ValueError):
             pool.free(torch.tensor([0]))
+
+    def _assert_double_free_detected(self, pool, alloc_size):
+        allocated = pool.alloc(alloc_size)
+        self.assertIsNotNone(allocated)
+        pool.free(allocated[:2])
+        # allocated[1] has already been freed above.
+        with self.assertRaisesRegex(AssertionError, "Double-free"):
+            pool.free(allocated[1:3])
+
+    def _assert_free_rejects_sentinels(self, pool, alloc_size):
+        allocated = pool.alloc(alloc_size)
+        self.assertIsNotNone(allocated)
+        bad = allocated.clone()
+        bad[0] = -1
+        with self.assertRaisesRegex(AssertionError, "negative"):
+            pool.free(bad)
+        too_big = allocated.clone()
+        too_big[0] = pool.size if pool.size else 10**9
+        with self.assertRaisesRegex(AssertionError, "out of range"):
+            pool.free(too_big)
+
+    def test_mamba_pool_free_guards(self):
+        pool = self._make_mamba_pool()
+        self._assert_double_free_detected(pool, 4)
+        self._assert_free_rejects_sentinels(pool, 4)
+
+    def test_deepseek_v4_pool_free_guards(self):
+        pool = self._make_deepseek_v4_pool()
+        self._assert_double_free_detected(pool, 4)
+        self._assert_free_rejects_sentinels(pool, 4)
+
+    def test_logical_pool_free_guards(self):
+        pool = self._make_logical_pool()
+        self._assert_double_free_detected(pool, 4)
+        self._assert_free_rejects_sentinels(pool, 4)
 
 
 class TestHostMemoryBudget(CustomTestCase):
