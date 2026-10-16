@@ -1,18 +1,21 @@
 # Disaggregation audit — prefill side (prefill.py, utils.py, kv_events.py, checksum.py, common/)
 Owner: disagg-prefill. Repo @ origin/main as of 2026-10-16.
 
-## Coverage checklist
+## Coverage checklist (COMPLETE — see coverage report section for per-file verdicts)
 - [x] bootstrap queue lifecycle (add/pop/abort/failure)
 - [x] abort paths: bootstrap queue, waiting queue, chunked req, inflight queue
 - [x] inflight queue: send completion vs radix unlock ordering
-- [ ] KV send completion vs prefix eviction during Transferring (deep: conn.py sender thread)
-- [ ] chunked prefill: chunk boundary off-by-one, start_send_idx monotonicity
-- [ ] grammar double release
-- [ ] checksum.py: tagging gaps
-- [ ] kv_events.py
-- [ ] utils.py: MetadataBuffers, ReqToMetadataIdxAllocator
-- [ ] SWA/mamba/DSA payload index translation
-- [ ] staging buffer lifetime
+- [x] KV send completion vs prefix eviction during Transferring
+      (failure-path always-terminate contract in common/conn.py; C9 no_deep
+      copy gate; bookkeeping-pop vs RDMA-read overlap analyzed)
+- [x] chunked prefill: chunk boundary off-by-one, start_send_idx monotonicity
+- [x] grammar double release (C8; decode._release_aborted_request guards)
+- [x] checksum.py: tagging gaps (C5 + deep-verify symmetry section)
+- [x] kv_events.py (event bus only, not KV path)
+- [x] utils.py: MetadataBuffers, ReqToMetadataIdxAllocator (guards verified)
+- [x] SWA/mamba/DSA/QSA payload index translation (bounded + provided-locals checked)
+- [x] staging buffer lifetime (disagg-prefill-common; F20/F21/#54)
+- [x] pp_consensus_store.py, role_switch.py (positions section)
 
 ## FINDING CANDIDATES
 
