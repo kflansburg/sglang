@@ -1,0 +1,44 @@
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index b766be298a..8ef60e75d2 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -461,8 +461,17 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
+         key_len = len(radix_key)
+         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+ 
++        # Guard: never insert or free below the tree's recorded protection for
++        # this request. A trimmed finish (e.g. stop-string / strip_thinking /
++        # spec-verify overshoot) after an unfinished checkpoint advanced
++        # cache_protected_len into generated output would otherwise hand
++        # tree-owned rows back to the allocator (freed double at evict and
++        # aliased by the next allocation). The freed tail is clamped to start
++        # past the protected prefix either way.
++        protected_len = req.cache_protected_len
++
+         # Radix Cache takes one ref in memory pool
+-        if is_insert:
++        if is_insert and key_len > protected_len:
+             priority = getattr(req, "priority", 0) or 0
+             result = self.insert(
+                 InsertParams(key=radix_key, value=values, priority=priority)
+@@ -474,12 +483,15 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
+             )
+         else:
+             session_leaf = None
+-            self.token_to_kv_pool_allocator.free(
+-                kv_indices[req.cache_protected_len : key_len]
+-            )
++            if key_len > protected_len:
++                self.token_to_kv_pool_allocator.free(
++                    kv_indices[req.cache_protected_len : key_len]
++                )
+ 
+-        # free the unaligned tail
+-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
++        # free the unaligned tail (clamped past the protected prefix)
++        self.token_to_kv_pool_allocator.free(
++            kv_indices[max(key_len, protected_len) :]
++        )
+ 
+         self._tag_session_leaf(req, radix_key, node=session_leaf)
+ 
