@@ -93,3 +93,9 @@ Fix skeleton (pending reachability): mask `freed_p_pages >= 0` before index_fill
 - Fix: (a) always-on integer accounting assert `available_size() <= size` on free() (no sync: python ints; catches accounting overflow AND the later overfill symptom of a corrupt list); (b) SGLANG_DEBUG_MEMORY_POOL-gated unique sweep mirroring paged `_debug_check_no_duplicate_pages`; (c) documented caller contract in free().
 - Tests (4, CPU, all pass): group roundtrip; overflow assert on dup; debug unique sweep; documented dup-handout consequence.
 ## FIX LANDED: paged alloc_decode ps==1 assert (BUG-ALLOC-5) — see board #32 in review.
+
+## FIX LANDED (agent/pools-lead): int32 guard on DCP-widened virtual id spaces (allocplan F1, LATENT->guarded)
+- kv_cache_configurator.logical_token_capacity: assert widened virtual capacity < 2^31 (req_to_token is int32; a DCP-widened wrap silently aliases requests' KV + torch negative-index offload reads wrong rows = cross-request leakage). Mirrors unified_memory_pool._assert_physical_id_bound.
+- memory_pool.DSATokenToKVPool: same bound on derived DSA index_buf_size.
+- Version surface (allocplan): v0.5.17/v0.5.20+/latest affected class; v0.5.14/.15 lack attn-DCP (class absent) unless a plain pool hits 2^31 (unrealistic).
+- Trigger bound: max_total_num_tokens * attn_dcp_size >= 2^31 — latent today (no prod deployment near), would be silent corruption if ever configured.

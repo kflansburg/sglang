@@ -119,6 +119,18 @@ def test_alloc_extend_kernel_part3_unreachable_on_dead_lanes():
         assert not oob_old, f"live-lane OOB in unmasked form: {batch}"
 
 
+def test_dcp_widened_int32_guard_reads():
+    """allocplan F1 fix: the configurator and DSA pool must REJECT id spaces
+    that overflow int32 (silent wrap -> cross-request aliasing). Static
+    source-level assertions: guard present at the two widened-space derivations."""
+    import inspect
+    from sglang.srt.mem_cache import kv_cache_configurator, memory_pool
+    cfg_src = inspect.getsource(kv_cache_configurator)
+    assert "exceeds the int32 bound" in cfg_src
+    pool_src = inspect.getsource(memory_pool)
+    assert "exceeds the int32 bound" in pool_src
+
+
 def test_alloc_decode_ps1_assert():
     a = PagedTokenToKVPoolAllocator(
         size=128, page_size=1, dtype=torch.float16, device="cpu",

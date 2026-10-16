@@ -5213,6 +5213,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 if dcp_replicated
                 else (size + self.page_size) * dcp_size - self.page_size
             )
+        # The index buffer (and req_to_token, int32) address these ids: beyond
+        # 2^31 they wrap negative and alias with no loud error.
+        assert index_buf_size < 2**31, (
+            f"DSA index buffer id space {index_buf_size} exceeds the int32 bound "
+            f"(2^31): size={size}, page_size={self.page_size}, "
+            f"dcp_replicated={dcp_replicated}. Reduce token capacity or DCP size."
+        )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
