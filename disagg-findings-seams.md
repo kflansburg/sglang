@@ -12,3 +12,16 @@ Files read: python/sglang/srt/managers/scheduler.py (disagg branches), cross-ref
   - DECODE transfer queue abort: host_staged -> prepare_abort + `continue` (keeps host dest alive until prefill stops writing — relies on drain-ack, check CommonKVReceiver._send_abort_notification). Non-staged -> kv_receiver.abort() arms drain-ack first (comment says so).
   - retracted_queue abort: discard_kv_cache_backup + send_output. Queue rebuilt. OK shape; verify discard_kv_cache_backup frees exactly once even when backup partially staged (owner: disagg-decode).
 - pause_generation retract (~5658): decode waits include reqs with kv.holds_kv staged into retract_reqs; PREFILL chunked_req tmp_end_idx reset; note PREFILL branch skips merging last_batch (comment: avoids leak since prefill event loop never calls update_running_batch).
+
+## Verified-bug ledger (as of 03:22)
+V1 nixl reload race — REFUTED at code level (complete peer sets ⇒ same worker; gate nixl/conn.py:3261, key 2956-2960). Fix = invariant comment/assert.
+V2 nixl send_aux count-only assert. FIXING (nixl).
+V3 nixl _await_handles unbounded healthy wait ⇒ bounded 300s (env tunable) with distinct failure. FIXING (nixl).
+V4 COMPOUND: best-effort one-shot AbortNotification (common/conn.py:2608-2629) × decode device-path deferred release frees at 30s w/o drain (decode.py:2989-3008). FIXING (prefill F9 retry/fail-all; decode F8 device parity w/ host path).
+V5 mooncake silent truncation transfer_worker (conn.py:2556-2573) ⇒ fail loud. FIXING (mooncake).
+V6 mooncake registration ret ignored ⇒ fail-fast. FIXING (mooncake).
+V7 mooncake worker death no supervision ⇒ supervision/keepalive. FIXING (mooncake).
+V8 decode drain_before_retraction raise in scheduler OOM path (decode_kvcache_offload_manager.py:302; scheduler.py:4399) — CANDIDATE (availability).
+V9 mooncake maybe_send_extra silent truncation on drift except QSA/SWA_RING/DSV4_REQUEST_STATE — pending which states are production.
+
+CLOSED-clean: bootstrap queue abort chain; inflight queue abort chain; grammar double-release decode; retract+SWA offload guard; nixl defer-ack accounting (F4); is_abort_release_safe truthful nixl-device/unreachable nixl-host; mooncake: batch indices pairing guard, Failed-terminal, drain-ack protocol, peer re-reg ordering, 0-len/dedup registration, int32 wire dtype.
