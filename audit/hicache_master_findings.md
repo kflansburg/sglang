@@ -101,6 +101,20 @@ Tags v0.5.14/v0.5.15.post1/v0.5.17/v0.5.20 fetched from upstream into local repo
   asymmetric path via different structure is OPEN (prefetch-ctl continuing).
   Teach-in: reviewing reviewer MUST chase overridden methods up the MRO before
   accepting "no sync exists" claims on subclass code paths.
+  SALVAGED VULN WINDOW (prefetch-ctl version archaeology, hicache-lead spot-
+  verified v0.5.17:1869-1917 by line): hi_mamba_radix_cache.py
+  check_prefetch_progress MIN-reduces completed_tokens across TP but reads
+  rank-local pool_storage_result.extra_pool_hit_pages[MAMBA] >= 1 to attach/
+  free the mamba host slot with NO TP sync → asymmetric mamba sidecar read:
+  one rank attaches + skips free, other frees the same slot + skips attach →
+  divergent mamba host trees + freed slot reissued while tree-referenced.
+  AFFECTED: v0.5.14 (~l.1815-1866), v0.5.15.post1 (~l.1815-1861), v0.5.17
+  (l.1869-1917) — all same shape. Unified SWA path on 0.5.15+ IS guarded
+  (packed MIN unified_radix_cache.py:2021-2033). v0.5.20 removed
+  hi_mamba_radix_cache.py (resolved by rewrite); HEAD guarded by override.
+  K3 (~v0.5.16, mamba production!) assumed affected if its hi_mamba matches
+  0.5.15/17 → K3 owners flagged. Fix analogue for backports: pack the mamba
+  hit into the existing terminate-time MIN all_reduce (mirror unified:2021).
 - ~~storage_prefetch_lifecycle::test_two_rank_completion_capacity_and_anchor_loss
   fails at clean HEAD~~ — ENV ARTIFACT (prefetch-ctl-audit root-caused):
   65-char sandbox hostname breaks gloo unix-socket paths ("File name too
