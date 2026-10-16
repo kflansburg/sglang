@@ -110,6 +110,26 @@ EVIDENCE:
   (bounds vs num_req_slots*ring/pages_per_req; boundary seq=0 / seq%ratio==0 empties; cross-ring 8<->16
   positional consistency; bad ring rejected). Verdict: correct at HEAD.
 
+## CORRECTED production-version matrix (after features-lead challenge #216)
+Challenge claimed v0.5.14/15.post1 were AFFECTED because kv_cache_configurator.py (with the caller-side
+fix) only exists in v0.5.17+. DIRECT TAG EVIDENCE REFUTES this: the fix in .14/.15p1 lives in
+model_executor/model_runner_kv_cache_mixin.py:
+- v0.5.14:488 + v0.5.15.post1:694 both pass num_req_slots=self.req_to_token_pool.req_to_token.shape[0]
+  with the PD-prealloc comment. K2's SWA-ring sizing was already fixed there.
+Moreover the RISKY FEATURES are version-gated:
+- K1 kpool-compress tail (DSATokenToKVPool._compress_tail_*): ABSENT in v0.5.14 AND v0.5.15.post1
+  (no _compress_tail/kpool_use_compress in memory_pool.py). First appears v0.5.17 sized via
+  req_to_token.shape[0]; v0.5.20/HEAD sized via ctor arg fed shape[0]. -> no prod version affected.
+- K2 request-scoped PD transfer (DSV4_REQUEST_STATE / request_scoped_state_transfer_indices /
+  CompressStatePool.request_scoped): ABSENT in v0.5.14, v0.5.15.post1, v0.5.17; PRESENT only in
+  v0.5.20+HEAD with correct sizing from introduction. -> no prod version affected.
+- DeepSeek V4 Pro on v0.5.15.post1: NOT exposed to K1/K2 (features absent; SWA-ring class already fixed).
+- Historical note: the same class DID ship and was fixed pre-v0.5.14 ("sizing as max_num_reqs+1 overflows
+  (length out of range)" comment at v0.5.14 deepseek_v4_memory_pool.py:489).
+- Kimi K3 branch (87dd4596/bd4828e2): still unverifiable from public upstream. Both K1/K2 features
+  post-date its ~v0.5.16 base upstream, but the branch may carry cherry-picks; needs internal-repo check
+  for (a) num_req_slots caller arg, (b) DSATokenToKVPool tail sizing, (c) _compress_tail_k req dim.
+
 ## FINAL VERDICT for assigned scope
 - No new memory-safety bug confirmed in my scope at HEAD. Both known classes (K1, K2) are fixed upstream
   and fixed in every reachable production tag. Two unconfirmed hardening candidates (c128 cleanup kernel
