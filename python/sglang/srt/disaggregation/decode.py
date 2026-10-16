@@ -650,6 +650,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
+        # Full-model main layer count, mirroring the prefill registration
+        # (get_mha_kv_ptrs_with_pp anchors the peer's main V block on it; the
+        # wire carries raw pointer lists whose draft tail is otherwise
+        # indistinguishable from a PP stage window). Defensive for role-switch
+        # D->P init paths.
+        kv_args.hidden_kv_layers = self.scheduler.model_config.num_hidden_layers
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
