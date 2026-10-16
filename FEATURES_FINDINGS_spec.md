@@ -122,3 +122,28 @@ deployments). Confirm via git tag diff before filing.
   extra entries (num_draft_entries) in the same transfer; decode prealloc allocates fill_len; deferred decode KV
   release class is disagg-lead's territory - leaving both-sides-release verification to coordinate with them.
 
+
+## F-spec-1 (CONFIRMED by features-lead): embedding prefetch wedge leak — VERSION SWEEP
+- embedding_cache_controller.py: ABSENT in v0.5.14, v0.5.15.post1, v0.5.17; present v0.5.20 + HEAD
+  (features-lead's matrix agrees). K3 base 87dd4596/bd4828e2: unfetchable from this sandbox (upstream
+  remote rejects those SHAs — they are branch-internal); inferred same-generation as v0.5.16+ => likely PRESENT.
+- Sibling S1 (short-read-as-success): mooncake_embedding_store batch_get + batch_get_into_multi_buffers treat
+  res>0 as success in EVERY tag v0.5.14..v0.5.20 and HEAD (byte-count semantics documented in
+  mooncake_store.py _batch_postprocess: positive = bytes read, never length-checked). AFFECTED: all production
+  versions; embeddings consumed partially-garbage on short read. Same class exists once in generic
+  mooncake_store.py (_batch_postprocess res>0 group check) — hicache team territory (earlier-audit class
+  'Mooncake store short reads treated as success'); embedding variant is mine to fix per features-lead.
+- PoC test_embedding_prefetch_timeout_leak.py RUNS on CPU (demonstrates leak on HEAD).
+- test_spec_retract_free_roundtrip.py added (retract-during-spec alloc/free roundtrip; pins invariant
+  kv_allocated_len >= ceil(owned_committed,page) at release; uses REAL page_aligned_decode_alloc_lens).
+
+## Test-class mapping (lead request: which shipped tests pin which known class in my area)
+- test_embedding_cache_controller.py: pin/unpin LRU semantics (embedding pin ownership class) - pins the
+  'embedding cache unpin of entries not pinned by the caller' class at LRU/refcount level; NOT abort/timeout.
+- test_staging_draft_kv_slots.py: Mooncake draft KV slot ordering (sibling of 'Mooncake transfer batch indices').
+- test_dense_fused_draft_geometry.py / test_fused_draft_placement.py: unified draft lane geometry.
+- test_kv_cache_configurator_draft_gate.py / test_kv_index_translator_draft_disposition.py: draft KV virtual-id
+  disposition on unified pools.
+- test_pd_eagle_draft_proposal.py (registered/spec/): PD first-verify proposal distribution correctness.
+- NO shipped test pins: draft KV verify/FAIL free paths, disagg+spec both-sides release, retract during spec,
+  embedding prefetch timeout (the four gaps features-lead named). My two new tests cover retract + timeout.
