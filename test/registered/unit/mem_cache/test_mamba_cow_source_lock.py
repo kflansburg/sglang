@@ -64,7 +64,7 @@ def _make_req():
     holds_mamba is False (fresh request row) so finalize allocates a dst slot —
     the production staging path.
     """
-    return SimpleNamespace(kv=ReqKvInfo())
+    return SimpleNamespace(kv=ReqKvInfo(), session=None)
 
 
 class TestMambaCowSourceLock(CustomTestCase):
@@ -151,10 +151,14 @@ class TestMambaCowSourceLock(CustomTestCase):
             ),
             "evict_for_alloc stole the locked COW source node (F-1 still open)",
         )
-        self.assertIsNone(
-            self.cache.tree_core.get_component_device_value(
+        try:
+            other_value = self.cache.tree_core.get_component_device_value(
                 node_other, ComponentType.MAMBA
-            ),
+            )
+        except KeyError:
+            other_value = None  # node removed from the arena = evicted
+        self.assertIsNone(
+            other_value,
             "sanity: the unlocked node should have been the eviction victim",
         )
 
@@ -199,6 +203,33 @@ class TestMambaCowSourceLock(CustomTestCase):
             0,
             "restaging leaked a pin (double-acquire without matching release)",
         )
+
+
+    def test_load_back_failure_releases_lock(self):
+        """Site #10: finalize_load_back(success=False) must drop the staged COW lock;
+        prepare_buffer_load_back's H2D-supersede (#9) runs the same helper on success."""
+        from sglang.srt.mem_cache.unified_cache.components.base import (
+            PrepareLoadBackResult,
+        )
+
+        node_src = self._insert_node_with_mamba(SOURCE_TOKENS)
+        req, match = self._stage_cow(SOURCE_TOKENS)
+        self.assertIsNotNone(req.kv.mamba_cow_lock)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)  # staging allocated dst
+
+        mamba_comp = self.cache.components[ComponentType.MAMBA]
+        mamba_comp.finalize_load_back(
+            req,
+            PrepareLoadBackResult(
+                allocated_mamba_slot=req.kv.mamba_pool_idx.unsqueeze(0)
+            ),
+            success=False,
+        )
+        # Lock released, slot returned, req metadata cleared.
+        self.assertIsNone(req.kv.mamba_cow_lock)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertEqual(self._mamba_lock(match.best_match_node), 0)
 
 
 if __name__ == "__main__":

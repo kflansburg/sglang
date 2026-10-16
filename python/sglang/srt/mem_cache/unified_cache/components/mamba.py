@@ -744,9 +744,16 @@ class MambaComponent(TreeComponent):
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
-            req.kv.mamba_pool_idx = None
+        if not success:
+            if prep.allocated_mamba_slot is not None:
+                self.cache.req_to_token_pool.mamba_allocator.free(
+                    prep.allocated_mamba_slot
+                )
+                req.kv.mamba_pool_idx = None
+            # The superseded deferred COW never runs either: drop its source
+            # lock (F-1, site #10); otherwise the node pins forever.
+            if req is not None:
+                clear_mamba_cow(req)
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
