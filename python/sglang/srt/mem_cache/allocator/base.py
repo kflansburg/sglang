@@ -61,6 +61,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: list[torch.Tensor] | None = None
 
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        self.tracker = _NullTracker()
+
     @property
     def size_full(self):
         return self.size

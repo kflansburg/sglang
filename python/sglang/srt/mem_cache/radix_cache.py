@@ -532,6 +532,9 @@ class RadixCache(BasePrefixCache):
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
+        self.req_to_token_pool.tracker.on_prefix_hit(
+            req.kv.req_pool_idx, new_indices[req.kv.cache_protected_len :]
+        )
 
         # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next

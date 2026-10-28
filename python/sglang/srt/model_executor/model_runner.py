@@ -973,6 +973,14 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        from sglang.srt.mem_cache.kv_integrity import install_tracker
+
+        install_tracker(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            get_spec().speculative_eagle_topk,
+        )
+
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):

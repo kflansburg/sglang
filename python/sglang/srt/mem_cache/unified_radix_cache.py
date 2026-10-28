@@ -1218,6 +1218,9 @@ class UnifiedRadixCache(BasePrefixCache):
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
+        self.req_to_token_pool.tracker.on_prefix_hit(
+            req.kv.req_pool_idx, new_indices[req.kv.cache_protected_len :]
+        )
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is

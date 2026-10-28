@@ -328,6 +328,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self.tracker.on_free(free_index)
 
         if self.free_group is None:
             self._release_page_ids(torch.unique(free_index // self.page_size))
@@ -360,6 +361,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Free exactly these pages; no page twice, no dedup."""
         if page_ids.numel() == 0:
             return
+        if self.tracker.enabled:
+            self.tracker.on_free(page_ids * self.page_size)
 
         if self.free_group is None:
             self._release_page_ids(page_ids)

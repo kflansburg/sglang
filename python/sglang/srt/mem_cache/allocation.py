@@ -455,6 +455,16 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    tracker = batch.token_to_kv_pool_allocator.tracker
+    if tracker.enabled:
+        from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+        for idx, prefix in zip(req_pool_indices, prefix_tensors):
+            if len(prefix) > 0:
+                tracker.on_prefix_hit(idx, prefix)
+        record_alloc_per_req(
+            tracker, req_pool_indices, batch.extend_lens, out_cache_loc
+        )
     try:
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,
@@ -825,6 +835,16 @@ def alloc_for_spec_decode(
                     req_pool_indices=req_pool_indices,
                     batch=batch,
                 )
+        tracker = tree_cache.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            record_alloc_per_req(
+                tracker,
+                req_pool_indices,
+                (nxt_kv_lens_cpu - cur_kv_lens_cpu).tolist(),
+                out_cache_loc,
+            )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(

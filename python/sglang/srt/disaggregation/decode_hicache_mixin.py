@@ -316,6 +316,9 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
+        self.tree_cache.req_to_token_pool.tracker.on_prefix_hit(
+            req.kv.req_pool_idx, decode_req.hicache_restored_kv_indices
+        )
         req.prefix_len = prefix_match.decode_prefix_len
         req.last_node = restore_lock.node
         req.lock = restore_lock

@@ -212,6 +212,10 @@ class DecodeReqToTokenPool:
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        self.tracker = _NullTracker()
+
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
@@ -257,6 +261,7 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
+        self.tracker.on_req_free(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
@@ -2332,6 +2337,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
+
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            if prefix_len > 0:
+                tracker.on_prefix_hit(req.kv.req_pool_idx, prefix_indices)
+            tracker.on_alloc(req.kv.req_pool_idx, kv_loc)
 
         self.req_to_token_pool.write(
             (

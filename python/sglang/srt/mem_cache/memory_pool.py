@@ -408,6 +408,10 @@ class ReqToTokenPool:
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        self.tracker = _NullTracker()
+
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
@@ -450,6 +454,8 @@ class ReqToTokenPool:
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
+        for index in indices:
+            self.tracker.on_req_free(index)
         # Per-row, so beam member rows release their aux entries too: they reach
         # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
         if self._aux_cache is not None:
