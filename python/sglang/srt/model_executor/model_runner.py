@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -289,6 +289,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    mm_embedding_errors: Optional[List[Tuple[int, int, int]]] = None
 
 
 def resolve_draft_attention_backend(
@@ -1879,6 +1880,7 @@ class ModelRunner:
         ):
             self.maybe_join_ep_ranks()
 
+        output.mm_embedding_errors = forward_batch.mm_embedding_errors
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(

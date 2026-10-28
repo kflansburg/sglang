@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -243,6 +244,12 @@ def handle_debug_utils(server_args: Any):
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
+        )
+
+    timeout = cfg.tokenizer_event_loop_watchdog_timeout
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError(
+            "--tokenizer-event-loop-watchdog-timeout must be finite and positive"
         )
 
 

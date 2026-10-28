@@ -558,6 +558,25 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
+    def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
+        """Aux (metadata) buffers pair up positionally, so a peer that
+        registered a different number of them gets only the leading ones, and
+        those line up only if the missing buffer is the last. Say so once per
+        registration; the senders stop at the shorter list."""
+        num_local = len(self.kv_args.aux_data_ptrs)
+        if num_remote != num_local:
+            logger.error(
+                "Decode %s registered %d metadata buffers but this prefill has %d; "
+                "only the first %d are transferred, and misaligned if the extra "
+                "buffer is not the last. An optional metadata buffer is enabled on "
+                "one engine only: --disaggregation-enable-kv-checksum, "
+                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK, or the DSA top-k buffer.",
+                peer,
+                num_remote,
+                num_local,
+                min(num_remote, num_local),
+            )
+
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
         if current is None:
@@ -904,6 +923,11 @@ class CommonKVManager(BaseKVManager):
             )
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def has_outstanding_chunks(self, room: int) -> bool:
+        """True while the transfer worker holds a dequeued or in-flight chunk for
+        this room."""
+        return self._staging_outstanding.get(room, 0) > 0
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained

@@ -29,6 +29,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
+from sglang.srt.managers.utils import (
+    complete_mm_embedding_validations,
+    decode_mm_embedding_errors,
+)
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
@@ -266,6 +271,12 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            mm_embedding_error_tensor = result.mm_embedding_errors
+            if mm_embedding_error_tensor is not None:
+                complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+            decoded_mm_embedding_errors = decode_mm_embedding_errors(
+                mm_embedding_error_tensor
+            )
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -303,10 +314,19 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            mm_embedding_errors = {
+                req_idx: (expected, actual)
+                for req_idx, expected, actual in decoded_mm_embedding_errors
+            }
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                mm_embedding_error = mm_embedding_errors.get(i)
+                deferred_mm_abort = (
+                    mm_embedding_error is not None or req.mm_embedding_abort_pending
+                )
                 should_commit_output = (
-                    not req.finished()
+                    not deferred_mm_abort
+                    and not req.finished()
                     and not req.is_retracted
                     and req.inflight_middle_chunks <= 0
                 )
@@ -339,6 +359,32 @@ class SchedulerBatchResultProcessor:
                         extend_input_len=extend_input_len_per_req[i],
                         store=(should_commit_output and discard_finish_reason is None),
                     )
+
+                if deferred_mm_abort:
+                    if mm_embedding_error is not None:
+                        self.abort_request(req, *mm_embedding_error)
+                    if batch.return_logprob:
+                        assert extend_input_len_per_req is not None
+                        assert extend_logprob_start_len_per_req is not None
+                        extend_input_len = extend_input_len_per_req[i]
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        if extend_logprob_start_len < extend_input_len:
+                            logprob_pt += self.logprob_result_processor.calculate_num_input_logprobs(
+                                req,
+                                extend_input_len,
+                                extend_logprob_start_len,
+                            )
+                    if req.inflight_middle_chunks > 0:
+                        req.inflight_middle_chunks -= 1
+                        req.time_stats.set_last_chunked_prefill_finish_time()
+                        if req.inflight_middle_chunks > 0:
+                            skip_stream_req = req
+                    if (
+                        req.inflight_middle_chunks <= 0
+                        and req.mm_embedding_validation_count == 0
+                    ):
+                        self._finish_deferred_mm_embedding_abort(req)
+                    continue
 
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
@@ -454,6 +500,12 @@ class SchedulerBatchResultProcessor:
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            mm_embedding_error_tensor = result.mm_embedding_errors
+            if mm_embedding_error_tensor is not None:
+                complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+            decoded_mm_embedding_errors = decode_mm_embedding_errors(
+                mm_embedding_error_tensor
+            )
 
             embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
@@ -465,8 +517,24 @@ class SchedulerBatchResultProcessor:
                     phs = phs.cpu().detach()
 
             # Check finish conditions
+            mm_embedding_errors = {
+                req_idx: (expected, actual)
+                for req_idx, expected, actual in decoded_mm_embedding_errors
+            }
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
+                    continue
+                mm_embedding_error = mm_embedding_errors.get(i)
+                if mm_embedding_error is not None:
+                    self.abort_request(req, *mm_embedding_error)
+                if mm_embedding_error is not None or req.mm_embedding_abort_pending:
+                    if req.inflight_middle_chunks > 0:
+                        req.inflight_middle_chunks -= 1
+                    if (
+                        req.inflight_middle_chunks <= 0
+                        and req.mm_embedding_validation_count == 0
+                    ):
+                        self._finish_deferred_mm_embedding_abort(req)
                     continue
 
                 if (
@@ -513,6 +581,24 @@ class SchedulerBatchResultProcessor:
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+
+    def _finish_deferred_mm_embedding_abort(self, req: Req) -> None:
+        if not req.mm_embedding_abort_pending:
+            return
+        if not req.finished():
+            req.update_finish_state()
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        if isinstance(self.draft_worker, BaseSpecWorker):
+            self.draft_worker.note_request_finished(
+                rid=req.rid,
+                natural_stop=False,
+            )
+        if req.multimodal_inputs is not None and req.session is None:
+            req.multimodal_inputs.release_features()
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        req.mm_embedding_abort_pending = False
+        req.time_stats.set_completion_time()
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()

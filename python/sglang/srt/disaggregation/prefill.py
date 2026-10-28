@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
+    kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -71,6 +72,10 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+)
+from sglang.srt.managers.utils import (
+    complete_mm_embedding_validations,
+    decode_mm_embedding_errors,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -220,8 +225,10 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
+            self.kv_checksum_signature = kv_layout_signature(kv_args)
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -880,6 +887,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        mm_embedding_error_tensor = result.mm_embedding_errors
+        if mm_embedding_error_tensor is not None:
+            complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+        decoded_mm_embedding_errors = decode_mm_embedding_errors(
+            mm_embedding_error_tensor
+        )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -893,7 +906,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         logprob_pt = 0
         aborted_reqs: List[Req] = []
-        assert batch.spec_info is result.next_draft_input
+        assert decoded_mm_embedding_errors or batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
@@ -925,9 +938,30 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        mm_embedding_errors = {
+            req_idx: (expected, actual)
+            for req_idx, expected, actual in decoded_mm_embedding_errors
+        }
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            mm_embedding_error = mm_embedding_errors.get(i)
+            if mm_embedding_error is not None:
+                self.defer_mm_embedding_abort(req, *mm_embedding_error)
+            if mm_embedding_error is not None or req.mm_embedding_abort_pending:
+                advance_logprob_pt(i, req)
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                if (
+                    req.inflight_middle_chunks <= 0
+                    and req.mm_embedding_validation_count == 0
+                ):
+                    self.finish_disagg_mm_embedding_abort(req)
+                    if not req.finished_output:
+                        aborted_reqs.append(req)
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -1104,6 +1138,18 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
+    def finish_disagg_mm_embedding_abort(self: Scheduler, req: Req) -> None:
+        if req.disagg_kv_sender is not None:
+            req.disagg_kv_sender.clear()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        self.disagg_prefill_inflight_queue = [
+            inflight_req
+            for inflight_req in self.disagg_prefill_inflight_queue
+            if inflight_req is not req
+        ]
+        self.batch_result_processor._finish_deferred_mm_embedding_abort(req)
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -1112,6 +1158,8 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        self.resolve_prefill_drain_releases()
+
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1259,7 +1307,7 @@ class SchedulerDisaggregationPrefillMixin:
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        self.release_prefill_kv_after_drain(req, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1268,6 +1316,41 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
+
+    def release_prefill_kv_after_drain(
+        self: Scheduler, req: Req, *, checkpoint: bool
+    ) -> bool:
+        """Release a retired request's KV, or hold it while its sender still has
+        a chunk inside the transfer engine (deferred KV release only).
+
+        A terminal poll or abort() does not stop a chunk the transfer worker has
+        already dequeued. The hold is per rank and outside
+        `disagg_prefill_inflight_queue`, whose length must stay identical across
+        TP ranks for the poll all-reduce. Returns True if released now."""
+        sender = req.disagg_kv_sender
+        kv_mgr = getattr(sender, "kv_mgr", None)
+        if (
+            kv_mgr is not None
+            and kv_mgr.enable_deferred_decode_kv_release
+            and hasattr(kv_mgr, "has_outstanding_chunks")
+            and kv_mgr.has_outstanding_chunks(sender.bootstrap_room)
+        ):
+            self.disagg_prefill_drain_releases.append((req, checkpoint))
+            return False
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        return True
+
+    def resolve_prefill_drain_releases(self: Scheduler) -> None:
+        if not self.disagg_prefill_drain_releases:
+            return
+        still_held = []
+        for req, checkpoint in self.disagg_prefill_drain_releases:
+            sender = req.disagg_kv_sender
+            if sender.kv_mgr.has_outstanding_chunks(sender.bootstrap_room):
+                still_held.append((req, checkpoint))
+            elif req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        self.disagg_prefill_drain_releases = still_held
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
@@ -1303,7 +1386,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self.release_prefill_kv_after_drain(req, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1397,7 +1480,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif req.mm_embedding_validation_count == 0:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1415,6 +1498,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if req.mm_embedding_validation_count > 0:
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1460,14 +1545,17 @@ class SchedulerDisaggregationPrefillMixin:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
-                value = 0
+                digest = signature = 0
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
-                value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+                digest = computer.compute(page_indices_gpu, state_indices)
+                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+                if self.metrics_reporter.current_scheduler_metrics_enabled:
+                    self.metrics_collector.increment_kv_checksum_digests()
+            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(

@@ -1524,9 +1524,7 @@ class HybridCacheController(BaseHiCacheController):
                     transfers_nonkv,
                 ):
                     results.update(
-                        self.storage_backend.batch_get_v2(
-                            transfers, extra_info=extra_info
-                        )
+                        self._batch_get_v2_observed(operation, transfers, extra_info)
                     )
                 pool_hits = count_pool_hits(results)
             except Exception:

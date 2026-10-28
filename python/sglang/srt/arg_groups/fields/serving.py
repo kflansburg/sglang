@@ -58,6 +58,10 @@ class Serving(msgspec.Struct):
     skip_tokenizer_init: A[
         bool, "If set, skip init tokenizer and pass input_ids in generate request."
     ] = False
+    tokenizer_event_loop_watchdog_timeout: A[
+        Optional[float],
+        "Set tokenizer event loop watchdog timeout in seconds. If the event loop stops responding, the server will dump information for debugging.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # HTTP server

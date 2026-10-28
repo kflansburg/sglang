@@ -200,6 +200,19 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
+
+def _drain_env_seconds(name: str) -> float:
+    """Read a non-negative seconds value from the environment; 0 disables."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logging.getLogger(__name__).warning("Ignoring invalid %s=%r", name, raw)
+        return 0.0
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +286,7 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    created_monotonic: float = dataclasses.field(default_factory=time.monotonic)
 
     # Prevent duplicate releases after completion or ownership transfer.
     lora_released: bool = False
@@ -693,6 +707,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Running generate_request handlers. Every rid_to_state entry is
+        # created by one, so once none has run for a while, nothing can consume
+        # the entries that remain (see the SIGTERM drain).
+        self.live_request_handlers = 0
+        self.request_handlers_idle_since = time.monotonic()
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -850,15 +869,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             start_cpu_monitor_thread("tokenizer")
+            from prometheus_client import Gauge
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+            self._last_receive_gauge = Gauge(
+                name="sglang:tokenizer_last_receive_tstamp_seconds",
+                documentation="Unix timestamp of the most recent message from the detokenizer. PromQL: time() - this gauge = seconds since pipeline last produced output.",
+                multiprocess_mode="mostrecent",
+            )
+
+        if (
+            get_observability().gc_warning_threshold_secs > 0.0
+            or self.enable_metrics
+        ):
+            configure_gc_warning(
+                warn_threshold_secs=get_observability().gc_warning_threshold_secs,
+                enable_metrics=self.enable_metrics,
+            )
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+        self.event_loop_watchdog_timeout = (
+            get_serving().tokenizer_event_loop_watchdog_timeout
+        )
+        self.event_loop_watchdog = None
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -929,6 +965,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rid: self.rid_to_state[rid]
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         }
+        self.live_request_handlers += 1
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -966,6 +1003,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_states)
             raise
+        finally:
+            self.live_request_handlers -= 1
+            if self.live_request_handlers == 0:
+                self.request_handlers_idle_since = time.monotonic()
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -2444,6 +2485,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
+        if self.event_loop_watchdog_timeout is not None:
+            self.event_loop_watchdog = Watchdog.create(
+                debug_name="TokenizerManager event loop",
+                watchdog_timeout=self.event_loop_watchdog_timeout,
+                soft=True,
+            )
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.event_loop_watchdog_loop))
+            )
         self.event_loop = loop
 
         # We only add signal handler when the tokenizer manager is in the main thread
@@ -2460,6 +2510,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+    async def event_loop_watchdog_loop(self):
+        interval = min(1.0, self.event_loop_watchdog_timeout / 2)
+        while True:
+            self.event_loop_watchdog.feed()
+            await asyncio.sleep(interval)
+
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -2473,6 +2529,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
+            if hasattr(self, "_last_receive_gauge"):
+                self._last_receive_gauge.set(self.last_receive_tstamp)
             self.soft_watchdog.feed()
 
     async def _handle_batch_output(
@@ -3122,7 +3180,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            if token_logprobs_val[i] is not None:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
@@ -3280,6 +3338,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and finish_reason.get("type") in ("stop", "length")
                 else None
             )
+
+            if (
+                get_observability().enable_cache_observability
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
+                self.metrics_collector.cache_reuse.observe(
+                    recv_obj.prompt_tokens[i],
+                    recv_obj.cached_tokens[i],
+                    cached_tokens_details,
+                    "aborted" if finish_reason.get("type") == "abort" else "observed",
+                )
 
             self.metrics_collector.observe_one_finished_request(
                 labels,
@@ -3503,8 +3572,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
     async def sigterm_watchdog(self):
+        stale_log_age = _drain_env_seconds("SGLANG_STALE_REQ_LOG_AGE_SECS")
+        next_stale_scan = time.monotonic() + 60
         while not self.gracefully_exit:
             await asyncio.sleep(5)
+            if stale_log_age > 0 and time.monotonic() >= next_stale_scan:
+                next_stale_scan = time.monotonic() + 60
+                self._log_stale_req_states(stale_log_age)
+
+        # Bound the drain. Without these guards the loop below waits for
+        # rid_to_state to empty, so one leaked entry pins the pod until the
+        # kubelet SIGKILLs it at terminationGracePeriodSeconds.
+        drain_deadline = _drain_env_seconds("SGLANG_DRAIN_DEADLINE_SECS")
+        orphan_grace = _drain_env_seconds("SGLANG_DRAIN_ORPHAN_GRACE_SECS")
+        drain_start = time.monotonic()
+        waited_for_handlers = False
+        if orphan_grace > 0 and get_serving().tokenizer_worker_num > 1:
+            # Each tokenizer worker only counts its own handlers, but its
+            # ShutdownReq stops the schedulers that every worker shares.
+            logger.warning(
+                "SGLANG_DRAIN_ORPHAN_GRACE_SECS is ignored with %d tokenizer workers",
+                get_serving().tokenizer_worker_num,
+            )
+            orphan_grace = 0.0
+        if drain_deadline > 0 or orphan_grace > 0:
+            logger.info(
+                "Drain guards enabled: deadline=%.0fs orphan_grace=%.0fs",
+                drain_deadline,
+                orphan_grace,
+            )
 
         # Drain requests
         while True:
@@ -3531,10 +3627,53 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.info(
                 f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
-            if remain_num_req > 0:
-                await asyncio.sleep(5)
-            else:
+            if remain_num_req == 0:
+                if (
+                    (drain_deadline > 0 or orphan_grace > 0)
+                    and self.live_request_handlers > 0
+                    and not waited_for_handlers
+                ):
+                    # A finished or aborted state leaves rid_to_state before
+                    # its handler returns the final output to the client.
+                    waited_for_handlers = True
+                    await self._wait_for_request_handlers(5)
+                    continue
                 break
+
+            now = time.monotonic()
+            if (
+                orphan_grace > 0
+                and self.live_request_handlers == 0
+                and now - self.request_handlers_idle_since >= orphan_grace
+            ):
+                # Only generate_request creates and consumes rid_to_state
+                # entries. With no handler alive, no client can receive these
+                # outputs. Exit without awaiting, so no new handler can start
+                # between this check and the ShutdownReq below.
+                logger.error(
+                    "No request handler has run for %.0fs; treating the %d "
+                    "remaining request state(s) as orphaned and exiting. %s",
+                    now - self.request_handlers_idle_since,
+                    remain_num_req,
+                    self._format_req_states(),
+                )
+                break
+
+            if drain_deadline > 0 and now - drain_start >= drain_deadline:
+                logger.error(
+                    "Drain deadline of %.0fs reached with %d live request "
+                    "handler(s) and %d request state(s); aborting them and "
+                    "exiting. %s",
+                    drain_deadline,
+                    self.live_request_handlers,
+                    remain_num_req,
+                    self._format_req_states(),
+                )
+                self.abort_request(abort_all=True)
+                await self._wait_for_request_handlers(5)
+                break
+
+            await asyncio.sleep(5)
 
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
@@ -3589,6 +3728,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         state.finished = True
         state.time_stats.set_finished_time()
+
+        if (
+            self.enable_metrics
+            and state.obj.log_metrics
+            and get_observability().enable_cache_observability
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            self.metrics_collector.cache_reuse.observe(
+                None, None, None, "aborted"
+            )
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -3841,6 +3990,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             new_states[rid] = state
 
         self.rid_to_state.update(new_states)
+
+    async def _wait_for_request_handlers(self, timeout: float) -> None:
+        wait_end = time.monotonic() + timeout
+        while self.live_request_handlers > 0 and time.monotonic() < wait_end:
+            await asyncio.sleep(0.5)
+
+    def _format_req_states(self, states=None, limit: int = 20) -> str:
+        """One-line summary of rid_to_state entries, oldest first.
+
+        Never raises: it runs in sigterm_watchdog, whose wrapper kills the
+        process on any exception.
+        """
+        try:
+            now = time.monotonic()
+            if states is None:
+                states = list(self.rid_to_state.items())
+            states = sorted(states, key=lambda item: item[1].created_monotonic)
+            parts = [
+                f"rid={rid} age={now - state.created_monotonic:.1f}s"
+                f" dispatched={state.dispatched}"
+                f" stream={getattr(state.obj, 'stream', False)}"
+                f" finished={state.finished}"
+                f" first_token={bool(state.time_stats.first_token_time)}"
+                f" output_tokens={len(state.output_ids)}"
+                f" pending_outputs={len(state.out_list)}"
+                for rid, state in states[:limit]
+            ]
+            if len(states) > limit:
+                parts.append(f"... and {len(states) - limit} more")
+            return "; ".join(parts)
+        except Exception as e:
+            return f"(failed to format request states: {e!r})"
+
+    def _log_stale_req_states(self, min_age: float) -> None:
+        try:
+            now = time.monotonic()
+            stale = [
+                (rid, state)
+                for rid, state in list(self.rid_to_state.items())
+                if now - state.created_monotonic >= min_age
+            ]
+            if not stale:
+                return
+            logger.warning(
+                "Possible leaked request states: %d of %d tokenizer entries are "
+                "older than %.0fs (live request handlers=%d). %s",
+                len(stale),
+                len(self.rid_to_state),
+                min_age,
+                self.live_request_handlers,
+                self._format_req_states(stale),
+            )
+        except Exception:
+            logger.exception("Failed to log stale request states")
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.

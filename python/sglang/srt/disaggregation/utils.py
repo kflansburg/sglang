@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -255,8 +256,44 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
             ].item()
-            if actual_room == 0:
+            # The aux fields are separate RDMA writes, so the room landing doesn't
+            # mean the first token has: wait for both.
+            first_token = metadata_buffers.output_ids[
+                decode_req.metadata_buffer_index, 0
+            ].item()
+            if actual_room == 0 or first_token < 0:
                 polls[i] = int(KVPoll.Transferring)
+
+
+def kv_layout_signature(kv_args: KVArgs) -> int:
+    """Identify the KV layout a checksum digests.
+
+    Two sides can compare digests only if they cover the same bytes. A prefill
+    with another TP width has other per-page item lengths; a PP or
+    layer-sharded prefill owns fewer buffers. Shipped beside the digest, so
+    those become one logged skip instead of a mismatch on every request.
+    Positive int64 and never 0, which marks "no digest" in the metadata row.
+    """
+    layout = (
+        kv_args.page_size,
+        list(kv_args.kv_item_lens),
+        [list(lens) for lens in kv_args.state_item_lens],
+    )
+    raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
+    return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def all_reduce_flags(
+    flags: List[int], group: dist.ProcessGroup, op: dist.ReduceOp
+) -> List[int]:
+    """Reduce one small int per entry across `group`; every rank must pass the
+    same number of entries in the same order. Empty or single-rank: unchanged."""
+    if not flags or dist.get_world_size(group) == 1:
+        return flags
+
+    tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=op, group=group)
+    return tensor_to_reduce.tolist()
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
@@ -401,6 +438,9 @@ class MetadataBuffers:
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            # -1 in output_ids[i, 0] marks a slot whose first token hasn't landed
+            # (token ids are never negative); decode resets it when it frees a slot.
+            self.output_ids.fill_(-1)
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
@@ -469,11 +509,24 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
-    def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+    def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
+        # Slot 0 the digest, slot 1 the layout signature it was taken under;
+        # the row is 8 wide for the 64 B RDMA minimum anyway.
+        row = self.kv_checksum[req.metadata_buffer_index]
+        row[0] = digest
+        row[1] = signature
 
-    def get_kv_checksum(self, idx: int) -> int:
-        return int(self.kv_checksum[idx, 0].item())
+    def get_kv_checksum(self, idx: int) -> Tuple[int, int]:
+        """Return ``(digest, signature)``; ``(0, 0)`` means no digest was written."""
+        digest, signature = self.kv_checksum[idx, :2].tolist()
+        return int(digest), int(signature)
+
+    def clear_slot(self, idx: int) -> None:
+        """Reset the fields the next owner reads before its prefill writes
+        them, so it sees "not yet written" instead of the previous owner's."""
+        self.bootstrap_room[idx] = 0
+        if self.kv_checksum is not None:
+            self.kv_checksum[idx] = 0
 
     def get_buf_infos(self):
         bufs = [
@@ -538,10 +591,8 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # cached_tokens slots: 0=cached 1=device 2=host 3=storage 4=image
+        # 5=audio 6=video 7=logical KV sequence length. Slots 8-15 remain spare.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -556,6 +607,10 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # Total coverage includes the decode cached prefix, not just the sent delta.
+        self.cached_tokens[req.metadata_buffer_index][7] = min(
+            req.extend_end or 0, len(req.origin_input_ids)
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

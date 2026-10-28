@@ -314,7 +314,10 @@ class StorageAttachment:
         controller = cache.cache_controller
         config = controller.storage_config
         attn_cp_rank, attn_cp_size = controller.get_attn_cp_rank_and_size()
+        from sglang.srt.runtime_context import get_serving
+
         labels = {
+            "model_name": get_serving().served_model_name,
             "storage_backend": storage_backend,
             "tp_rank": config.tp_rank,
             "dp_rank": config.dp_rank,
@@ -445,4 +448,5 @@ class StorageAttachment:
             cache.discard_storage_prefetch_accounting(handle)
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
+        cache.prefetch_sources_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

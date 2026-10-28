@@ -820,4 +820,5 @@ def run_eagle_verify(
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
         prepared_draft_extend_inputs=prepared_draft_inputs,
+        mm_embedding_errors=forward_batch_output.mm_embedding_errors,
     )

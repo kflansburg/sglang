@@ -19,6 +19,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
+    MM_EMBEDDING_ERRORS_KEY,
     GenerationBatchResult,
     allocate_distinct_stream,
     get_logprob_dict_from_result,
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
+    overlaps_mm_placeholder = bool(
+        batch is not None and batch.mm_embedding_validation_indices()
+    )
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
@@ -53,6 +57,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not overlaps_mm_placeholder
     )
 
 
@@ -78,6 +83,17 @@ def _pp_exchange_outputs_before_forward(
     if not spec_relay or is_last_rank or cur_batch is None:
         return False
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
+
+
+def _pp_filter_failed_rows(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    mm_embedding_errors: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mm_embedding_errors is None:
+        return indices, values
+    keep = mm_embedding_errors[: indices.shape[0], 1].to(indices.device) == 0
+    return indices[keep], values[keep.to(values.device)]
 
 
 @dataclass
@@ -278,6 +294,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -790,6 +807,8 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if result.mm_embedding_errors is not None:
+            tensor_dict[MM_EMBEDDING_ERRORS_KEY] = result.mm_embedding_errors
 
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
@@ -1052,7 +1071,6 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
@@ -1080,6 +1098,7 @@ class SchedulerPPMixin:
             )
             batch.spec_info = next_draft_input
 
+        mm_embedding_errors = pp_outputs.tensors.get(MM_EMBEDDING_ERRORS_KEY)
         if self._pp_spec_relay:
             # Gated single-instance PP+spec: the sampled first token roots
             # round 1's tree. Only the chunk that finishes the prompt samples
@@ -1107,25 +1126,29 @@ class SchedulerPPMixin:
             # PP rank 0 also relays into output_tokens_buf so the next iter's
             # resolve_forward_inputs finds these tokens for the decode portion
             # of mixed-chunk batches (which gather via mix_running_indices).
-            self.future_map.stash(
-                batch.req_pool_indices,
-                RelayPayload(
-                    bonus_tokens=next_token_ids,
-                    topk_p=(
-                        None if next_draft_input is None else next_draft_input.topk_p
-                    ),
-                    topk_index=(
-                        None
-                        if next_draft_input is None
-                        else next_draft_input.topk_index
-                    ),
-                    hidden_states=(
-                        None
-                        if next_draft_input is None
-                        else next_draft_input.hidden_states
-                    ),
+            stash_indices, stash_token_ids = _pp_filter_failed_rows(
+                batch.req_pool_indices, next_token_ids, mm_embedding_errors
+            )
+            relay_payload = RelayPayload(
+                bonus_tokens=next_token_ids,
+                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                topk_index=(
+                    None if next_draft_input is None else next_draft_input.topk_index
+                ),
+                hidden_states=(
+                    None if next_draft_input is None else next_draft_input.hidden_states
                 ),
             )
+            if mm_embedding_errors is not None:
+                keep = (
+                    mm_embedding_errors[: next_token_ids.shape[0], 1].to(
+                        next_token_ids.device
+                    )
+                    == 0
+                )
+                relay_payload = relay_payload.select_rows(keep)
+            relay_payload.bonus_tokens = stash_token_ids
+            self.future_map.stash(stash_indices, relay_payload)
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1135,7 +1158,9 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            mm_embedding_errors=mm_embedding_errors,
         )
+        output_result.copy_mm_embedding_errors_to_cpu()
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 

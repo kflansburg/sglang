@@ -239,6 +239,7 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        self.read_source_codes = []
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -319,6 +320,7 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.cache_observability = False
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -370,8 +372,8 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
-        # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards (see start_loading).
+        # Set by the scheduler to the forward stream; gate load-back H2D and
+        # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
@@ -839,6 +841,14 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
+        if self.load_fence_stream is not None:
+            # The copy may read KV a forward is still writing: under overlap
+            # scheduling a finished request is cached while the next forward
+            # writes its last token. Later forwards still overlap with the copy.
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                self.load_fence_stream
+            )
+
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
@@ -1053,9 +1063,18 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        results = self.storage_backend.batch_get_v1(
-            hash_values, host_indices, extra_info
+        observed = (
+            getattr(self.storage_backend, "batch_get_v1_with_sources", None)
+            if self.cache_observability
+            else None
         )
+        if observed is not None:
+            results, sources = observed(hash_values, host_indices, extra_info)
+        else:
+            results = self.storage_backend.batch_get_v1(
+                hash_values, host_indices, extra_info
+            )
+            sources = [8] * len(hash_values) if self.cache_observability else None
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -1064,7 +1083,47 @@ class HiCacheController:
                 )
                 break
             inc += 1
+        if sources is not None:
+            operation.read_source_codes.extend(sources[:inc])
         return inc
+
+    def record_pool_read_sources(self, operation, transfers, sources) -> None:
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
+
+        page_indices = {key: index for index, key in enumerate(operation.hash_value)}
+        for transfer in transfers:
+            if transfer.name == PoolName.DRAFT:
+                continue
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                operation.read_source_codes = [
+                    code | 8 for code in operation.read_source_codes
+                ]
+                continue
+            keys = transfer.keys or []
+            receipt = sources.get(transfer.name, [])
+            if len(receipt) != len(keys):
+                receipt = [8] * len(keys)
+            for key, code in zip(keys, receipt):
+                index = page_indices.get(key)
+                if index is not None and index < len(operation.read_source_codes):
+                    operation.read_source_codes[index] |= code
+
+    def _batch_get_v2_observed(self, operation, transfers, extra_info):
+        observed = (
+            getattr(self.storage_backend, "batch_get_v2_with_sources", None)
+            if self.cache_observability
+            else None
+        )
+        if observed is not None:
+            results, sources = observed(transfers, extra_info=extra_info)
+        else:
+            results = self.storage_backend.batch_get_v2(
+                transfers, extra_info=extra_info
+            )
+            sources = {}
+        if self.cache_observability:
+            self.record_pool_read_sources(operation, transfers, sources)
+        return results
 
     # todo: deprecate
     def _generic_page_get(
@@ -1176,8 +1235,8 @@ class HiCacheController:
                 )
                 for transfer in kv_derived_transfers
             ]
-            sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers, extra_info=extra_info
+            sidecar_results = self._batch_get_v2_observed(
+                operation, current_kv_derived_transfers, extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
 

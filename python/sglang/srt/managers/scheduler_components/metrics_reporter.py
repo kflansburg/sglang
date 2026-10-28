@@ -294,6 +294,12 @@ class SchedulerMetricsReporter:
         self.decode_log_interval = get_observability().decode_log_interval
 
         if self.enable_metrics:
+            if get_parallel().attn_tp_rank == 0:
+                from sglang.srt.observability.cpu_monitor import (
+                    start_cpu_monitor_thread,
+                )
+
+                start_cpu_monitor_thread("scheduler")
             self.enable_mfu_metrics = get_observability().enable_mfu_metrics
             if self.enable_mfu_metrics:
                 self._init_estimated_perf_constants()

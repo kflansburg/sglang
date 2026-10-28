@@ -1155,6 +1155,8 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        self.mm_embedding_abort_pending = False
+        self.mm_embedding_validation_count = 0
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1324,6 +1326,7 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.storage_hit_sources = None
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
@@ -2594,6 +2597,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def batch_size(self):
         return len(self.reqs)
+
+    def mm_embedding_validation_indices(self) -> List[int]:
+        if (
+            not self.forward_mode.is_extend_without_speculative()
+            or self.multimodal_inputs is None
+            or self.prefix_lens is None
+            or self.extend_lens is None
+        ):
+            return []
+        indices = []
+        for i, (mm_input, start, length) in enumerate(
+            zip(
+                self.multimodal_inputs,
+                self.prefix_lens,
+                self.extend_lens,
+                strict=True,
+            )
+        ):
+            if mm_input is None:
+                continue
+            end = start + length
+            if any(
+                item_start < end and item_end >= start
+                for item in mm_input.mm_items
+                for item_start, item_end in item.offsets
+            ):
+                indices.append(i)
+        return indices
 
     def is_empty(self):
         return len(self.reqs) == 0

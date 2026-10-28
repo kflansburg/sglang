@@ -185,6 +185,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.enable_cache_observability = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -402,6 +403,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
+        self.prefetch_sources_by_reqid = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -480,8 +482,10 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        self.enable_cache_observability = get_observability().enable_cache_observability
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
+            self.cache_controller.cache_observability = self.enable_cache_observability
             self.tree_core.set_hicache_enabled()
             if self.supports_swa():
                 swa = self.components[ComponentType.SWA]
@@ -2189,7 +2193,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
             self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            operation.prefetch_timed_out = should_terminate_tensor.item() == 1
+            return operation.prefetch_timed_out
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -2309,6 +2314,31 @@ class UnifiedRadixCache(BasePrefixCache):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
 
+        if self.enable_cache_observability:
+            pages = completed_tokens // self.page_size
+            codes = (list(operation.read_source_codes) + [8] * pages)[:pages]
+            if self.pp_size > 1:
+                codes = [8] * pages
+            if pages:
+                source_tensor = torch.tensor(codes, dtype=torch.int)
+                self._all_reduce_attn_groups(
+                    source_tensor, torch.distributed.ReduceOp.BOR
+                )
+                codes = source_tensor.tolist()
+            if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+                cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
+                if (
+                    self.cache_controller.storage_config.tp_rank == 0
+                    and self.pp_rank == 0
+                    and cp_rank == 0
+                ):
+                    self.storage_metrics_collector.log_prefetch_stages(
+                        len(prefetch_key),
+                        operation.storage_hit_count,
+                        completed_tokens,
+                        completed_tokens,
+                    )
+
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
             self._resolve_storage_prefetch_tokens(
@@ -2322,6 +2352,13 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.storage_metrics_collector is not None
         ):
             self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
+        if (
+            self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+            and getattr(operation, "prefetch_timed_out", False)
+            and completed_tokens < len(prefetch_key)
+        ):
+            self.storage_metrics_collector.log_storage_prefetch_timeout_fallback()
 
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
@@ -2377,6 +2414,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
+        if self.enable_cache_observability:
+            self.prefetch_sources_by_reqid[request] = (
+                codes[insert_result.prefix_len // self.page_size :],
+                self.page_size,
+            )
         if loaded_from_storage > 0:
             self.prefetch_loaded_storage_start_by_reqid[request] = (
                 operation.storage_start + insert_result.prefix_len
@@ -2612,6 +2654,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         return self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
 
+    def pop_prefetch_sources(self, request: CacheRequestHandle):
+        return self.prefetch_sources_by_reqid.pop(request, None)
+
     def pop_prefetch_loaded_span(
         self, request: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:
@@ -2628,6 +2673,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
+        self.prefetch_sources_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None

@@ -1866,20 +1866,12 @@ def load_audio(
     if sr is None:
         sr = 16000
 
-    # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
         source = audio_file
     elif isinstance(audio_file, str) and audio_file.startswith("data:"):
-        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
-    elif isinstance(audio_file, str) and (
-        audio_file.startswith("http://") or audio_file.startswith("https://")
-    ):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        source = download_remote_media(audio_file, timeout=timeout)
-    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = unquote(urlparse(audio_file).path)
+        source = pybase64.b64decode(audio_file.split(",", 1)[1], validate=True)
     elif isinstance(audio_file, str):
-        source = audio_file
+        source = pybase64.b64decode(audio_file, validate=True)
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
@@ -1888,11 +1880,7 @@ def load_audio(
         is_audio_container,
     )
 
-    if isinstance(source, bytes):
-        header = source[:16]
-    else:
-        with open(source, "rb") as audio_stream:
-            header = audio_stream.read(16)
+    header = source[:16]
 
     if is_audio_container(header):
         return decode_audio_container(
@@ -1927,10 +1915,7 @@ def load_audio(
     import torchaudio
 
     try:
-        if isinstance(source, bytes):
-            audio, original_sr = sf.read(BytesIO(source))
-        else:
-            audio, original_sr = sf.read(source)
+        audio, original_sr = sf.read(BytesIO(source))
     except sf.LibsndfileError as e:
         raise ValueError(f"Could not decode audio: {e}") from e
 
@@ -2065,10 +2050,15 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            from torchvision.io import (  # lazy: ~1 s of torch._dynamo
+                ImageReadMode,
+                decode_jpeg,
+            )
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":
@@ -2098,10 +2088,7 @@ def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
     gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
-    """
-    Load image from multiple input formats, including:
-    ImageData, PIL Image, bytes, URL, file path, or base64 string.
-    """
+    """Load an image from ImageData, PIL, bytes, or inline base64 data."""
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
@@ -2112,22 +2099,7 @@ def load_image(
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith("file://"):
-        image = _load_image(
-            image_file=unquote(urlparse(image_file).path),
-            gpu_image_decode=gpu_image_decode,
-        )
-    elif isinstance(image_file, str) and image_file.lower().endswith(
-        image_extension_names
-    ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(
-        image_file, str
-    ):  # Other formats, try to decode as base64 by default
+    elif isinstance(image_file, str):
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
@@ -2140,12 +2112,6 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
-    if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
@@ -2157,25 +2123,13 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
 def _normalize_video_input(
     video_file: Union[str, bytes],
 ) -> Union[str, bytes, None]:
-    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
-
-    Returns a file path or bytes suitable for a decoder, or None on failure.
-    URLs and base64 are returned as bytes (no temp files needed since both
-    torchcodec and VideoDecoderWrapper accept bytes natively).
-    """
+    """Normalize inline video data to bytes, or None for unsupported types."""
     if isinstance(video_file, bytes):
         return video_file
     elif isinstance(video_file, str):
-        if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            return download_remote_media(video_file, timeout=timeout)
-        elif video_file.startswith("data:"):
+        if video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
-        elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
-        elif os.path.isfile(unquote(urlparse(video_file).path)):
-            return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)
     else:
@@ -4412,8 +4366,55 @@ def gc_object_counts():
     return g0, g1, g2
 
 
-def configure_gc_warning(warn_threshold_secs):
+def configure_gc_warning(
+    warn_threshold_secs: float = 0.0, enable_metrics: bool = False
+):
+    """Install a gc.callbacks hook for GC pause observability.
+
+    - When enable_metrics is True, every GC pause is recorded in
+      `sglang:gc_pause_duration_seconds` regardless of duration.
+    - When warn_threshold_secs > 0, a warning is logged for pauses
+      that exceed the threshold (existing behavior).
+    Either feature can be enabled independently.
+    """
+    if not enable_metrics and warn_threshold_secs <= 0.0:
+        return
+
     import gc
+
+    if enable_metrics:
+        from collections import deque
+
+        from prometheus_client import Histogram
+
+        gc_pause_histogram = Histogram(
+            name="sglang:gc_pause_duration_seconds",
+            documentation="Duration of CPython gc.collect() pauses, by generation.",
+            labelnames=["generation"],
+            buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
+        )
+
+        # Prometheus metric locks are not safe to re-enter from a GC callback.
+        gc_pause_samples = deque(maxlen=100000)
+
+        def _gc_pause_flush_loop():
+            while True:
+                time.sleep(1.0)
+                while True:
+                    try:
+                        sample_gen, sample_duration = gc_pause_samples.popleft()
+                    except IndexError:
+                        break
+                    gc_pause_histogram.labels(generation=sample_gen).observe(
+                        sample_duration
+                    )
+
+        threading.Thread(
+            target=_gc_pause_flush_loop, name="gc-pause-flush", daemon=True
+        ).start()
+    else:
+        gc_pause_histogram = None
+        gc_pause_samples = None
 
     gc_start_time = {}
 
@@ -4423,7 +4424,10 @@ def configure_gc_warning(warn_threshold_secs):
             gc_start_time[gen] = time.time()
         elif phase == "stop":
             duration = time.time() - gc_start_time.get(gen, time.time())
-            if duration > warn_threshold_secs:
+            if gc_pause_samples is not None:
+                # lock-free; the (lock-taking) observe happens off-thread. See above.
+                gc_pause_samples.append((str(gen), duration))
+            if warn_threshold_secs > 0.0 and duration > warn_threshold_secs:
                 g0, g1, g2 = gc_object_counts()
                 logger.warn(
                     f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "

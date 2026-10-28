@@ -256,7 +256,7 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if not req.skip_radix_cache_insert:
+    if not req.skip_radix_cache_insert and req.mm_embedding_validation_count == 0:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
@@ -397,7 +397,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         return
 
     owned_kv_len = req.owned_kv_len()
-    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    checkpoint = (
+        checkpoint
+        and not req.skip_radix_cache_insert
+        and req.mm_embedding_validation_count == 0
+    )
     if checkpoint:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.

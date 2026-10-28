@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import zmq
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge, Histogram
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -85,6 +85,63 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+DISAGG_ZMQ_LOCK_WAIT_SECONDS = Histogram(
+    "sglang:disagg_zmq_lock_wait_seconds",
+    "Time waiting for a shared decode-to-prefill ZMQ socket lock.",
+    labelnames=["operation"],
+    buckets=(0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0),
+)
+DISAGG_ZMQ_SEND_SECONDS = Histogram(
+    "sglang:disagg_zmq_send_seconds",
+    "Time spent sending decode-to-prefill ZMQ messages.",
+    labelnames=["operation", "outcome"],
+    buckets=(0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0),
+)
+MOONCAKE_BOOTSTRAP_MESSAGES = Counter(
+    "sglang:mooncake_bootstrap_messages_total",
+    "Messages consumed by the prefill Mooncake bootstrap thread.",
+    labelnames=["kind"],
+)
+MOONCAKE_BOOTSTRAP_LAST_RECEIVE_TIMESTAMP_SECONDS = Gauge(
+    "sglang:mooncake_bootstrap_last_receive_timestamp_seconds",
+    "Unix timestamp of the last message consumed by the prefill bootstrap thread.",
+    multiprocess_mode="mostrecent",
+)
+MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS = Gauge(
+    "sglang:mooncake_transfer_worker_last_progress_timestamp_seconds",
+    "Unix timestamp when a prefill transfer worker last handled a queue item.",
+    labelnames=["worker"],
+    multiprocess_mode="mostrecent",
+)
+
+
+def _send_multipart_with_metrics(sock, lock, parts, operation: str):
+    lock_start = time.perf_counter()
+    with lock:
+        try:
+            DISAGG_ZMQ_LOCK_WAIT_SECONDS.labels(operation=operation).observe(
+                time.perf_counter() - lock_start
+            )
+        except Exception:
+            pass
+        send_start = time.perf_counter()
+        try:
+            sock.send_multipart(parts)
+        except Exception:
+            try:
+                DISAGG_ZMQ_SEND_SECONDS.labels(
+                    operation=operation, outcome="error"
+                ).observe(time.perf_counter() - send_start)
+            except Exception:
+                pass
+            raise
+        try:
+            DISAGG_ZMQ_SEND_SECONDS.labels(
+                operation=operation, outcome="success"
+            ).observe(time.perf_counter() - send_start)
+        except Exception:
+            pass
 
 
 # decode
@@ -896,6 +953,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         reason, if any.
         """
         fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        self.check_peer_aux_buffer_count(
+            mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
+        )
         with self.session_lock:
             self.failed_sessions.discard(mooncake_session_id)
             self.session_failures.pop(mooncake_session_id, None)
@@ -1285,21 +1345,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+
+        cancel() is a no-op for a running future, so every submitted future is
+        drained before returning: the caller frees source and destination pages
+        (and acks the decode's abort) once the chunk is quiescent. A worker
+        exception becomes a failure status instead of abandoning siblings."""
         ret = 0
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception:
+                logger.exception("KV transfer worker raised")
+                status = -1
             if status != 0 and ret == 0:
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
         return ret
 
     def send_kvcache(
@@ -1752,7 +1815,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
@@ -1769,7 +1833,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i in range(len(prefill_aux_ptrs)):
+        for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
@@ -2444,6 +2508,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS.labels(
+                    worker=str(worker_index)
+                ).set(time.time())
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2804,12 +2871,47 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                if kv_chunk is not None:
-                    self.poison_deferred_ack_room(kv_chunk.room)
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS.labels(
+                    worker=str(worker_index)
+                ).set(time.time())
+                room = kv_chunk.room if kv_chunk is not None else None
+                if room is not None:
+                    # A failed send may still be writing decode pages.
+                    self.poison_deferred_ack_room(room)
+                logger.exception(
+                    "Transfer worker failed for room=%s on bootstrap_port=%s; "
+                    "failing the request and continuing",
+                    room,
+                    self.bootstrap_port,
                 )
+                if room is None:
+                    continue
+
+                try:
+                    self.conclude_failure(
+                        bootstrap_room=room,
+                        failure_reason=(
+                            f"Prefill transfer worker raised an unexpected exception: {e}"
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to conclude transfer worker failure for room=%s", room
+                    )
+
+                # This chunk is no longer in flight. Mirror the normal tail so the
+                # room can tear down.
+                if kv_chunk.staging_counted and room in self._staging_outstanding:
+                    self._staging_outstanding[room] -= 1
+                if self._staging_outstanding.get(room, 0) <= 0:
+                    self._staging_outstanding.pop(room, None)
+                    self.transfer_infos.pop(room, None)
+                    self.req_to_decode_prefix_len.pop(room, None)
+                    if self.enable_staging:
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._staging_ctx.prefetched_rooms.discard(room)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -2893,6 +2995,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if waiting_req_bytes is None:
                     continue
                 room = waiting_req_bytes[0].decode("ascii")
+                message_kind = (
+                    room.lower()
+                    if room in {"ABORT", "STAGING_RSP", "WATERMARK"}
+                    else "register" if room == "None" else "metadata"
+                )
+                MOONCAKE_BOOTSTRAP_MESSAGES.labels(kind=message_kind).inc()
+                MOONCAKE_BOOTSTRAP_LAST_RECEIVE_TIMESTAMP_SECONDS.set(time.time())
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
@@ -3211,6 +3320,15 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             return self.conclude_state
 
         status = check_status(self.bootstrap_room)
+        # With deferred release, hold Failed while a chunk is still inside the
+        # transfer engine: the scheduler frees the source pages right after a
+        # terminal poll.
+        if (
+            status == KVPoll.Failed
+            and self.kv_mgr.enable_deferred_decode_kv_release
+            and self.kv_mgr.has_outstanding_chunks(self.bootstrap_room)
+        ):
+            return KVPoll.Transferring
         # Hold Success until all staging chunks transferred. With deferred
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
@@ -3320,34 +3438,36 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            packed_kv_data_ptrs,
-                            packed_aux_data_ptrs,
-                            packed_state_data_ptrs,
-                            dst_tp_rank,
-                            dst_attn_tp_size,
-                            dst_kv_item_len,
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            packed_kv_layer_ids,
-                            packed_state_layer_ids,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
-                            dst_dcp_size,
-                            dst_dcp_rank,
-                            packed_staging_slot_layer_ids,
-                            struct.pack(
-                                f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
-                                *self.kv_mgr.kv_args.kv_item_lens,
-                            ),
-                        ]
-                    )
+                _send_multipart_with_metrics(
+                    sock,
+                    lock,
+                    [
+                        "None".encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs,
+                        packed_state_data_ptrs,
+                        dst_tp_rank,
+                        dst_attn_tp_size,
+                        dst_kv_item_len,
+                        packed_state_item_lens,
+                        packed_state_dim_per_tensor,
+                        packed_kv_layer_ids,
+                        packed_state_layer_ids,
+                        packed_staging_base_ptr,
+                        staging_total_size_str,
+                        dst_dcp_size,
+                        dst_dcp_rank,
+                        packed_staging_slot_layer_ids,
+                        struct.pack(
+                            f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+                            *self.kv_mgr.kv_args.kv_item_lens,
+                        ),
+                    ],
+                    "register_kv_args",
+                )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -3387,29 +3507,31 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
-                            str(aux_index).encode("ascii") if not is_dummy else b"",
-                            (
-                                pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
-                                else b""
-                            ),
-                            str(self.required_dst_info_num).encode("ascii"),
-                            str(decode_prefix_len or 0).encode("ascii"),
-                            (
-                                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
-                                if not is_dummy and device_kv_indices is not None
-                                else b""
-                            ),
-                        ]
-                    )
+                _send_multipart_with_metrics(
+                    sock,
+                    lock,
+                    [
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        str(aux_index).encode("ascii") if not is_dummy else b"",
+                        (
+                            pack_int_lists(state_indices, "i")
+                            if not is_dummy and state_indices
+                            else b""
+                        ),
+                        str(self.required_dst_info_num).encode("ascii"),
+                        str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                            if not is_dummy and device_kv_indices is not None
+                            else b""
+                        ),
+                    ],
+                    "send_metadata",
+                )
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(

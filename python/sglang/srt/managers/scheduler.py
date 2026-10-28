@@ -287,6 +287,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    has_mm_embedding_failures,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -1591,6 +1592,9 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            # Retired requests whose KV is held until the transfer worker drains
+            # their last outstanding chunk (deferred KV release only).
+            self.disagg_prefill_drain_releases: List[Tuple[Req, bool]] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2573,7 +2577,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
-            abort_request=self.abort_request,
+            abort_request=self.defer_mm_embedding_abort,
         )
 
     def init_internal_state(self) -> None:
@@ -3375,7 +3379,25 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
-                req.time_stats.set_decode_prealloc_queue_entry_time()
+                # Record decode pod KV pool state at request admission for
+                # weight gap reconstruction (see decode-weight-tracing spec).
+                # Attributes are placed on the decode_prepare trace span
+                # (not the root span) because root_span is None in the
+                # scheduler process — OTel Spans cannot be pickled across
+                # the tokenizer→scheduler IPC boundary.
+                pool_attrs = None
+                if req.time_stats.trace_ctx.tracing_enable:
+                    pool = self.pool_stats_observer.get_pool_stats()
+                    pool_attrs = {
+                        "kv_pool.used_tokens": pool.full_num_used,
+                        "kv_pool.available_tokens": pool.full_available_size,
+                        "kv_pool.num_running": (
+                            len(self.running_batch.reqs) if self.running_batch else 0
+                        ),
+                    }
+                req.time_stats.set_decode_prealloc_queue_entry_time(
+                    trace_attrs=pool_attrs,
+                )
             else:
                 # Restart the queue wait here;
                 # resume_retracted_reqs() re-queues the request without stamping it.
@@ -3664,7 +3686,7 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if self.chunked_req is not None and self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
@@ -3676,19 +3698,32 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        if req.inflight_middle_chunks > 0 or req.mm_embedding_validation_count > 0:
+            self.chunked_req = None
+            return
+
+        if req.finished():
+            self.chunked_req = None
+            self._pending_chunked_abort_req = None
+            return
+
+        reason = req.discard_output_reason or req.to_finish or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
+            if req.disagg_kv_sender is not None:
+                req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.release_prefill_kv_after_drain(req, checkpoint=False)
+        else:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3698,6 +3733,31 @@ class Scheduler(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def defer_mm_embedding_abort(
+        self, req: Req, expected_tokens: int, actual_tokens: int
+    ) -> None:
+        req.skip_radix_cache_insert = True
+        if req.mm_embedding_abort_pending:
+            return
+        req.mm_embedding_abort_pending = True
+        if not req.finished() and req.to_finish is None:
+            req.to_finish = FINISH_ABORT(
+                message=(
+                    "Insufficient multimodal embedding length: "
+                    f"expected {expected_tokens} tokens, got {actual_tokens}. "
+                    "This is an internal error."
+                ),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        req.hidden_states_tensor = None
+        req.output_dsa_topk_indices = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.clear_pending_chunk_send(req)
+            if req.disagg_kv_sender is not None:
+                req.disagg_kv_sender.abort()
+        if self.chunked_req is req or req.inflight_middle_chunks > 0:
+            self._pending_chunked_abort_req = req
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -3971,6 +4031,12 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
+            self.chunked_req is not None
+            and self.chunked_req.mm_embedding_validation_count > 0
+        ):
+            return None, running_batch
+
+        if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
@@ -4126,6 +4192,15 @@ class Scheduler(
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
                     req.cache_request_handle
                 )
+                source_receipt = getattr(self.tree_cache, "pop_prefetch_sources", None)
+                if source_receipt is not None:
+                    sources = source_receipt(req.cache_request_handle)
+                    if (
+                        sources is not None
+                        and not req._cache_breakdown_computed
+                        and not req.retracted_stain
+                    ):
+                        req.storage_hit_sources = sources
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
                     req.storage_hit_start = loaded_start
@@ -4521,6 +4596,10 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if batch.forward_mode.is_extend():
+            for req_idx in batch.mm_embedding_validation_indices():
+                batch.reqs[req_idx].mm_embedding_validation_count += 1
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
@@ -4568,7 +4647,19 @@ class Scheduler(
                             batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            publish_indices = future_indices
+                            publish_seq_lens = batch.seq_lens + 1
+                            if batch_result.mm_embedding_errors is not None:
+                                keep = self._mm_embedding_success_mask(
+                                    batch_result, len(batch.reqs), future_indices.device
+                                )
+                                publish_indices = publish_indices[keep]
+                                publish_seq_lens = publish_seq_lens[keep]
+                            self.future_map.publish(publish_indices, publish_seq_lens)
+                        else:
+                            self._publish_speculative_overlap_result(
+                                batch, future_indices, batch_result
+                            )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -4774,24 +4865,26 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
-                    pooler_output, can_run_cuda_graph = (
+                    pooler_output, can_run_cuda_graph, mm_embedding_errors = (
                         self.tp_worker.forward_batch_embedding(batch)
                     )
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                         can_run_cuda_graph=can_run_cuda_graph,
+                        mm_embedding_errors=mm_embedding_errors,
                     )
                     ret.copy_to_cpu()
             else:
                 resolve_forward_inputs(batch, self.future_map)
-                pooler_output, can_run_cuda_graph = (
+                pooler_output, can_run_cuda_graph, mm_embedding_errors = (
                     self.tp_worker.forward_batch_embedding(batch)
                 )
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                     can_run_cuda_graph=can_run_cuda_graph,
+                    mm_embedding_errors=mm_embedding_errors,
                 )
 
         if self.enable_unified_cache_external_linker:
@@ -4834,9 +4927,17 @@ class Scheduler(
         batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
+        keep = None
+        if batch_result.mm_embedding_errors is not None:
+            keep = Scheduler._mm_embedding_success_mask(
+                batch_result, len(batch.reqs), future_indices.device
+            )
+            future_indices = future_indices[keep]
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
+                if keep is not None:
+                    payload = payload.select_rows(keep)
                 self.future_map.stash(future_indices, payload)
             return
         if batch_result.next_draft_input is not None:
@@ -4845,6 +4946,8 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
+        if keep is not None:
+            payload = payload.select_rows(keep)
         if batch.beam_tail is not None:
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
@@ -4853,6 +4956,28 @@ class Scheduler(
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
+
+    def _publish_speculative_overlap_result(
+        self,
+        batch: ScheduleBatch,
+        future_indices: torch.Tensor,
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        if not has_mm_embedding_failures(batch_result.mm_embedding_errors):
+            return
+        keep = self._mm_embedding_success_mask(
+            batch_result, len(batch.reqs), future_indices.device
+        )
+        self.future_map.publish(
+            future_indices[keep],
+            batch_result.new_seq_lens[keep],
+        )
+
+    @staticmethod
+    def _mm_embedding_success_mask(
+        result: GenerationBatchResult, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        return result.mm_embedding_errors[:batch_size, 1].to(device=device) == 0
 
     def _copy_auxiliary_output_to_cpu(
         self,
@@ -5117,6 +5242,9 @@ class Scheduler(
         deferred_pending = (
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+        ) or (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and bool(self.disagg_prefill_drain_releases)
         )
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
             if not self.enable_hisparse and not deferred_pending:
@@ -5204,6 +5332,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_drain_releases) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

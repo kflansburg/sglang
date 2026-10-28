@@ -654,6 +654,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
+        self.kv_checksum_requests_total = Counter(
+            name="sglang:kv_checksum_requests_total",
+            documentation="Decode KV checksum outcome per request "
+            "(--disaggregation-enable-kv-checksum), counted on attn TP rank 0.",
+            labelnames=list(labels.keys()) + ["result"],
+        )
+        self.kv_checksum_digests_total = Counter(
+            name="sglang:kv_checksum_digests_total",
+            documentation="Prefill KV checksum digests written, counted on "
+            "attn TP rank 0.",
+            labelnames=labels.keys(),
+        )
         self.num_prefill_retries_total = Counter(
             name="sglang:num_prefill_retries_total",
             documentation="Total number of prefill retries.",
@@ -1403,6 +1415,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_kv_checksum_requests(self, result: str) -> None:
+        self.kv_checksum_requests_total.labels(**self.labels, result=result).inc(1)
+
+    def increment_kv_checksum_digests(self) -> None:
+        self.kv_checksum_digests_total.labels(**self.labels).inc(1)
+
     def increment_decode_host_receive_reqs(self) -> None:
         self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
 
@@ -1773,6 +1791,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        self._cache_reuse = None
 
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
@@ -2006,6 +2025,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_e2e_request_latency,
         )
 
+    @property
+    def cache_reuse(self):
+        if self._cache_reuse is None:
+            from sglang.srt.observability.cache_reuse import CacheReuseCollector
+
+            self._cache_reuse = CacheReuseCollector(self.labels)
+        return self._cache_reuse
+
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
         for phase in (
             "load_weight",
@@ -2144,12 +2171,27 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels
 
+        self.prefetch_stage_tokens = Counter(
+            name="sglang:storage_prefetch_stage_tokens",
+            documentation="Logical prefetch stages at publication decision, recorded by one attention leader; not consumption.",
+            labelnames=[*labels, "stage"],
+        )
+
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
             documentation="Prompt tokens successfully transferred from L3 "
             "storage into host memory, before admission-time reuse or discard.",
             labelnames=labels.keys(),
         )
+
+        self.storage_prefetch_timeout_fallbacks_total = Counter(
+            name="sglang:storage_prefetch_timeout_fallbacks_total",
+            documentation="Number of L3 storage prefetches that reached the "
+            "HiCache timeout before the requested prefix was fully fetched, "
+            "forcing the remaining prefix to be recomputed.",
+            labelnames=labels.keys(),
+        )
+        self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels)
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
@@ -2278,9 +2320,19 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
+    def log_storage_prefetch_timeout_fallback(self):
+        self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels).inc()
+
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_prefetch_stages(self, requested, found, returned, published):
+        from sglang.srt.observability.cache_reuse import prefetch_stages
+
+        stages = prefetch_stages(requested, found, returned, published)
+        for stage, amount in stages.items():
+            self.prefetch_stage_tokens.labels(**self.labels, stage=stage).inc(amount)
 
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
